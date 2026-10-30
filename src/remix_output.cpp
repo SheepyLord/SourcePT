@@ -160,8 +160,11 @@ struct FlexMesh {
   uint64_t content = 0; // the flex deltas it was built from (0: at rest)
   uint32_t bones = 0;
   uint64_t geometry = 0;
+  uint64_t builtFrame = ~0ull; // the frame its vertices were last refreshed (diagnostics)
 };
 std::unordered_map<uint64_t, FlexMesh> g_flexMeshes;
+// Diagnostics: deforming instances submitted with a mesh refreshed this frame, and with an older one.
+uint64_t g_deformFresh = 0, g_deformStale = 0;
 // Diagnostics: cached (static-buffer) meshes built anew, by the material bound
 // at the time, with the cache key of the last two builds. A mesh that is
 // rebuilt every frame is a new mesh, and a new instance, every frame: it has
@@ -1185,6 +1188,8 @@ struct Instance {
   uint64_t view;
   bool skinned = false;     // a skinned model's draw (bones may still be dropped: single-bone models are rigid)
   bool modelLayer = false;  // a layer the proxy adds to a model (an eye's iris): of the model whatever its transform
+  bool deforming = false;   // its mesh is refreshed in place every frame (g_flexMeshes): never the static world
+  uint64_t builtFrame = ~0ull; // a deforming mesh's last refresh (diagnostics)
   uint32_t primitives = 0, firstIndex = 0; // the draw's primitive count and first index (a screen view's dedupe)
   bool offTarget = false; // drawn into a render-target texture: a screen camera's view (role Screen) or nothing
   // Stencil emulation: the draw's group (g_stencilGroups index) and part in it.
@@ -2052,10 +2057,18 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
         w[1] = stored[1];
         w[2] = 1 - stored[0] - stored[1];
       }
+      // The implied weight can round slightly below zero, which the runtime
+      // rejects; clamped, the weights then summed above one and scaled the
+      // vertex about the world origin (a face drifting off its head the
+      // further a character stood from the origin). They sum to one again.
+      float sum = 0;
+      for (uint32_t k = 0; k < bonesPerVertex; ++k)
+        sum += w[k] = std::isfinite(w[k]) ? std::clamp(w[k], 0.0f, 1.0f) : 0;
+      for (uint32_t k = 0; k < bonesPerVertex; ++k)
+        w[k] = sum > 0 ? w[k] / sum : (k == 0 ? 1.0f : 0.0f);
       for (uint32_t k = 0; k < bonesPerVertex; ++k) {
         const uint32_t bone = bi ? bi[k] : 0;
-        // The implied weight can round slightly below zero; the runtime rejects negatives.
-        weights[size_t(v) * bonesPerVertex + k] = std::isfinite(w[k]) ? std::clamp(w[k], 0.0f, 1.0f) : 0;
+        weights[size_t(v) * bonesPerVertex + k] = w[k];
         bones[size_t(v) * bonesPerVertex + k] = bone;
         maxBone = std::max(maxBone, bone);
         if (weights[size_t(v) * bonesPerVertex + k] > 0)
@@ -2249,6 +2262,7 @@ void probeMaterialDraw(const void *texture, const engine_materials::Shading &bou
 // shading taken.
 struct ShaderProbe {
   std::string shader;
+  std::string material; // after a space in the request: a part of the material's name the draws must have
   uint32_t left = 0;
 } g_shaderProbe; // render thread
 void serviceShaderProbeRequest() {
@@ -2269,8 +2283,10 @@ void serviceShaderProbeRequest() {
     name.pop_back();
   for (char &c : name)
     c = char(std::tolower(static_cast<unsigned char>(c)));
-  g_shaderProbe.shader = name;
-  g_shaderProbe.left = name.empty() ? 0 : 64;
+  const size_t space = name.find(' ');
+  g_shaderProbe.shader = name.substr(0, space);
+  g_shaderProbe.material = space == std::string::npos ? std::string() : name.substr(space + 1);
+  g_shaderProbe.left = name.empty() ? 0 : g_shaderProbe.material.empty() ? 64 : 256;
   if (FILE *out = _wfopen((g_moduleDir + L"\\shader_probe.txt").c_str(), L"w")) {
     fprintf(out, "== shader %s, from frame %llu\n", name.c_str(), static_cast<unsigned long long>(g_frame));
     fclose(out);
@@ -2287,6 +2303,13 @@ void probeShaderDraw(const Draw &d, const engine_materials::Shading &taken) {
     c = char(std::tolower(static_cast<unsigned char>(c)));
   if (shader.rfind(g_shaderProbe.shader, 0) != 0)
     return;
+  if (!g_shaderProbe.material.empty()) {
+    std::string material = engine_materials::currentName();
+    for (char &c : material)
+      c = char(std::tolower(static_cast<unsigned char>(c)));
+    if (material.find(g_shaderProbe.material) == std::string::npos)
+      return;
+  }
   --g_shaderProbe.left;
   FILE *out = _wfopen((g_moduleDir + L"\\shader_probe.txt").c_str(), L"a");
   if (!out)
@@ -2295,6 +2318,35 @@ void probeShaderDraw(const Draw &d, const engine_materials::Shading &taken) {
           static_cast<unsigned long long>(g_frame), engine_materials::currentName(), b.shader, int(b.translucent),
           int(b.alphaTest), engine_materials::current().base.c_str(), int(d.blend), d.srcBlend, d.dstBlend, int(d.alphaTest),
           int(taken.mode), taken.base.c_str(), d.numVertices, d.primCount);
+  // Skinning: dynamic buffers (rewritten per draw: per-frame meshes), bones,
+  // flex, the first vertex's position and bone 0's translation.
+  {
+    const auto *pos = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
+    float p[3] = {};
+    if (pos && pos->Stream < 4 && pos->Type == D3DDECLTYPE_FLOAT3) {
+      const auto &st = d.streams[pos->Stream];
+      const uint64_t at = uint64_t(st.offset) + uint64_t(int64_t(d.baseVertex) + d.minIndex) * st.stride + pos->Offset;
+      if (st.data && at + 12 <= st.size)
+        std::memcpy(p, st.data + at, 12);
+    }
+    const float *bone = d.vsConstants + kRegModel * 4;
+    // The first vertex in world space by its first bone (as a one-weight draw is skinned).
+    float world[3] = {p[0], p[1], p[2]};
+    if (currentNumBones() > 0)
+      if (const auto *bi = findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0); bi && bi->Stream < 4) {
+        const auto &st = d.streams[bi->Stream];
+        const uint64_t at = uint64_t(st.offset) + uint64_t(int64_t(d.baseVertex) + d.minIndex) * st.stride + bi->Offset;
+        if (st.data && at + 4 <= st.size && st.data[at] < 53) {
+          const float *m = d.vsConstants + (kRegModel + 3 * st.data[at]) * 4;
+          for (int r = 0; r < 3; ++r)
+            world[r] = m[r * 4] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] + m[r * 4 + 3];
+        }
+      }
+    fprintf(out, "   vb dynamic %d ib dynamic %d | bones %d skinned decl %d flex %g | vertex0 %.3f %.3f %.3f | world0 %.3f %.3f %.3f | bone0 t %.3f %.3f %.3f\n",
+            pos && pos->Stream < 4 ? int(d.streams[pos->Stream].dynamic) : -1, int(d.indices.dynamic),
+            currentNumBones(), int(findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0) != nullptr), flexScale(d),
+            p[0], p[1], p[2], world[0], world[1], world[2], bone[3], bone[7], bone[11]);
+  }
   // The vertex layout, and the first vertex's texture coordinates.
   if (d.elements) {
     fprintf(out, "   elements:");
@@ -4093,9 +4145,12 @@ void onDraw(const Draw &d) {
     ++g_stats.noPosition;
     return;
   }
+  // A skinned layout drawn with no bones was skinned on the CPU (studiorender's
+  // software path: world-space vertices, bone 0 the identity): rigid, as the
+  // shader draws it. Its blend indices are stale and name leftover matrices.
   uint32_t bonesPerVertex = 0;
   if (skinnedDraw) {
-    bonesPerVertex = uint32_t(std::clamp(currentNumBones(), 1, 3));
+    bonesPerVertex = uint32_t(std::clamp(currentNumBones(), 0, 3));
     ++g_stats.skinned;
   }
   const auto &ps = d.streams[pos->Stream];
@@ -4423,16 +4478,73 @@ void onDraw(const Draw &d) {
   // on a flexed face and flexed draws from dynamic buffers stay per frame,
   // named by their deltas.
   const bool dynamicBuffers = ps.dynamic || d.indices.dynamic;
-  const uint64_t flexHash = hash ^ 0xf1e8f1e8f1e8f1e8ull;
-  const bool flexTracked = !dynamicBuffers && !lifted && (flex != 0 || g_flexMeshes.count(flexHash) != 0);
+  // A model studiorender flexed or skinned on the CPU (a face): its vertices
+  // are written to a dynamic buffer every frame, at a new offset, over a
+  // static index range. Named by that range and matched to last frame's
+  // draws of it by place (bone 0, or the first vertex of one skinned on the
+  // CPU: the order of several characters' draws changes as they move), it
+  // keeps one mesh refreshed in place like a flexed face: one instance whose
+  // previous vertices give motion vectors, where a mesh per frame had none.
+  const bool dynamicModel = ps.dynamic && !d.indices.dynamic && !d.blend && !lifted && flex == 0 &&
+                            particle == kNotParticle;
+  uint64_t lineage = 0;
+  if (dynamicModel) {
+    struct Slot {
+      float at[3];
+      uint64_t id;
+      bool taken;
+    };
+    // Render thread: last frame's and this frame's draws of each range.
+    static std::unordered_map<uint64_t, std::vector<Slot>> previous, current;
+    static uint64_t slotsFrame = ~0ull, nextLineage = 1;
+    if (slotsFrame != g_frame) {
+      previous.swap(current);
+      current.clear();
+      slotsFrame = g_frame;
+    }
+    const struct {
+      const void *indices, *declaration, *texture;
+      uint32_t startIndex, primCount, numVertices, bones;
+    } range = {d.indices.buffer, d.declaration, d.texture0, d.startIndex, d.primCount, d.numVertices, bonesPerVertex};
+    const uint64_t key = fnv(&range, sizeof(range), 0x6c696e65616765ull);
+    float at[3] = {d.vsConstants[kRegModel * 4 + 3], d.vsConstants[kRegModel * 4 + 7], d.vsConstants[kRegModel * 4 + 11]};
+    if (!bonesPerVertex && pos->Type == D3DDECLTYPE_FLOAT3) {
+      const uint64_t first = uint64_t(ps.offset) + uint64_t(int64_t(d.baseVertex) + d.minIndex) * ps.stride + pos->Offset;
+      if (ps.data && first + 12 <= ps.size)
+        std::memcpy(at, ps.data + first, 12);
+    }
+    Slot *best = nullptr;
+    float bestDistance = 64.0f * 64.0f; // units: a part moves less than this in a frame
+    for (auto &slot : previous[key]) {
+      float distance = 0;
+      for (int i = 0; i < 3; ++i)
+        distance += (slot.at[i] - at[i]) * (slot.at[i] - at[i]);
+      if (!slot.taken && distance < bestDistance) {
+        bestDistance = distance;
+        best = &slot;
+      }
+    }
+    if (best)
+      best->taken = true;
+    lineage = fnv(&key, sizeof(key), best ? best->id : nextLineage++);
+    current[key].push_back({{at[0], at[1], at[2]}, best ? best->id : (nextLineage - 1), false});
+  }
+  const uint64_t flexHash = dynamicModel ? lineage : hash ^ 0xf1e8f1e8f1e8f1e8ull;
+  const bool flexTracked =
+      dynamicModel || (!dynamicBuffers && !lifted && (flex != 0 || g_flexMeshes.count(flexHash) != 0));
   if (flex != 0 && !flexTracked)
     hash = fnv(&flexContent, sizeof(flexContent), hash);
-  const bool transientDraw = dynamicBuffers || (flex != 0 && !flexTracked);
+  if (dynamicModel)
+    flexContent = g_frame << 1 | 1; // new vertices every frame (g_frame | 1 named two frames alike)
+  const bool transientDraw = (dynamicBuffers && !dynamicModel) || (flex != 0 && !flexTracked);
+  // Eyes of such a model follow its lineage too.
+  const bool eyesPerFrame = dynamicBuffers && !dynamicModel;
 
   remixapi_MeshHandle mesh = nullptr;
   uint32_t boneCount = 0;
   uint64_t geometry = 0;
   bool faceNormals = false, meshBuilt = false;
+  uint64_t meshBuiltFrame = ~0ull;
   if (flexTracked) {
     FlexMesh &f = g_flexMeshes[flexHash];
     if (!f.handle || f.content != flexContent) {
@@ -4443,6 +4555,7 @@ void onDraw(const Draw &d) {
         f.handle = refreshed;
         f.content = flexContent;
         f.bones = boneCount;
+        f.builtFrame = g_frame;
         if (!f.geometry)
           f.geometry = dxvk::geometryHash(d);
         ++g_stats.flexRefreshed;
@@ -4454,6 +4567,7 @@ void onDraw(const Draw &d) {
     f.lastFrame = g_frame;
     mesh = f.handle;
     boneCount = f.bones;
+    meshBuiltFrame = f.builtFrame;
     geometry = f.geometry;
   } else if (transientDraw) {
     // Dynamic buffers are rewritten every frame: build, draw once, destroy.
@@ -4677,6 +4791,8 @@ void onDraw(const Draw &d) {
   inst.primitives = d.primCount;
   inst.firstIndex = d.startIndex;
   inst.skinned = skinnedDraw;
+  inst.deforming = flexTracked;
+  inst.builtFrame = meshBuiltFrame;
   if (cameraToWorld) { // see CameraSpace
     if (inst.bones.empty())
       premultiply(cameraToWorld, inst.transform);
@@ -4701,12 +4817,12 @@ void onDraw(const Draw &d) {
     uint32_t eyeBones = 0;
     g_liftVertexStep = 0;
     const remixapi_MaterialHandle eyeMaterial = clampedMaterialFor(d.texture1, isPointSampler(d.samplerStates, 1));
-    const uint64_t eyeHash = (dynamicBuffers ? hash : flexHash) ^ 0xe7e2ef2ac7e7e2efull;
+    const uint64_t eyeHash = (eyesPerFrame ? hash : flexHash) ^ 0xe7e2ef2ac7e7e2efull;
     remixapi_MeshHandle eyeMesh =
         eyeMaterial ? buildMesh(d, eyeHash, bonesPerVertex, &eyeBones, 0, false, false, 1, nullptr, flex,
-                                d.vsConstants + kRegEyeIrisU * 4, !dynamicBuffers, 0.5f)
+                                d.vsConstants + kRegEyeIrisU * 4, !eyesPerFrame, 0.5f)
                     : nullptr;
-    if (dynamicBuffers) {
+    if (eyesPerFrame) {
       if (eyeMesh)
         g_transient.push_back(eyeMesh);
     } else if (eyeMaterial) {
@@ -4722,7 +4838,8 @@ void onDraw(const Draw &d) {
       inst.mesh = eyeMesh;
       inst.material = eyeMaterial;
       inst.texture0 = d.texture1;
-      inst.persistent = !dynamicBuffers;
+      inst.persistent = !eyesPerFrame;
+      inst.deforming = true; // refreshed as the gaze moves
       inst.replacementHash = 0;
       ++g_stats.eyeRefracts;
     }
@@ -4761,16 +4878,16 @@ void onDraw(const Draw &d) {
     g_liftVertexStep = 0;
     const remixapi_MaterialHandle irisMaterial = clampedMaterialFor(d.texture1, isPointSampler(d.samplerStates, 1));
     // From buffers the engine rewrites (not seen for eyes) it stays per frame.
-    const uint64_t irisHash = (dynamicBuffers ? hash : flexHash) ^ 0x1215e5e5e5e51215ull;
+    const uint64_t irisHash = (eyesPerFrame ? hash : flexHash) ^ 0x1215e5e5e5e51215ull;
     remixapi_MeshHandle irisMesh =
         // Lifted out of the eyeball: by face normals (an eye has no vertex
         // normals) these wind as the model's do (faceNormalSign; 1 put the
         // iris inside it, where only a decal's attachment still found it).
         irisMaterial ? buildMesh(d, irisHash, bonesPerVertex, &irisBones, kIrisLift, false, false,
                                  faceNormalSign(d.cullMode), nullptr, flex,
-                                 d.vsConstants + kRegEyeIrisU * 4, !dynamicBuffers)
+                                 d.vsConstants + kRegEyeIrisU * 4, !eyesPerFrame)
                      : nullptr;
-    if (dynamicBuffers) {
+    if (eyesPerFrame) {
       if (irisMesh)
         g_transient.push_back(irisMesh);
     } else if (irisMaterial) {
@@ -4795,7 +4912,8 @@ void onDraw(const Draw &d) {
       over.separateAlpha = over.alphaTest = false;
       iris.blend = blendState(over);
       iris.categories = categories | REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC;
-      iris.persistent = !dynamicBuffers;
+      iris.persistent = !eyesPerFrame;
+      iris.deforming = true;
       iris.replacementHash = 0;
       iris.modelLayer = true; // its eye may be skinned on the CPU: world-space vertices, no transform
       g_instances.push_back(iris);
@@ -5470,6 +5588,8 @@ void onPresent() {
       const Role role = roles[inst.view];
       if (role == Role::Skip || (inst.offTarget && role != Role::Screen))
         continue;
+      if (inst.deforming && inst.builtFrame != ~0ull)
+        ++(inst.builtFrame == g_frame ? g_deformFresh : g_deformStale);
       if (role == Role::Screen) {
         // Blended layers of a model (an eye's iris over its eyeball: skinned,
         // or rigid with a model transform) come too; world decals and other
@@ -5616,7 +5736,11 @@ void onPresent() {
       identity.instanceId = idHash ? idHash : 1;
       identity.classification = REMIXAPI_INSTANCE_STATIC_EXT;
       identity.rasterVisible = 1;
-      const bool isStatic = staticWorld && role == Role::Main && inst.persistent && inst.bones.empty() &&
+      // (A mesh refreshed every frame is not: a part studiorender skins on
+      // the CPU has world-space vertices and no transform, and as part of the
+      // static set it was drawn a frame behind its body.)
+      const bool isStatic = staticWorld && role == Role::Main && inst.persistent && !inst.deforming &&
+                            inst.bones.empty() &&
                             !inst.blend.alphaBlendEnabled && !inst.categories &&
                             std::memcmp(inst.transform, identityTransform, sizeof(identityTransform)) == 0;
       // Additive draws (destination factor ONE: glows, lens flares, sparks)
@@ -6506,6 +6630,9 @@ void dumpStatistics(FILE *out) {
           (unsigned long long)g_screenSkipped[2], g_screenSkippedExample[2].c_str(),
           (unsigned long long)g_screenSkipped[3], g_screenSkippedExample[3].c_str());
   std::fill_n(g_screenSkipped, 4, 0ull);
+  fprintf(out, "   deforming instances submitted (since the last dump): mesh refreshed this frame %llu, earlier %llu\n",
+          (unsigned long long)g_deformFresh, (unsigned long long)g_deformStale);
+  g_deformFresh = g_deformStale = 0;
   for (const auto &c : screenCameras())
     fprintf(out, "   screen camera %u: at %.0f %.0f %.0f forward %.2f %.2f %.2f up %.2f %.2f %.2f fovY %.1f aspect %.2f\n",
             c.slot, c.position.x, c.position.y, c.position.z, c.forward.x, c.forward.y, c.forward.z, c.up.x, c.up.y,
