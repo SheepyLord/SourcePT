@@ -58,7 +58,12 @@ Material convert(const Inputs &in) {
     if (in.phongExponent > 0)
       roughness = phongRoughness(in.phongExponent, in.phongBoost);
   } else if (in.envmap) {
-    roughness = in.hasEnvmapTint ? 0.6f - 0.4f * (in.envmapTint[0] + in.envmapTint[1] + in.envmapTint[2]) / 3 : 0.4f;
+    // $envmaptint is the reflection's strength, which a dielectric's cannot
+    // follow (Fresnel sets it): a faint one is a rough sheen. ToPBR's 0.6 -
+    // 0.4 x tint left gm_scrapland's dried mud ($envmaptint 0.34, unmasked)
+    // a glossy 0.47 that mirrored the low sun across the ground (issue #84);
+    // as strong a tint as Source allows stays as smooth (0.2).
+    roughness = in.hasEnvmapTint ? 1 - 0.8f * (in.envmapTint[0] + in.envmapTint[1] + in.envmapTint[2]) / 3 : 0.4f;
   }
   out.roughness = roughness = std::clamp(roughness, 0.04f, 1.0f);
   Map &rough = out.maps[0], &metal = out.maps[1];
