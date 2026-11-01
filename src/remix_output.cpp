@@ -1181,7 +1181,7 @@ struct Instance {
   uint32_t categories;
   uint64_t replacementHash; // dxvk-remix mesh replacement key (0: none)
   bool persistent;          // mesh from static buffers (cached across frames)
-  bool singleSided = false; // blended draw D3D culls: its back faces are not seen
+  bool singleSided = false; // D3D culls its back faces (opaque models, blended draws by choice): not seen by any ray
   bool cameraCullBack = false; // D3D culls its back faces: hidden from the camera only
   std::vector<remixapi_Transform> bones; // skinned instances
   float transform[3][4];
@@ -4758,7 +4758,19 @@ void onDraw(const Draw &d) {
     char v[8] = {};
     return GetEnvironmentVariableA("OPENREMIX_PROXY_CULL_BLENDED", v, sizeof(v)) && v[0] == '1';
   }();
-  inst.singleSided = cullBlended && d.blend && d.cullMode != D3DCULL_NONE;
+  // Opaque models D3D draws with back faces culled (D3DCULL_CCW, Source's
+  // default; $nocull draws are D3DCULL_NONE) are one-sided for every ray, as
+  // dxvk-remix's rtx.enableCullingInSecondaryRays: their back faces are
+  // authored never to be seen. Two-sided, a collar's inside a hair over the
+  // neck and folds in a nose took every bounce leaving the skin under them
+  // (G-Man: solid black in indirect light). OPENREMIX_PROXY_TWO_SIDED_MODELS=1
+  // keeps them two-sided.
+  static const bool twoSidedModels = [] {
+    char v[8] = {};
+    return GetEnvironmentVariableA("OPENREMIX_PROXY_TWO_SIDED_MODELS", v, sizeof(v)) && v[0] == '1';
+  }();
+  inst.singleSided = (cullBlended && d.blend && d.cullMode != D3DCULL_NONE) ||
+                     (!twoSidedModels && !d.blend && d.cullMode == D3DCULL_CCW);
   // Opt-in (OPENREMIX_PROXY_CULL_BACKFACES_MODELS=1), not verified in game:
   // engine-drawn models hide from the camera the back faces D3D culls
   // (remixapi_InstanceInfoCameraCullingEXT; shadows and bounces still meet
