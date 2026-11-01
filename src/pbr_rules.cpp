@@ -19,6 +19,10 @@ namespace {
 // incidence: F / (4 alpha^2) = boost x F); the sharper of the two keeps a
 // boosted highlight as bright.
 constexpr float kPhongToBlinn = 4;
+// A base texture darker than this (mean luminance) under an envmap is metal.
+constexpr float kEnvmapMetalLuminance = 0.35f;
+// ... and its reflection this strong (mean $envmaptint, as authored).
+constexpr float kEnvmapMetalTint = 0.7f;
 float phongRoughness(float exponent, float boost) {
   float alpha = std::sqrt(2 / (kPhongToBlinn * std::clamp(exponent, 1.0f, 150.0f) + 2));
   if (boost > 1)
@@ -119,6 +123,39 @@ Material convert(const Inputs &in) {
       rough.scale = 0.75f;
     }
   }
+  // A dark base under a cubemap reflection (no Phong): Source draws it as the
+  // reflection over little diffuse, which is how polished metal looks
+  // (Portal's chamber pipes, metal/metal_lift001: $basealphaenvmapmask,
+  // $envmaptint 0.8; GMod issue #97). As ToPBR: where the mask reflects past
+  // 30% it is metal, and the metal is $envmaptint (gamma 2.2 in Source's
+  // shaders) instead of the dark base. A light (painted) base stays a shiny
+  // dielectric, and so does a weaker reflection: a sheen over a textured
+  // panel (the same map's metal/metalwall048b, $envmaptint 0.6 0.5 0.5, went
+  // flat grey as metal).
+  if (metal.texture.empty() && !out.metallic && !in.phong && in.envmap && envmapMetal() && in.luminance &&
+      !in.base.empty()) {
+    const float luminance = in.luminance(in.base);
+    float tint[3] = {1, 1, 1};
+    if (in.hasEnvmapTint)
+      for (int c = 0; c < 3; ++c)
+        tint[c] = std::pow(std::clamp(in.envmapTint[c], 0.0f, 1.0f), 2.2f);
+    const float strength = in.hasEnvmapTint ? (in.envmapTint[0] + in.envmapTint[1] + in.envmapTint[2]) / 3 : 1;
+    if (luminance >= 0 && luminance < kEnvmapMetalLuminance && strength >= kEnvmapMetalTint) {
+      // The mask as rough reads it (smooth where it reflects), turned around.
+      const bool masked = !rough.texture.empty();
+      if (masked) {
+        metal.texture = rough.texture;
+        metal.channel = rough.channel;
+        metal.invert = !rough.invert;
+        metal.bias = -0.3f / 0.7f;
+        metal.scale = 1 / 0.7f;
+      } else {
+        out.metallic = 1;
+      }
+      out.metalColored = true;
+      std::copy(tint, tint + 3, out.metalColor);
+    }
+  }
   // A dark, Phong-lit material whose surface is metal ($surfaceprop): Source
   // shows it as its highlight on a dark base, which is how metal looks (HL2's
   // helicopter bomb). Under its Phong mask; a light (painted) one stays
@@ -149,6 +186,14 @@ bool phongMetal() {
   static const bool on = [] {
     char v[8] = {};
     return !(GetEnvironmentVariableA("OPENREMIX_PROXY_PBR_PHONG_METAL", v, sizeof(v)) && v[0] == '0');
+  }();
+  return on;
+}
+
+bool envmapMetal() {
+  static const bool on = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_PBR_ENVMAP_METAL", v, sizeof(v)) && v[0] == '0');
   }();
   return on;
 }

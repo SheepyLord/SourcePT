@@ -777,6 +777,7 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
     uint8_t pbrBits[3];
     uint8_t nearest;
     uint16_t albedo[3]; // Shading::albedo, 1/1024 steps
+    uint8_t metalColor[4]; // pbr::Material::metalColor, 1/255 steps; [3] whether it has one
   } key;
   std::memset(&key, 0, sizeof(key)); // hashed as bytes
   key.mask = maskHash;
@@ -801,6 +802,11 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
       key.pbr[3 + 3 * i] = m.bias;
       key.pbr[4 + 3 * i] = m.scale;
       key.pbrBits[1 + i] = uint8_t(m.invert | (m.curve & 1) << 1 | (m.channel & 3) << 2);
+    }
+    if (p.metalColored) {
+      for (int c = 0; c < 3; ++c)
+        key.metalColor[c] = uint8_t(std::lround(std::clamp(p.metalColor[c], 0.0f, 1.0f) * 255));
+      key.metalColor[3] = 1;
     }
   }
   uint64_t hash = XXH3_64bits_withSeed(&key, sizeof(key), t.hash);
@@ -832,6 +838,9 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
   remixapi_MaterialInfoPbrEXT enable = {};
   enable.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_PBR_EXT;
   enable.enabled = 1;
+  remixapi_MaterialMetalColorEXT metalColor = {};
+  metalColor.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_METAL_COLOR_EXT;
+  metalColor.color = {key.metalColor[0] / 255.0f, key.metalColor[1] / 255.0f, key.metalColor[2] / 255.0f};
   remixapi_MaterialInfoReplacementHashEXT replacement = {};
   replacement.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_REPLACEMENT_HASH_EXT;
   replacement.materialHash = t.legacyHash;
@@ -854,6 +863,10 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
     remap.pNext = chain;
     enable.pNext = &remap;
     chain = &enable;
+    if (key.metalColor[3]) {
+      metalColor.pNext = chain;
+      chain = &metalColor;
+    }
     if (pbr.normal) {
       encoding.pNext = chain;
       chain = &encoding;
@@ -2248,12 +2261,15 @@ void probeMaterialDraw(const void *texture, const engine_materials::Shading &bou
   if (!out)
     return;
   const auto &b = engine_materials::bound();
-  fprintf(out, "f%llu texture %016llX | bound %s (%s, flags %08X) base %s pbr %d | taken mode %d base %s pbr %d normal %s rough %s ch %u bias %g scale %g, roughness %g%s%s\n",
+  fprintf(out, "f%llu texture %016llX | bound %s (%s, flags %08X) base %s pbr %d | taken mode %d base %s pbr %d normal %s rough %s ch %u bias %g scale %g, roughness %g | metal %s ch %u inv %d bias %g scale %g, metallic %g, colour %d (%g %g %g)%s%s\n",
           static_cast<unsigned long long>(g_frame), static_cast<unsigned long long>(hash), engine_materials::currentName(),
           b.known ? b.shader : "?", unsigned(b.flags), bound.base.c_str(), int(bound.pbr.active), int(taken.mode),
           taken.base.c_str(), int(taken.pbr.active), taken.pbr.normal.c_str(), taken.pbr.maps[0].texture.c_str(),
           taken.pbr.maps[0].channel, taken.pbr.maps[0].bias, taken.pbr.maps[0].scale, taken.pbr.roughness,
-          additive ? " additive" : "", multiply ? " multiply" : "");
+          taken.pbr.maps[1].texture.c_str(), taken.pbr.maps[1].channel, int(taken.pbr.maps[1].invert),
+          taken.pbr.maps[1].bias, taken.pbr.maps[1].scale, taken.pbr.metallic, int(taken.pbr.metalColored),
+          taken.pbr.metalColor[0], taken.pbr.metalColor[1], taken.pbr.metalColor[2], additive ? " additive" : "",
+          multiply ? " multiply" : "");
   fclose(out);
 }
 

@@ -53,6 +53,10 @@ struct Material {
   // $color2 removes: the draw's tint is not applied (the metal's colour is
   // the base texture's).
   bool metalByBaseAlpha = false;
+  // The metal's colour (remixapi_MaterialMetalColorEXT, linear): where it is
+  // metal the albedo turns to it (envmapped metal, see convert()).
+  bool metalColored = false;
+  float metalColor[3] = {1, 1, 1};
 };
 
 Material convert(const Inputs &in);
@@ -65,5 +69,7 @@ bool capable(const std::string &shader);
 bool enabled();
 // OPENREMIX_PROXY_PBR_PHONG_METAL=0 turns the dark Phong metal rule off.
 bool phongMetal();
+// OPENREMIX_PROXY_PBR_ENVMAP_METAL=0 turns the dark envmapped metal rule off.
+bool envmapMetal();
 
 } // namespace proxy::pbr
