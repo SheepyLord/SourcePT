@@ -300,13 +300,14 @@ void noteReplacementKey(uint64_t key, char kind = 'M') {
   }
 }
 
-// Whether a D3D9 sampler state requests point (nearest) filtering (e.g. for pixel-art).
+// Whether a D3D9 sampler state requests point (nearest) filtering (e.g. for
+// pixel-art): its magnification filter, what a close look shows. A point
+// minification filter alone still magnifies smoothly in D3D; taken as nearest
+// it drew blood on a face as blocks (issue #104).
 bool isPointSampler(const DWORD (*samplerStates)[16], uint32_t sampler = 0) {
   if (!samplerStates || sampler >= 16)
     return false;
-  const DWORD mag = samplerStates[sampler][D3DSAMP_MAGFILTER];
-  const DWORD min = samplerStates[sampler][D3DSAMP_MINFILTER];
-  return mag == D3DTEXF_POINT || min == D3DTEXF_POINT;
+  return samplerStates[sampler][D3DSAMP_MAGFILTER] == D3DTEXF_POINT;
 }
 
 // `skyBrightness` > 0 selects the sky variant, whose tint scales the texture.
@@ -1854,11 +1855,12 @@ float flexScale(const Draw &d) {
 // Converts one indexed draw into a Remix mesh. Returns nullptr when the draw
 // cannot be represented yet.
 float g_liftVertexStep = 0; // added lift per vertex index (render thread; set by onDraw for decals)
+float g_liftVertexCap = 0.3f; // at most this much of it
 // Forwarded vertex colours keep their hue only: each scaled so its largest
 // channel is full (render thread; set by onDraw for lit Lua meshes, whose
 // colours carry baked shading the path tracer replaces).
 bool g_hueColors = false;
-// `normalOffset` > 0 lifts the surface off its receiver (decals, see onDraw):
+// `normalOffset` lifts the surface off its receiver (decals, see onDraw; below 0 lowers it):
 // along the vertex normals, or without them (DecalModulate's vertices are a
 // position and a texture coordinate) along the summed face normals, e1 x e2
 // times `faceNormalSign` (see faceNormalSign()). `usedFaceNormals`: which.
@@ -2119,7 +2121,7 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
     else if (along < 0)
       ++g_stats.windingAgainst;
   }
-  if (normalOffset > 0) {
+  if (normalOffset != 0) {
     // Vertex normal where present, else the summed face normals.
     bool anyFace = false;
     std::vector<float> faces(vertices.size() * 3, 0.0f);
@@ -2142,7 +2144,7 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
       anyFace |= !(vlen > 1e-6f);
       if (len > 1e-12f)
         for (int j = 0; j < 3; ++j)
-          vertices[v].position[j] += n[j] / len * (normalOffset + std::min(float(v) * g_liftVertexStep, 0.3f)) * sign;
+          vertices[v].position[j] += n[j] / len * (normalOffset + std::min(float(v) * g_liftVertexStep, g_liftVertexCap)) * sign;
     }
     if (usedFaceNormals)
       *usedFaceNormals = anyFace;
@@ -4134,6 +4136,12 @@ void onDraw(const Draw &d) {
     ++(d.srcBlend == D3DBLEND_ONE && d.dstBlend == D3DBLEND_ONE ? g_stats.additive : g_stats.blended);
   const auto *pos = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
   const bool skinnedDraw = findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0) != nullptr;
+  // A studio model's decals come right after its own draws (studiorender
+  // draws a model, then its decals); a brush entity's after a brush.
+  static bool afterStudio = false;
+  const bool studioDecal = lifted && afterStudio;
+  if (!lifted)
+    afterStudio = skinnedDraw;
   // Particles (see submitParticles). A shader that builds its geometry reads
   // POSITION as it likes (a curve parameter, any type).
   const ParticleKind particle =
@@ -4423,18 +4431,43 @@ void onDraw(const Draw &d) {
   // within a draw (a batch of one material's decals) each vertex a little
   // above the one before it; the next draw starts above the last. Above the
   // map's overlays (0.1) and its second layers (0.05); in all under the
-  // runtime's attach distance (~2 inches): past kDecalRise they share a height.
-  constexpr float kDecalOffset = 0.15f, kDecalVertexStep = 0.001f, kDecalDrawGap = 0.004f, kDecalRise = 1.2f; // inches
+  // runtime's attach distance (~2 inches): past the rise cap they share a height.
+  // Model decals (drawn outside the world lists: props, NPCs) have no
+  // overlays under them and stack on their own, a fiftieth as high: lifted
+  // along a curved model's normals, paint at its silhouette stood out past it,
+  // where rays that miss the model met it unattached (a bullet hole as a dark
+  // disc beside a barrel, a grey strip off its edge; issue #104), and seen
+  // at an angle it slid off the hole it marks. The runtime finds the receiver
+  // with paint left out, so the lift only orders overlapping paint.
+  // studiorender itself places model decals 0.1 off the model, along its
+  // normals, and hides that with depth bias: a blood decal stood as a shell
+  // over G-Man's face (every vertex measured 0.099-0.101 out). They come
+  // back down by that much first.
+  // OPENREMIX_PROXY_MODEL_DECAL_LIFT scales the model lift (0: none).
+  constexpr float kStudioDecalOffset = 0.1f; // inches
+  struct DecalLift { float offset, vertexStep, vertexCap, drawGap, riseCap; }; // inches
+  static const DecalLift kWorldLift = {0.15f, 0.001f, 0.3f, 0.004f, 1.2f}, kModelLift = [] {
+    char v[32] = {};
+    const float scale = GetEnvironmentVariableA("OPENREMIX_PROXY_MODEL_DECAL_LIFT", v, sizeof(v))
+                            ? std::max(0.0f, float(std::atof(v)))
+                            : 1.0f;
+    return DecalLift{0.01f * scale, 0.00005f * scale, 0.005f * scale, 0.0005f * scale, 0.015f * scale};
+  }();
+  const bool modelDecal = g_worldLists == 0;
+  const DecalLift &lifting = modelDecal ? kModelLift : kWorldLift;
   static uint64_t decalFrame = ~0ull;
-  static float decalRise = 0; // how far this frame's decals have stacked up
+  static float decalRise[2] = {}; // how far this frame's world and model decals have stacked up
   if (decalFrame != g_frame) {
     decalFrame = g_frame;
-    decalRise = 0;
+    decalRise[0] = decalRise[1] = 0;
   }
-  const float lift = lifted ? kDecalOffset + decalRise : 0;
+  float &rise = decalRise[modelDecal];
+  const float lift = lifted ? lifting.offset + rise - (studioDecal ? kStudioDecalOffset : 0) : 0;
   if (lifted) // the next draw starts above this one's last vertex
-    decalRise = std::min(decalRise + std::min(float(d.numVertices) * kDecalVertexStep, 0.3f) + kDecalDrawGap, kDecalRise);
-  g_liftVertexStep = lifted ? kDecalVertexStep : 0;
+    rise = std::min(rise + std::min(float(d.numVertices) * lifting.vertexStep, lifting.vertexCap) + lifting.drawGap,
+                    lifting.riseCap);
+  g_liftVertexStep = lifted ? lifting.vertexStep : 0;
+  g_liftVertexCap = lifting.vertexCap;
   const float windingSign = lifted ? faceNormalSign(d.cullMode) : 1;
 
   struct Key {
