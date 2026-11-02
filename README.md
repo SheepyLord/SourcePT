@@ -1,6 +1,11 @@
 > This project uses AI-generated code
 
-# Garry's Mod RTX Remixed 2
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/ecee9efd-d865-494c-96e4-f0b4ed3c01d9" width="500" />
+</p>
+
+> proper logo someday
+
 This is currently a proxy `shaderapidx9.dll` for Garry's Mod that wraps the
 Source shader API (and later D3D9) to submit the game's rendering to
 [OpenRemix](https://github.com/OpenRenderCollective/OpenRemix) through the Remix C API. 
