@@ -1,4 +1,5 @@
 #include "vb_origins.h"
+#include "game.h"
 #include "vtable_proxy.h"
 #include <algorithm>
 #include <map>
@@ -30,8 +31,8 @@ const char *intern(const char *name) {
 
 // IVBAllocTracker slot 0: void CountVB(void *buffer, bool isDynamic,
 // int bufferSize, int vertexSize, VertexFormat_t fmt).
-void countVB(Wrapper *self, void *buffer, bool dynamic, int size, int vertexSize, uint64_t format) {
-  using Fn = void (*)(void *, void *, bool, int, int, uint64_t);
+void PROXY_THISCALL countVB(Wrapper *self, void *buffer, bool dynamic, int size, int vertexSize, uint64_t format) {
+  using Fn = void(PROXY_THISCALL *)(void *, void *, bool, int, int, uint64_t);
   if (buffer) {
     std::lock_guard lock(g_lock);
     g_buffers[buffer] = {t_allocator, format, vertexSize, dynamic};
@@ -40,8 +41,8 @@ void countVB(Wrapper *self, void *buffer, bool dynamic, int size, int vertexSize
 }
 
 // Slot 1: void UnCountVB(void *buffer).
-void unCountVB(Wrapper *self, void *buffer) {
-  using Fn = void (*)(void *, void *);
+void PROXY_THISCALL unCountVB(Wrapper *self, void *buffer) {
+  using Fn = void(PROXY_THISCALL *)(void *, void *);
   {
     std::lock_guard lock(g_lock);
     g_buffers.erase(buffer);
@@ -51,8 +52,8 @@ void unCountVB(Wrapper *self, void *buffer) {
 
 // Slot 2: bool TrackMeshAllocations(const char *allocatorName); a null name
 // closes the bracket.
-bool trackMeshAllocations(Wrapper *self, const char *name) {
-  using Fn = bool (*)(void *, const char *);
+bool PROXY_THISCALL trackMeshAllocations(Wrapper *self, const char *name) {
+  using Fn = bool(PROXY_THISCALL *)(void *, const char *);
   t_allocator = intern(name);
   return original<Fn>(self, 2)(self->real, name);
 }

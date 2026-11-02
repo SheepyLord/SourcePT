@@ -1,6 +1,7 @@
 #include "bsp_world.h"
 
 #include "engine_lights.h"
+#include "game.h"
 #include "lzma_source.h"
 #include "source_fs.h"
 #include "texture_categories.h"
@@ -1381,7 +1382,7 @@ WaterNormal *waterNormal(const std::string &name, float fps) {
 // Animated water normals show the frame of the time (submit, every frame).
 void animateWaterNormals() {
   static const auto update = reinterpret_cast<PFN_remixapi_UpdateTextureEXT>(
-      reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_UpdateTextureEXT")));
+      reinterpret_cast<void *>(GetProcAddress(game::runtimeModule(), "remixapi_UpdateTextureEXT")));
   static const ULONGLONG start = GetTickCount64();
   const double seconds = double(GetTickCount64() - start) / 1000;
   for (auto &normal : g_world.waterNormals) {
@@ -1658,9 +1659,9 @@ SecondLayer secondLayer(int base, bool use) {
 
 constexpr uint64_t kBatchId = 0x42535057; // "BSPW"
 
-// The runtime's scene instances (in process: resolved from remix.dll).
+// The runtime's scene instances (resolved from the runtime module, game.h).
 template <typename Fn> Fn sceneFunction(const char *name) {
-  const HMODULE runtime = GetModuleHandleW(L"remix.dll");
+  const HMODULE runtime = game::runtimeModule();
   return runtime ? reinterpret_cast<Fn>(GetProcAddress(runtime, name)) : nullptr;
 }
 
@@ -2879,7 +2880,7 @@ void sendPartition(const Bsp *bsp) {
     return !(GetEnvironmentVariableA("OPENREMIX_PROXY_PVS", v, sizeof(v)) && v[0] == '0');
   }();
   static auto set = reinterpret_cast<PFN_remixapi_SetVisibilityPartitionEXT>(
-      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_SetVisibilityPartitionEXT"));
+      GetProcAddress(game::runtimeModule(), "remixapi_SetVisibilityPartitionEXT"));
   if (!set)
     return;
   g_partition = {};
@@ -3170,8 +3171,12 @@ void submit(MaterialLookup lookup) {
     char v[8] = {};
     return !(GetEnvironmentVariableA("OPENREMIX_PROXY_BSP_BATCH", v, sizeof(v)) && v[0] == '0');
   }();
+  // Scene instances, where the runtime (or the bridge) has them, take the
+  // place of batches: the runtime keeps those, a batch is replayed by the host.
   static const auto beginRecording =
-      bridge && batchEnabled ? reinterpret_cast<BeginFn>(GetProcAddress(bridge, "openremix_bridge_BeginRecording")) : nullptr;
+      bridge && batchEnabled && !sceneFunction<PFN_remixapi_AddSceneInstancesEXT>("remixapi_AddSceneInstancesEXT")
+          ? reinterpret_cast<BeginFn>(GetProcAddress(bridge, "openremix_bridge_BeginRecording"))
+          : nullptr;
   static const auto endRecording =
       bridge ? reinterpret_cast<BatchFn>(GetProcAddress(bridge, "openremix_bridge_EndRecording")) : nullptr;
   static const auto replayBatch =
@@ -3670,7 +3675,7 @@ void dumpStatistics(FILE *out) {
             c.overlayBehind, c.propAgainst, c.propAlong, c.propPartsAlong);
     // The runtime's view of it (last traced frame).
     static auto get = reinterpret_cast<PFN_remixapi_GetCameraCullingStatisticsEXT>(
-        GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetCameraCullingStatisticsEXT"));
+        GetProcAddress(game::runtimeModule(), "remixapi_GetCameraCullingStatisticsEXT"));
     remixapi_CameraCullingStatisticsEXT r = {};
     r.structSize = sizeof(r);
     if (get && get(&r) == REMIXAPI_ERROR_CODE_SUCCESS)

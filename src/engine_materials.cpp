@@ -1,5 +1,6 @@
 #include "engine_materials.h"
 #include "bsp_world.h"
+#include "game.h"
 #include "remix_output.h"
 
 #include <windows.h>
@@ -136,8 +137,8 @@ struct Module {
     const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(module);
     if (dos->e_magic != IMAGE_DOS_SIGNATURE)
       return false;
-    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(base + dos->e_lfanew);
-    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+    const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC)
       return false;
     size = nt->OptionalHeader.SizeOfImage;
     return true;
@@ -161,10 +162,10 @@ struct Module {
 std::atomic<bool> g_installed{false}, g_subRects{false};
 std::atomic<const char *> g_status{"not installed"}, g_detail{""};
 
-using NameFn = const char *(*)(void *);
-using IntFn = int (*)(void *);
-using FloatFn = float (*)(void *);
-using VecFn = const float *(*)(void *);
+using NameFn = const char *(PROXY_THISCALL *)(void *);
+using IntFn = int(PROXY_THISCALL *)(void *);
+using FloatFn = float(PROXY_THISCALL *)(void *);
+using VecFn = const float *(PROXY_THISCALL *)(void *);
 NameFn g_materialName = nullptr, g_shaderName = nullptr, g_varName = nullptr, g_subRectName = nullptr,
        g_varString = nullptr;
 IntFn g_varInt = nullptr;
@@ -498,6 +499,12 @@ bool install(const void *const *shaderApiVtable) {
   static std::atomic<bool> done{false};
   if (done.exchange(true))
     return g_installed;
+  // L4D2: the RVAs, slots and offsets below are GMod's materialsystem.dll and
+  // shader API; L4D2's are not known yet, so nothing is read (every draw Lit).
+  if (!game::kGMod) {
+    g_status = "not available for this game (GMod's material system only)";
+    return false;
+  }
   char v[8] = {};
   if (GetEnvironmentVariableA("OPENREMIX_PROXY_EMISSIVE", v, sizeof(v)) && v[0] == '0') {
     g_status = "disabled (OPENREMIX_PROXY_EMISSIVE=0)";

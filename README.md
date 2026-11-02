@@ -39,3 +39,15 @@ This is primarily built on Linux, Windows support is largely untested.
 
 Deploy: rename `bin/win64/shaderapidx9.dll` to `shaderapidx9_orig.dll` and copy
 `_build/shaderapidx9.dll` in its place.
+
+The same tree builds the proxy for Left 4 Dead 2 (x86, work in progress: the
+runtime is reached through the bridge, `remix_bridge.dll` beside the proxy in
+`bin`), with the 32-bit cross file:
+
+    meson setup --cross-file cross/i686-w64-mingw32.txt _build-l4d2
+    meson compile -C _build-l4d2
+
+The game follows the cross file (`-Dgame=gmod|l4d2` names it; a mismatch with
+the cross file is an error). What differs between the games is in
+`src/game.h`; the GMod-only engine modules are left out of the L4D2 build
+(`src/gmod_only_stubs.cpp`).

@@ -3,6 +3,7 @@
 #include "d3d_hooks.h"
 #include "dxvk_hash.h"
 #include "engine_materials.h"
+#include "game.h"
 #include "texture_formats.h"
 #include "dxso/dxso_module.h"
 #include "dxso/dxso_modinfo.h"
@@ -414,7 +415,7 @@ static bool available() {
     char value[8] = {};
     if (GetEnvironmentVariableA("OPENREMIX_PROXY_HOST_PASSES", value, sizeof(value)) && value[0] == '0')
       return false;
-    const HMODULE runtime = GetModuleHandleW(L"remix.dll");
+    const HMODULE runtime = game::runtimeModule();
     if (!runtime)
       return false;
     g_registerShader = reinterpret_cast<PFN_remixapi_RegisterHostShaderEXT>(

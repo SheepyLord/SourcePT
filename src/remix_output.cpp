@@ -8,7 +8,11 @@
 #include "dxvk_hash.h"
 #include "engine_lights.h"
 #include "engine_materials.h"
+#include "game.h"
 #include "host_passes.h"
+#ifdef PROXY_GAME_L4D2
+#include "l4d2.h"
+#endif
 #include "particles.h"
 #include "texture_categories.h"
 #include "vb_origins.h"
@@ -51,14 +55,11 @@ constexpr unsigned kRegAmbientUp = 25; // c21..c26: ambient cube +X -X +Y -Y +Z 
 // MaterialMatrixMode_t
 constexpr int kMatrixView = 0;
 constexpr int kMatrixProjection = 1;
-// IShaderAPI (ShaderApi030) slot 12: void GetMatrix(MaterialMatrixMode_t, float *dst)
-constexpr unsigned kSlotGetMatrix = 12;
-// IShaderAPI slot 34: int GetCurrentNumBones() const
-constexpr unsigned kSlotGetCurrentNumBones = 34;
-// IShaderDynamicAPI: MaterialFogMode_t GetSceneFogMode(), void
-// GetSceneFogColor(unsigned char *rgb); IShaderAPI: void GetFogDistances(float
-// *start, float *end, float *fogZ). (tools/sdk_vtables64.py, like the above.)
-constexpr unsigned kSlotGetSceneFogMode = 4, kSlotGetSceneFogColor = 5, kSlotGetFogDistances = 213;
+// IShaderAPI slots GetMatrix, GetCurrentNumBones, GetSceneFogMode,
+// GetSceneFogColor, GetFogDistances: per game (game.h).
+using game::kSlotGetMatrix;
+using game::kSlotGetCurrentNumBones;
+using game::kSlotGetSceneFogMode, game::kSlotGetSceneFogColor, game::kSlotGetFogDistances;
 constexpr unsigned kMaxBones = 53; // cModel[53] starting at c58
 
 remixapi_Interface g_api = {};
@@ -1362,12 +1363,15 @@ std::atomic<uint32_t> g_fogSent{0}, g_fogFrames{0};
 float g_fogSample[8] = {}; // mode, start, end, max density, colour, sent end (statistics)
 
 void readSceneFog() {
+  if (!game::kSceneFogSlots)
+    return;
   auto *vtbl = *static_cast<void ***>(g_shaderApi);
   SceneFog fog;
-  fog.mode = reinterpret_cast<int (*)(void *)>(vtbl[kSlotGetSceneFogMode])(g_shaderApi);
-  reinterpret_cast<void (*)(void *, unsigned char *)>(vtbl[kSlotGetSceneFogColor])(g_shaderApi, fog.color);
-  reinterpret_cast<void (*)(void *, float *, float *, float *)>(vtbl[kSlotGetFogDistances])(g_shaderApi, &fog.start,
-                                                                                            &fog.end, &fog.z);
+  fog.mode = reinterpret_cast<int(PROXY_THISCALL *)(void *)>(vtbl[kSlotGetSceneFogMode])(g_shaderApi);
+  reinterpret_cast<void(PROXY_THISCALL *)(void *, unsigned char *)>(vtbl[kSlotGetSceneFogColor])(g_shaderApi,
+                                                                                                fog.color);
+  reinterpret_cast<void(PROXY_THISCALL *)(void *, float *, float *, float *)>(vtbl[kSlotGetFogDistances])(
+      g_shaderApi, &fog.start, &fog.end, &fog.z);
   fog.read = true;
   g_sceneFog = fog;
 }
@@ -1384,7 +1388,7 @@ void sendSceneFog() {
     return !(GetEnvironmentVariableA("OPENREMIX_PROXY_FOG", v, sizeof(v)) && v[0] == '0');
   }();
   static auto set = reinterpret_cast<PFN_remixapi_SetFogState>(
-      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_SetFogState"));
+      GetProcAddress(game::runtimeModule(), "remixapi_SetFogState"));
   if (!set)
     return;
   const SceneFog fog = g_sceneFog;
@@ -1532,13 +1536,13 @@ float g_lastSky[3] = {};
 std::string g_viewSummary; // last frame's views, for statistics
 
 int currentNumBones() {
-  using Fn = int(__thiscall *)(void *);
+  using Fn = int(PROXY_THISCALL *)(void *);
   auto *vtbl = *static_cast<void ***>(g_shaderApi);
   return reinterpret_cast<Fn>(vtbl[kSlotGetCurrentNumBones])(g_shaderApi);
 }
 
 void getMatrix(int mode, float *out) {
-  using Fn = void(__thiscall *)(void *, int, float *);
+  using Fn = void(PROXY_THISCALL *)(void *, int, float *);
   auto *vtbl = *static_cast<void ***>(g_shaderApi);
   reinterpret_cast<Fn>(vtbl[kSlotGetMatrix])(g_shaderApi, mode, out);
 }
@@ -1586,7 +1590,7 @@ remixapi_UITextureHandle uiTextureFor(const void *texture) {
   // to the runtime (remixapi_UpdateUITextureRegionEXT), without a copy when
   // its alpha is real.
   static const auto updateRegion = reinterpret_cast<PFN_remixapi_UpdateUITextureRegionEXT>(
-      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_UpdateUITextureRegionEXT"));
+      GetProcAddress(game::runtimeModule(), "remixapi_UpdateUITextureRegionEXT"));
   const bool wide = t.format == D3DFMT_A8R8G8B8 || t.format == D3DFMT_X8R8G8B8;
   if (t.registeredVersion && t.registeredVersion != t.version && updateRegion && wide &&
       t.data.size() == size_t(t.width) * t.height * 4) {
@@ -2502,16 +2506,17 @@ bool startRemix() {
   GetModuleFileNameW(self, path, MAX_PATH);
   std::wstring dll = path;
   g_moduleDir = dll.substr(0, dll.find_last_of(L"\\/"));
-  // OpenRemix runs in process (GMod is x64): bin/win64/openremix/remix.dll,
+  // GMod: OpenRemix runs in process (x64), bin/win64/openremix/remix.dll,
   // its dependencies (SDL3, OpenUSD, DLSS) resolved from that directory.
-  dll = g_moduleDir + L"\\openremix\\remix.dll";
-  diag::stage("OpenRemix: loading openremix\\remix.dll");
+  // L4D2: the bridge client beside the proxy (game.h).
+  dll = g_moduleDir + game::kRuntimePath;
+  diag::stage("OpenRemix: loading %s", game::kRuntimeLabel);
   if (!LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)) {
     // 126: the file or one of the DLLs it needs is missing; 193: wrong architecture.
-    diag::stage("OpenRemix: FAILED to load remix.dll (error %lu)", GetLastError());
+    diag::stage("OpenRemix: FAILED to load %s (error %lu)", game::kRuntimeName, GetLastError());
     return false;
   }
-  diag::stage("OpenRemix: remix.dll loaded, initializing the API");
+  diag::stage("OpenRemix: %s loaded, initializing the API", game::kRuntimeName);
   remixapi_HMODULE lib = nullptr;
   if (const auto status = remixapi_lib_loadRemixDllAndInitialize(dll.c_str(), &g_api, &lib);
       status != REMIXAPI_ERROR_CODE_SUCCESS) {
@@ -2544,7 +2549,7 @@ bool startRemix() {
       strcat(mods, "\\rtx-remix\\mods");
     }
     auto configure = reinterpret_cast<decltype(&remixapi_ConfigureUSDModsEXT)>(
-        GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_ConfigureUSDModsEXT"));
+        GetProcAddress(game::runtimeModule(), "remixapi_ConfigureUSDModsEXT"));
     if (configure && std::strcmp(mods, "0") != 0) {
       remixapi_USDModsOptionsEXT options = {};
       options.structSize = sizeof(options);
@@ -2571,7 +2576,7 @@ bool startRemix() {
   // undo it: ReSTIR DI came back on). An older runtime without it takes them
   // as plain settings.
   static const auto configDefault = reinterpret_cast<PFN_remixapi_SetConfigDefaultEXT>(
-      reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_SetConfigDefaultEXT")));
+      reinterpret_cast<void *>(GetProcAddress(game::runtimeModule(), "remixapi_SetConfigDefaultEXT")));
   auto setDefault = [](const char *key, const char *value) {
     if (!configDefault || configDefault(key, value) != REMIXAPI_ERROR_CODE_SUCCESS)
       g_api.SetConfigVariable(key, value);
@@ -5037,7 +5042,7 @@ void sampleGpuPasses() {
   if (!enabled)
     return;
   static auto get = reinterpret_cast<decltype(&remixapi_GetGpuPassTimingsEXT)>(
-      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetGpuPassTimingsEXT"));
+      GetProcAddress(game::runtimeModule(), "remixapi_GetGpuPassTimingsEXT"));
   static remixapi_GpuPassTimingsEXT t;
   t = {};
   t.structSize = sizeof(t);
@@ -5074,9 +5079,9 @@ struct SlowFrame {
 } g_slowFrame;
 void sampleFramePerformance() {
   static auto getPerformance = reinterpret_cast<PFN_remixapi_GetFramePerformanceEXT>(
-      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetFramePerformanceEXT"));
+      GetProcAddress(game::runtimeModule(), "remixapi_GetFramePerformanceEXT"));
   static auto getBreakdown = reinterpret_cast<PFN_remixapi_GetFrameBreakdownEXT>(
-      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetFrameBreakdownEXT"));
+      GetProcAddress(game::runtimeModule(), "remixapi_GetFrameBreakdownEXT"));
   remixapi_FramePerformanceEXT performance = {};
   performance.structSize = sizeof(performance);
   if (!getPerformance || getPerformance(&performance) != REMIXAPI_ERROR_CODE_SUCCESS)
@@ -5119,9 +5124,9 @@ void noteStatisticsDump(bool begin) { (begin ? g_statisticsBegan : g_statisticsE
 // are), the engine's frame and this proxy's draw handling within it.
 void logFrameSpike() {
   static auto getPerformance = reinterpret_cast<PFN_remixapi_GetFramePerformanceEXT>(
-      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetFramePerformanceEXT"));
+      GetProcAddress(game::runtimeModule(), "remixapi_GetFramePerformanceEXT"));
   static auto getBreakdown = reinterpret_cast<PFN_remixapi_GetFrameBreakdownEXT>(
-      GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetFrameBreakdownEXT"));
+      GetProcAddress(game::runtimeModule(), "remixapi_GetFrameBreakdownEXT"));
   static uint32_t last[5] = {}, frames = 0, logged = 0, sinceSpike = 0;
   static double average = 0;
   static const ULONGLONG started = GetTickCount64();
@@ -5191,7 +5196,7 @@ void logWindowState(uint32_t presents) {
   if (presents % 30 != 0 && presents > 3)
     return;
   static auto framePerformance = reinterpret_cast<PFN_remixapi_GetFramePerformanceEXT>(
-      reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetFramePerformanceEXT")));
+      reinterpret_cast<void *>(GetProcAddress(game::runtimeModule(), "remixapi_GetFramePerformanceEXT")));
   remixapi_FramePerformanceEXT performance = {};
   performance.structSize = sizeof(performance);
   if (framePerformance)
@@ -5243,7 +5248,7 @@ void logWindowState(uint32_t presents) {
 void logRendererState(uint32_t presents, size_t instances) {
   if (presents % 30 != 0 && presents > 3)
     return;
-  auto stat = [](const char *name) { return reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"remix.dll"), name)); };
+  auto stat = [](const char *name) { return reinterpret_cast<void *>(GetProcAddress(game::runtimeModule(), name)); };
   static auto getBackend = reinterpret_cast<PFN_remixapi_GetBackendCapabilitiesEXT>(stat("remixapi_GetBackendCapabilitiesEXT"));
   static auto getTracing = reinterpret_cast<PFN_remixapi_GetTracingStatisticsEXT>(stat("remixapi_GetTracingStatisticsEXT"));
   static auto getDenoising = reinterpret_cast<PFN_remixapi_GetDenoisingStatisticsEXT>(stat("remixapi_GetDenoisingStatisticsEXT"));
@@ -6045,6 +6050,9 @@ void onPresent() {
       g_api.DrawLightInstance(cached.handle);
       ++g_stats.lights;
     }
+#ifdef PROXY_GAME_L4D2
+    l4d2::submitLights(g_api); // the survivors' flashlights (their own Remix lights)
+#endif
     if (g_skyDome)
       g_api.DrawLightInstance(g_skyDome); // the captured 2D skybox (setSkyFaces)
     g_lastLights.swap(g_frameLights);
@@ -6503,7 +6511,7 @@ PFN_remixapi_UpdateTextureEXT targetUpdateEntry() {
     if (GetEnvironmentVariableA("OPENREMIX_PROXY_TARGET_UPDATE", v, sizeof(v)) && v[0] == '0')
       return PFN_remixapi_UpdateTextureEXT(nullptr);
     return reinterpret_cast<PFN_remixapi_UpdateTextureEXT>(
-        reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_UpdateTextureEXT")));
+        reinterpret_cast<void *>(GetProcAddress(game::runtimeModule(), "remixapi_UpdateTextureEXT")));
   }();
   return entry;
 }
@@ -6729,7 +6737,7 @@ void dumpStatistics(FILE *out) {
           g_usSubmit.exchange(0) / f / 1000, g_usBsp.exchange(0) / f / 1000, g_usPresent.exchange(0) / f / 1000);
   if (g_ready) {
     static auto framePerformance = reinterpret_cast<PFN_remixapi_GetFramePerformanceEXT>(
-        GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetFramePerformanceEXT"));
+        GetProcAddress(game::runtimeModule(), "remixapi_GetFramePerformanceEXT"));
     remixapi_FramePerformanceEXT perf = {};
     perf.structSize = sizeof(perf);
     if (framePerformance && framePerformance(&perf) == REMIXAPI_ERROR_CODE_SUCCESS)
@@ -6798,7 +6806,7 @@ void dumpStatistics(FILE *out) {
       g_slowFrame.recordSum = 0;
     }
     // GPU side: per-pass times, tracing and local-light counts.
-    auto stat = [](const char *name) { return GetProcAddress(GetModuleHandleW(L"remix.dll"), name); };
+    auto stat = [](const char *name) { return GetProcAddress(game::runtimeModule(), name); };
     static auto passTimings = reinterpret_cast<decltype(&remixapi_GetGpuPassTimingsEXT)>(stat("remixapi_GetGpuPassTimingsEXT"));
     static auto tracing = reinterpret_cast<decltype(&remixapi_GetTracingStatisticsEXT)>(stat("remixapi_GetTracingStatisticsEXT"));
     static auto localLights = reinterpret_cast<decltype(&remixapi_GetLocalLightStatisticsEXT)>(stat("remixapi_GetLocalLightStatisticsEXT"));
@@ -6906,7 +6914,7 @@ void dumpStatistics(FILE *out) {
   {
     char diagnostic[512] = {};
     auto modsDiagnostic = reinterpret_cast<decltype(&remixapi_GetUSDModsDiagnosticEXT)>(
-        GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetUSDModsDiagnosticEXT"));
+        GetProcAddress(game::runtimeModule(), "remixapi_GetUSDModsDiagnosticEXT"));
     if (g_ready && modsDiagnostic)
       modsDiagnostic(diagnostic, sizeof(diagnostic));
     fprintf(out, "   USD mods: configure %d; %s\n", int(g_modsResult), diagnostic);
@@ -7235,7 +7243,7 @@ void dumpStatistics(FILE *out) {
             g_targetRecreated.exchange(0), g_targetFailed.exchange(0),
             targetUpdateEntry() ? "" : " | in-place updates off: a new texture per image");
     static const auto statistics = reinterpret_cast<PFN_remixapi_GetTextureStatisticsEXT>(reinterpret_cast<void *>(
-        GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetTextureStatisticsEXT")));
+        GetProcAddress(game::runtimeModule(), "remixapi_GetTextureStatisticsEXT")));
     static remixapi_TextureStatisticsEXT last = {};
     remixapi_TextureStatisticsEXT now = {};
     now.structSize = sizeof(now);

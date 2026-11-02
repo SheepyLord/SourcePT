@@ -1788,15 +1788,15 @@ IDirect3D9 *WINAPI direct3DCreate9(UINT sdk) {
 // Rewrites `module`'s IAT entry for dll!name.
 void *patchImport(HMODULE module, const char *dll, const char *name, void *hook) {
   auto *base = reinterpret_cast<uint8_t *>(module);
-  auto *nt = reinterpret_cast<IMAGE_NT_HEADERS64 *>(base + reinterpret_cast<IMAGE_DOS_HEADER *>(base)->e_lfanew);
+  auto *nt = reinterpret_cast<IMAGE_NT_HEADERS *>(base + reinterpret_cast<IMAGE_DOS_HEADER *>(base)->e_lfanew);
   const auto &dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
   for (auto *imp = reinterpret_cast<IMAGE_IMPORT_DESCRIPTOR *>(base + dir.VirtualAddress); imp->Name; ++imp) {
     if (_stricmp(reinterpret_cast<char *>(base + imp->Name), dll) != 0)
       continue;
-    auto *names = reinterpret_cast<IMAGE_THUNK_DATA64 *>(base + imp->OriginalFirstThunk);
-    auto *iat = reinterpret_cast<IMAGE_THUNK_DATA64 *>(base + imp->FirstThunk);
+    auto *names = reinterpret_cast<IMAGE_THUNK_DATA *>(base + imp->OriginalFirstThunk);
+    auto *iat = reinterpret_cast<IMAGE_THUNK_DATA *>(base + imp->FirstThunk);
     for (; names->u1.AddressOfData; ++names, ++iat) {
-      if (names->u1.Ordinal & IMAGE_ORDINAL_FLAG64)
+      if (names->u1.Ordinal & IMAGE_ORDINAL_FLAG)
         continue;
       auto *byName = reinterpret_cast<IMAGE_IMPORT_BY_NAME *>(base + names->u1.AddressOfData);
       if (std::strcmp(reinterpret_cast<char *>(byName->Name), name) != 0)
@@ -1804,7 +1804,7 @@ void *patchImport(HMODULE module, const char *dll, const char *name, void *hook)
       DWORD old;
       VirtualProtect(&iat->u1.Function, sizeof(iat->u1.Function), PAGE_READWRITE, &old);
       void *previous = reinterpret_cast<void *>(iat->u1.Function);
-      iat->u1.Function = reinterpret_cast<ULONGLONG>(hook);
+      iat->u1.Function = reinterpret_cast<ULONG_PTR>(hook);
       VirtualProtect(&iat->u1.Function, sizeof(iat->u1.Function), old, &old);
       return previous;
     }
