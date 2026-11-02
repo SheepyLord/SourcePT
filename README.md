@@ -16,7 +16,9 @@ RTX Remix mods from the old version of the project will be supported, and also a
 
 Multiplayer works out of the box since everything lives in the wrapper.
 
-Other source game support is planned
+### Games supported
+* Garry's Mod
+* Left 4 Dead 2
 
 ## Installation
 - Ensure you're on the `main` branch of Garry's Mod on Steam (not `x86-64`)
