@@ -139,6 +139,13 @@ phases; do not add it to them. CPU, GPU and host observations are asynchronous,
 so their IDs and intervals must not be treated as one aligned frame. These extra
 columns add no API queries and leave profiling-disabled behavior unchanged.
 
+`profilePreviousMs` measures the preceding profiler invocation's complete wall
+cost, including statistics queries, formatting and a periodic file flush. The
+first value is zero. It trails the CPU/GPU snapshot IDs by a sample and must not
+be assigned to the current snapshot or subtracted from asynchronous native CPU
+timings. Use it to check whether the observer itself perturbs a comparison;
+disabled sessions take no timestamps for this measurement.
+
 The appended `cpuStatus` and `bakeStatus` retain each statistics API return code.
 A failed query is unknown; zero-filled CPU/bake fields are not evidence of a zero-cost
 frame, absent lighting or a rebake.

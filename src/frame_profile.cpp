@@ -2,6 +2,7 @@
 #include "diag.h"
 #include <windows.h>
 #include <cstdio>
+#include <chrono>
 #include <cstring>
 #include <memory>
 #include <fcntl.h>
@@ -19,6 +20,7 @@ struct Recorder {
   PFN_remixapi_GetBakeStatisticsEXT bake = nullptr;
   uint64_t lastGpu = ~0ull, lastCpu = ~0ull;
   uint32_t rows = 0;
+  double previousSampleMilliseconds = 0;
 
   Recorder() {
     wchar_t path[32768] = {};
@@ -49,12 +51,13 @@ struct Recorder {
                "depthMs,viewmodelMs,viewmodelSunShadowMs,viewmodelLocalShadowMs,bakeState,bakeHash,"
                "hostFocused,processFocused,windowStatus,nativeFocused,nativeMinimized,nativeWidth,nativeHeight,cpuStatus,bakeStatus,"
                "gpuTruncated,probeGatherAvailable,probeGatherMs,viewmodelColorMs,viewmodelDepthMs,"
-               "cpuAttempt,cpuNew,cpuPresented,cpuPresentMs,cpuSceneMs,cpuAcquireMs,cpuSubmitMs,cpuQueuePresentMs\n", file.get());
+               "cpuAttempt,cpuNew,cpuPresented,cpuPresentMs,cpuSceneMs,cpuAcquireMs,cpuSubmitMs,cpuQueuePresentMs,profilePreviousMs\n", file.get());
   }
 
   void sample(double hostMs, remixapi_ErrorCode presentStatus,
               HWND hostWindow, PFN_remixapi_GetWindowState getWindowState) {
     if (!file) return;
+    const auto began = std::chrono::steady_clock::now();
     // Record observations without changing focus. Missing window state is an
     // explicit failure status, never an assumed focused measurement.
     remixapi_WindowState window{};
@@ -96,7 +99,7 @@ struct Recorder {
     const bool cpuFresh = cpuStatus == REMIXAPI_ERROR_CODE_SUCCESS && frame.attempts != lastCpu;
     std::fprintf(file.get(), "%llu,%.6f,%u,%.6f,%.6f,%u,%u,%llu,%.6f,%u,%u,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,"
         "%.6f,%.6f,%.6f,%.6f,%u,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%.6f,%.6f,%.6f,"
-        "%llu,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+        "%llu,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
         static_cast<unsigned long long>(unixMs), hostMs, unsigned(presentStatus), frame.recordMilliseconds, frame.fenceMilliseconds,
         unsigned(available), unsigned(fresh), static_cast<unsigned long long>(timings.frame), timings.frameMilliseconds,
         timings.renderWidth, timings.renderHeight, timings.outputWidth, timings.outputHeight,
@@ -112,10 +115,14 @@ struct Recorder {
         pass("Forward+ viewmodel color"), pass("Forward+ viewmodel depth prepass"),
         static_cast<unsigned long long>(frame.attempts), unsigned(cpuFresh), frame.presented,
         frame.presentMilliseconds, frame.sceneMilliseconds, frame.acquireMilliseconds,
-        frame.submitMilliseconds, frame.queuePresentMilliseconds);
+        frame.submitMilliseconds, frame.queuePresentMilliseconds, previousSampleMilliseconds);
     if (available) lastGpu = timings.frame;
     if (cpuStatus == REMIXAPI_ERROR_CODE_SUCCESS) lastCpu = frame.attempts;
     if (++rows % 120 == 0) std::fflush(file.get());
+    // A row cannot include the cost of writing itself. Attribute this complete
+    // sample (queries, formatting and any flush) to the next row explicitly.
+    previousSampleMilliseconds = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - began).count();
   }
 };
 }
