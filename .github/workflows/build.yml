@@ -1,0 +1,48 @@
+# The proxy shaderapidx9.dll for Garry's Mod x64 (bin/win64), cross-built on
+# Linux with MinGW-w64 as README.md describes, against OpenRemix's public
+# headers (its Vulkan and SDL3 headers too). Arch Linux for the same rolling
+# toolchain the project is developed with.
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      openremix_ref:
+        description: OpenRemix branch, tag or commit for the headers
+        default: main
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    container: archlinux:latest
+    steps:
+      - name: Install build tools
+        run: pacman -Syu --noconfirm --needed git meson ninja glslang mingw-w64-gcc python
+
+      - uses: actions/checkout@v4
+
+      - name: Check out OpenRemix headers
+        uses: actions/checkout@v4
+        with:
+          repository: sambow23/OpenRemix
+          ref: ${{ inputs.openremix_ref || 'main' }}
+          path: openremix
+          sparse-checkout: |
+            public/include
+            include/vulkan/include
+            subprojects/SDL3-3.4.14/include
+
+      - name: Build
+        run: |
+          meson setup --cross-file cross/x86_64-w64-mingw32.txt \
+            -Dopenremix_include="$PWD/openremix/public/include" _build
+          meson compile -C _build
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: shaderapidx9-x64
+          path: _build/shaderapidx9.dll
