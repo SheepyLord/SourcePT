@@ -131,6 +131,14 @@ host window, any foreground window in the game process, and the native output's
 focus/minimized/drawable state. Reject unfocused or minimized intervals when
 comparing gameplay performance; a failed `windowStatus` is unknown state. GPU
 readbacks can repeat across host frames, so use `gpuNew` for GPU timing summaries.
+CPU summaries likewise require `cpuStatus=0`, `cpuNew=1` and `cpuPresented=1`;
+`cpuAttempt` identifies the completed CPU snapshot. Appended `cpuPresentMs`,
+`cpuSceneMs`, `cpuAcquireMs`, `cpuSubmitMs` and `cpuQueuePresentMs` use the CPU
+snapshot already queried for recording/fence times. Present time contains nested
+phases; do not add it to them. CPU, GPU and host observations are asynchronous,
+so their IDs and intervals must not be treated as one aligned frame. These extra
+columns add no API queries and leave profiling-disabled behavior unchanged.
+
 The appended `cpuStatus` and `bakeStatus` retain each statistics API return code.
 A failed query is unknown; zero-filled CPU/bake fields are not evidence of a zero-cost
 frame, absent lighting or a rebake.

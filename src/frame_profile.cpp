@@ -17,7 +17,7 @@ struct Recorder {
   PFN_remixapi_GetGpuPassTimingsEXT gpu = nullptr;
   PFN_remixapi_GetFramePerformanceEXT cpu = nullptr;
   PFN_remixapi_GetBakeStatisticsEXT bake = nullptr;
-  uint64_t lastGpu = ~0ull;
+  uint64_t lastGpu = ~0ull, lastCpu = ~0ull;
   uint32_t rows = 0;
 
   Recorder() {
@@ -48,7 +48,8 @@ struct Recorder {
                "outputWidth,outputHeight,opaqueMs,clusterMs,localShadowMs,sunShadowMs,reflectionMs,"
                "depthMs,viewmodelMs,viewmodelSunShadowMs,viewmodelLocalShadowMs,bakeState,bakeHash,"
                "hostFocused,processFocused,windowStatus,nativeFocused,nativeMinimized,nativeWidth,nativeHeight,cpuStatus,bakeStatus,"
-               "gpuTruncated,probeGatherAvailable,probeGatherMs,viewmodelColorMs,viewmodelDepthMs\n", file.get());
+               "gpuTruncated,probeGatherAvailable,probeGatherMs,viewmodelColorMs,viewmodelDepthMs,"
+               "cpuAttempt,cpuNew,cpuPresented,cpuPresentMs,cpuSceneMs,cpuAcquireMs,cpuSubmitMs,cpuQueuePresentMs\n", file.get());
   }
 
   void sample(double hostMs, remixapi_ErrorCode presentStatus,
@@ -89,8 +90,13 @@ struct Recorder {
     const uint64_t ticks = (uint64_t(now.dwHighDateTime) << 32) | now.dwLowDateTime;
     const auto unixMs = (ticks - 116444736000000000ull) / 10000;
     const bool fresh = available && timings.frame != lastGpu;
+    // These fields come from the same CPU snapshot already queried above. Host
+    // intervals and completed CPU/GPU frames are asynchronous; record identity
+    // and freshness rather than treating repeated snapshots as new frames.
+    const bool cpuFresh = cpuStatus == REMIXAPI_ERROR_CODE_SUCCESS && frame.attempts != lastCpu;
     std::fprintf(file.get(), "%llu,%.6f,%u,%.6f,%.6f,%u,%u,%llu,%.6f,%u,%u,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,"
-        "%.6f,%.6f,%.6f,%.6f,%u,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%.6f,%.6f,%.6f\n",
+        "%.6f,%.6f,%.6f,%.6f,%u,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%.6f,%.6f,%.6f,"
+        "%llu,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f\n",
         static_cast<unsigned long long>(unixMs), hostMs, unsigned(presentStatus), frame.recordMilliseconds, frame.fenceMilliseconds,
         unsigned(available), unsigned(fresh), static_cast<unsigned long long>(timings.frame), timings.frameMilliseconds,
         timings.renderWidth, timings.renderHeight, timings.outputWidth, timings.outputHeight,
@@ -103,8 +109,12 @@ struct Recorder {
         unsigned(windowStatus), unsigned(window.focused), unsigned(window.minimized),
         window.drawableWidth, window.drawableHeight, unsigned(cpuStatus), unsigned(bakeStatus),
         timings.truncated, unsigned(probeGather != nullptr), probeGather ? probeGather->milliseconds : 0.0,
-        pass("Forward+ viewmodel color"), pass("Forward+ viewmodel depth prepass"));
+        pass("Forward+ viewmodel color"), pass("Forward+ viewmodel depth prepass"),
+        static_cast<unsigned long long>(frame.attempts), unsigned(cpuFresh), frame.presented,
+        frame.presentMilliseconds, frame.sceneMilliseconds, frame.acquireMilliseconds,
+        frame.submitMilliseconds, frame.queuePresentMilliseconds);
     if (available) lastGpu = timings.frame;
+    if (cpuStatus == REMIXAPI_ERROR_CODE_SUCCESS) lastCpu = frame.attempts;
     if (++rows % 120 == 0) std::fflush(file.get());
   }
 };
