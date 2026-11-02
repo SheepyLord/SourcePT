@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <tuple>
 
 namespace proxy::pbr {
 namespace {
@@ -131,14 +133,16 @@ Material convert(const Inputs &in) {
   // A dark base under a cubemap reflection (no Phong): Source draws it as the
   // reflection over little diffuse, which is how polished metal looks
   // (Portal's chamber pipes, metal/metal_lift001: $basealphaenvmapmask,
-  // $envmaptint 0.8; GMod issue #97). As ToPBR: where the mask reflects past
-  // 30% it is metal, and the metal is $envmaptint (gamma 2.2 in Source's
+  // $envmaptint 0.8; GMod issue #97). As ToPBR: where the mask reflects it
+  // is metal, and the metal is $envmaptint (gamma 2.2 in Source's
   // shaders) instead of the dark base. A light (painted) base stays a shiny
   // dielectric, and so does a weaker reflection: a sheen over a textured
   // panel (the same map's metal/metalwall048b, $envmaptint 0.6 0.5 0.5, went
-  // flat grey as metal).
-  if (metal.texture.empty() && !out.metallic && !in.phong && in.envmap && envmapMetal() && in.luminance &&
-      !in.base.empty()) {
+  // flat grey as metal). A mask in the normal map's alpha is a bumped
+  // surface's gloss, not polished metal either (HL2's train seats,
+  // $envmaptint 0.8, turned to chrome).
+  if (metal.texture.empty() && !out.metallic && !in.phong && in.envmap && !in.normalAlphaEnvmapMask &&
+      envmapMetal() && in.luminance && !in.base.empty()) {
     const float luminance = in.luminance(in.base);
     float tint[3] = {1, 1, 1};
     if (in.hasEnvmapTint)
@@ -146,14 +150,32 @@ Material convert(const Inputs &in) {
         tint[c] = std::pow(std::clamp(in.envmapTint[c], 0.0f, 1.0f), 2.2f);
     const float strength = in.hasEnvmapTint ? (in.envmapTint[0] + in.envmapTint[1] + in.envmapTint[2]) / 3 : 1;
     if (luminance >= 0 && luminance < kEnvmapMetalLuminance && strength >= kEnvmapMetalTint) {
-      // The mask as rough reads it (smooth where it reflects), turned around.
+      // The mask as rough reads it (smooth where it reflects), turned around,
+      // is the metal. Source's cubemap is as sharp under a faint mask as a
+      // full one, only weaker: a mirror (roughness 0) beside fully rough rust
+      // (1), switching to metal past ToPBR's 30%, made the pipes blotchy at
+      // every rust spot. Here the mask is metal as it is, roughness 0.05 to
+      // 0.8 along the mask's rough side (OPENREMIX_PROXY_PBR_ENVMAP_METAL_
+      // ROUGHNESS="min max exponent"): bare metal stays glossy, just above
+      // where the runtime's primary surface replacement takes smooth metal
+      // as an exact mirror (0.041), whose hard edge against the glossier
+      // texels around it cut across the pipes;
+      // and roughness reads the mask two mips blurred: Valve paints it in
+      // crisp patches, whose edges a sharp path-traced reflection showed as
+      // blotches where Source's dim cubemap hid them
+      // (OPENREMIX_PROXY_PBR_ENVMAP_METAL_BLUR, in mips; 0: sharp). Metallic
+      // reads it sharp: it decides where the rust's diffuse shows, whose
+      // detail a blurred one washed out.
       const bool masked = !rough.texture.empty();
       if (masked) {
         metal.texture = rough.texture;
         metal.channel = rough.channel;
         metal.invert = !rough.invert;
-        metal.bias = -0.3f / 0.7f;
-        metal.scale = 1 / 0.7f;
+        const auto [low, high, exponent] = envmapMetalRoughness();
+        rough.bias = low;
+        rough.scale = high - low;
+        rough.exponent = exponent;
+        out.blur = envmapMetalBlur();
       } else {
         out.metallic = 1;
       }
@@ -193,6 +215,33 @@ bool phongMetal() {
     return !(GetEnvironmentVariableA("OPENREMIX_PROXY_PBR_PHONG_METAL", v, sizeof(v)) && v[0] == '0');
   }();
   return on;
+}
+
+std::tuple<float, float, float> envmapMetalRoughness() {
+  static const std::tuple<float, float, float> range = [] {
+    char v[64] = {};
+    float low = 0.05f, high = 0.8f, exponent = 1;
+    if (GetEnvironmentVariableA("OPENREMIX_PROXY_PBR_ENVMAP_METAL_ROUGHNESS", v, sizeof(v))) {
+      float a, b, c = 1;
+      if (std::sscanf(v, "%f %f %f", &a, &b, &c) >= 2 || std::sscanf(v, "%f,%f,%f", &a, &b, &c) >= 2) {
+        low = std::clamp(a, 0.0f, 1.0f);
+        high = std::clamp(b, low, 1.0f);
+        exponent = std::clamp(c, 0.0f, 15.0f);
+      }
+    }
+    return std::tuple{low, high, exponent};
+  }();
+  return range;
+}
+
+float envmapMetalBlur() {
+  static const float blur = [] {
+    char v[32] = {};
+    return GetEnvironmentVariableA("OPENREMIX_PROXY_PBR_ENVMAP_METAL_BLUR", v, sizeof(v))
+               ? std::clamp(float(std::atof(v)), 0.0f, 15.0f)
+               : 2.0f;
+  }();
+  return blur;
 }
 
 bool envmapMetal() {

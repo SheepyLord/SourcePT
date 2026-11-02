@@ -778,6 +778,7 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
     uint8_t nearest;
     uint16_t albedo[3]; // Shading::albedo, 1/1024 steps
     uint8_t metalColor[4]; // pbr::Material::metalColor, 1/255 steps; [3] whether it has one
+    uint8_t blur; // pbr::Material::blur, 1/16 mips
   } key;
   std::memset(&key, 0, sizeof(key)); // hashed as bytes
   key.mask = maskHash;
@@ -808,6 +809,7 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
         key.metalColor[c] = uint8_t(std::lround(std::clamp(p.metalColor[c], 0.0f, 1.0f) * 255));
       key.metalColor[3] = 1;
     }
+    key.blur = uint8_t(std::lround(std::clamp(p.blur, 0.0f, 15.9375f) * 16));
   }
   uint64_t hash = XXH3_64bits_withSeed(&key, sizeof(key), t.hash);
   if (!hash || hash == t.hash)
@@ -841,6 +843,9 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
   remixapi_MaterialMetalColorEXT metalColor = {};
   metalColor.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_METAL_COLOR_EXT;
   metalColor.color = {key.metalColor[0] / 255.0f, key.metalColor[1] / 255.0f, key.metalColor[2] / 255.0f};
+  remixapi_MaterialPbrBlurEXT blur = {};
+  blur.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_PBR_BLUR_EXT;
+  blur.roughnessMinimumLod = std::min(key.blur / 16.0f, 15.0f);
   remixapi_MaterialInfoReplacementHashEXT replacement = {};
   replacement.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_REPLACEMENT_HASH_EXT;
   replacement.materialHash = t.legacyHash;
@@ -866,6 +871,10 @@ EmissiveMaterial *ensureEmissive(RemixTexture &t, const engine_materials::Shadin
     if (key.metalColor[3]) {
       metalColor.pNext = chain;
       chain = &metalColor;
+    }
+    if (key.blur) {
+      blur.pNext = chain;
+      chain = &blur;
     }
     if (pbr.normal) {
       encoding.pNext = chain;

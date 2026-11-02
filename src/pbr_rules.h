@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <tuple>
 
 // Source materials as PBR materials, converted while they are drawn: the
 // runtime reads the game's own textures (its normal map, and the masks Source
@@ -57,6 +58,9 @@ struct Material {
   // metal the albedo turns to it (envmapped metal, see convert()).
   bool metalColored = false;
   float metalColor[3] = {1, 1, 1};
+  // The roughness map's least mip (remixapi_MaterialPbrBlurEXT; 0: as sharp
+  // as the view allows).
+  float blur = 0;
 };
 
 Material convert(const Inputs &in);
@@ -71,5 +75,10 @@ bool enabled();
 bool phongMetal();
 // OPENREMIX_PROXY_PBR_ENVMAP_METAL=0 turns the dark envmapped metal rule off.
 bool envmapMetal();
+// The roughness its mask maps to: min, max and the mask's exponent
+// (OPENREMIX_PROXY_PBR_ENVMAP_METAL_ROUGHNESS).
+std::tuple<float, float, float> envmapMetalRoughness();
+// The mips its mask is blurred by (OPENREMIX_PROXY_PBR_ENVMAP_METAL_BLUR).
+float envmapMetalBlur();
 
 } // namespace proxy::pbr
