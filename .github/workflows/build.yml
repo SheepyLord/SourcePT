@@ -22,7 +22,11 @@ jobs:
       - name: Install build tools
         run: pacman -Syu --noconfirm --needed git meson ninja glslang mingw-w64-gcc python
 
+      # Side by side: Meson refuses an absolute include path inside the
+      # project's own source tree, which OpenRemix checked out within it was.
       - uses: actions/checkout@v4
+        with:
+          path: proxy
 
       - name: Check out OpenRemix headers
         uses: actions/checkout@v4
@@ -36,13 +40,14 @@ jobs:
             subprojects/SDL3-3.4.14/include
 
       - name: Build
+        working-directory: proxy
         run: |
           meson setup --cross-file cross/x86_64-w64-mingw32.txt \
-            -Dopenremix_include="$PWD/openremix/public/include" _build
+            -Dopenremix_include="$GITHUB_WORKSPACE/openremix/public/include" _build
           meson compile -C _build
 
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: shaderapidx9-x64
-          path: _build/shaderapidx9.dll
+          path: proxy/_build/shaderapidx9.dll
