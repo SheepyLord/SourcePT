@@ -4016,7 +4016,9 @@ void onDraw(const Draw &d) {
     float projection[16];
     getMatrix(kMatrixProjection, projection);
     const bool perspective = std::fabs(std::fabs(projection[11]) - 1.0f) < 1e-3f && std::fabs(projection[15]) < 1e-3f;
-    const bool custom = material.known && nameStarts(material.shader, "screenspace_general");
+    const bool screenspace = material.known && nameStarts(material.shader, "screenspace_general");
+    const bool isExoModel = screenspace && (material.isModel || engine_materials::current().pbr.active);
+    const bool custom = screenspace && !isExoModel;
     if ((!perspective || custom) && hostpass::recordDraw(d, projection))
       return;
   }
