@@ -17,10 +17,12 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     container: archlinux:latest
     steps:
       - name: Install build tools
-        run: pacman -Syu --noconfirm --needed git meson ninja glslang mingw-w64-gcc python
+        run: pacman -Syu --noconfirm --needed git meson ninja glslang mingw-w64-gcc python github-cli
 
       # Side by side: Meson refuses an absolute include path inside the
       # project's own source tree, which OpenRemix checked out within it was.
@@ -51,3 +53,26 @@ jobs:
         with:
           name: shaderapidx9-x64
           path: proxy/_build/shaderapidx9.dll
+
+      # The launcher (RTXLauncher) installs from a rolling "nightly" prerelease:
+      # each push to main moves its tag and replaces its zip, whose upload time
+      # tells the launcher's download cache it is new.
+      - name: Publish nightly release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        working-directory: proxy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          git config --global --add safe.directory "$PWD"
+          python3 -c "import zipfile; zipfile.ZipFile('shaderapidx9-x64.zip', 'w', zipfile.ZIP_DEFLATED).write('_build/shaderapidx9.dll', 'shaderapidx9.dll')"
+          git tag -f nightly
+          git push -f origin refs/tags/nightly
+          title="Nightly ${GITHUB_SHA::7}"
+          notes="Built from ${GITHUB_SHA} by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+          if gh release view nightly >/dev/null 2>&1; then
+            gh release edit nightly --title "$title" --notes "$notes" --prerelease
+          else
+            gh release create nightly --title "$title" --notes "$notes" --prerelease
+          fi
+          gh release upload nightly shaderapidx9-x64.zip --clobber
