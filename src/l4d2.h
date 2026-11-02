@@ -17,6 +17,7 @@
 //  * l4d2_cull.cpp: anti-culling code patches in engine.dll and client.dll.
 //  * l4d2_lights.cpp: the survivors' flashlights as Remix lights.
 //  * l4d2_ui.cpp: the runtime's own UI on F12 (remix_ui).
+//  * l4d2_infected.cpp: the common infected's look and wounds (see infected).
 //
 // Every code address is found by a byte pattern (first match in the module's
 // code, as l4d2-rtx did) and checked against the bytes it expects before it is
@@ -99,5 +100,64 @@ void dumpLights(FILE *out);
 
 // Everything above, for the statistics file.
 void dumpStatistics(FILE *out);
+
+// l4d2_infected.cpp: the common infected (Source's Infected shader), drawn
+// with their gradient-mapped look (remixapi_MaterialGradientMapEXT) and their
+// wounds cut out (remixapi_InstanceInfoWoundCutEXT). Their draws are told
+// apart by their shaders' constant tables (CTAB, read once per shader
+// object): the pixel shader declares g_vGradSelect, g_vUVTransform,
+// BaseTextureSampler and ColorLookupSampler; the wounded combination also
+// g_tCutOutDecalMap and g_vWoundUVScaleBias1/2, its vertex shader the
+// ellipsoids (g_vEllipsoidCenter...). Registers are taken from the tables.
+// OPENREMIX_PROXY_INFECTED=0: drawn as any other model. Render thread.
+namespace infected {
+bool enabled();
+
+// What one draw's shaders and constants say.
+struct Params {
+  // Samplers (D3D stages) of the base texture, detail (-1: none), gradient
+  // and cut (-1: not the wounded combination).
+  int baseStage = 0, detailStage = -1, gradientStage = 5, cutStage = -1;
+  float skinRow = 0, clothRow = 0, spriteOffset[2] = {}, detailU[2] = {1, 0}, detailV[2] = {0, 1};
+  float bloodColor[3] = {1, 1, 1}, bloodRange[2] = {0, 1};
+  // A wound in place: the wounded combination of both shaders, and an
+  // ellipsoid near the model (the game parks unused ones at 1e6).
+  bool wounded = false;
+  bool woundCombo = false; // the pixel shader is the wounded combination
+  bool vertexShaderKnown = false; // the vertex shader's constant table names the registers
+  float center[2][3] = {}, axisX[2][3] = {}, axisY[2][3] = {}, axisZ[2][3] = {};
+  float mappingScale = 1, secondBlend = 0, projectionScale[4] = {}, projectionBias[4] = {};
+  float cutScaleBias[2][4] = {}, threshold = 1;
+};
+// Whether the draw is an infected one (`out` filled). `ps`, `vs`: the
+// shadowed float constants (224 / 256 registers).
+bool classify(const void *pixelShader, const void *vertexShader, const float *ps, const float *vs, Params &out);
+
+// Statistics.
+enum Missing { kMissingBase, kMissingGradient, kMissingDetail, kMissingCut, kMissingCount };
+void noteDraw(bool wounded, bool material, bool woundSent);
+// An infected shader's draw not taken as infected: blended, alpha tested, lifted or a particle.
+void noteRefused(bool blend, bool alphaTest, bool lifted, bool particle, const Params &p);
+void noteMissing(Missing which);
+void noteMaterialCreated(bool failed);
+void dumpStatistics(FILE *out, size_t materials);
+
+// Dev aid: bin/shaderapi_proxy_infected.request (its contents: a draw count,
+// default 32) writes the next infected draws to bin/infected_probe.txt.
+// servicePresent: once per frame (polls the request); probing: draws left.
+void servicePresent(const wchar_t *directory, uint64_t frame);
+bool probing();
+struct ProbeDraw {
+  const void *textures[4] = {}; // stages 0, 4, 5, 6
+  uint64_t hashes[4] = {};      // their runtime texture hashes (0: none)
+  bool uploaded[4] = {};        // the runtime has them
+  uint32_t vertices = 0, primitives = 0;
+  uint32_t bonesPerVertex = 0, boneCount = 0; // as the mesh was built (boneCount 1: rigid)
+  bool skinnedLayout = false, dynamicVertices = false, flexIgnored = false;
+  bool material = false, woundSent = false;
+  uint64_t frame = 0;
+};
+void probe(const Params &p, const float *ps, const float *vs, const ProbeDraw &draw);
+} // namespace infected
 
 } // namespace proxy::l4d2

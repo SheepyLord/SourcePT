@@ -59,7 +59,7 @@ else
   # The GMod-only modules' entry points as no-ops; L4D2's own engine side
   # (src/l4d2.h) and the runtime UI in the bridge host.
   sources += ['src/gmod_only_stubs.cpp', 'src/l4d2_engine.cpp', 'src/l4d2_cull.cpp', 'src/l4d2_lights.cpp',
-              'src/l4d2_ui.cpp']
+              'src/l4d2_ui.cpp', 'src/l4d2_infected.cpp']
   def_file = 'shaderapidx9_l4d2.def'
   link_args += '-Wl,--enable-stdcall-fixup'
 endif

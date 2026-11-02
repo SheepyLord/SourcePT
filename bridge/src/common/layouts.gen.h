@@ -56,67 +56,70 @@ enum StructId : uint16_t {
   S_InstanceInfoReplacementHashEXT = 48,
   S_InstanceInfoSpriteEXT = 49,
   S_InstanceInfoWireframeEXT = 50,
-  S_InstanceRasterStateEXT = 51,
-  S_LightInfo = 52,
-  S_LightInfoCookieEXT = 53,
-  S_LightInfoCylinderEXT = 54,
-  S_LightInfoDiskEXT = 55,
-  S_LightInfoDistantEXT = 56,
-  S_LightInfoDomeEXT = 57,
-  S_LightInfoIesProfileEXT = 58,
-  S_LightInfoLightShaping = 59,
-  S_LightInfoLocalOriginEXT = 60,
-  S_LightInfoRectEXT = 61,
-  S_LightInfoSphereEXT = 62,
-  S_LightInfoUSDEXT = 63,
-  S_LocalLightGuidingStatisticsEXT = 64,
-  S_LocalLightSetStatisticsEXT = 65,
-  S_LocalLightStatisticsEXT = 66,
-  S_MaterialInfo = 67,
-  S_MaterialInfoEmissionEXT = 68,
-  S_MaterialInfoOpaqueEXT = 69,
-  S_MaterialInfoOpaqueSubsurfaceEXT = 70,
-  S_MaterialInfoPbrEXT = 71,
-  S_MaterialInfoPortalEXT = 72,
-  S_MaterialInfoReplacementHashEXT = 73,
-  S_MaterialInfoScreenCameraEXT = 74,
-  S_MaterialInfoSelfIlluminationEXT = 75,
-  S_MaterialInfoTranslucentEXT = 76,
-  S_MaterialIridescenceEXT = 77,
-  S_MaterialMetalColorEXT = 78,
-  S_MaterialNormalEncodingEXT = 79,
-  S_MaterialNormalScrollEXT = 80,
-  S_MaterialPbrBlurEXT = 81,
-  S_MaterialPbrChannelEXT = 82,
-  S_MaterialPbrRemapEXT = 83,
-  S_MeshInfo = 84,
-  S_MeshInfoDeformEXT = 85,
-  S_MeshInfoMotionEXT = 86,
-  S_MeshInfoSkinning = 87,
-  S_MeshInfoSpriteVerticesEXT = 88,
-  S_MeshInfoSurfaceTriangles = 89,
-  S_MeshInfoUpdateEXT = 90,
-  S_MouseState = 91,
-  S_PresentInfo = 92,
-  S_Rect2D = 93,
-  S_SceneInstanceChangeEXT = 94,
-  S_ScreenCameraEXT = 95,
-  S_ShadowStatisticsEXT = 96,
-  S_SharcStatisticsEXT = 97,
-  S_StartupInfo = 98,
-  S_TextureInfo = 99,
-  S_TextureInfoDynamicEXT = 100,
-  S_TextureInfoGenerateMipsEXT = 101,
-  S_TextureStatisticsEXT = 102,
-  S_TracingStatisticsEXT = 103,
-  S_Transform = 104,
-  S_UIDrawCommand = 105,
-  S_UIDrawList = 106,
-  S_UIVertex = 107,
-  S_VisibilityPartitionEXT = 108,
-  S_WindowMetrics = 109,
-  S_WindowState = 110,
-  S_COUNT = 111,
+  S_InstanceInfoWoundCutEXT = 51,
+  S_InstanceRasterStateEXT = 52,
+  S_LightInfo = 53,
+  S_LightInfoCookieEXT = 54,
+  S_LightInfoCylinderEXT = 55,
+  S_LightInfoDiskEXT = 56,
+  S_LightInfoDistantEXT = 57,
+  S_LightInfoDomeEXT = 58,
+  S_LightInfoIesProfileEXT = 59,
+  S_LightInfoLightShaping = 60,
+  S_LightInfoLocalOriginEXT = 61,
+  S_LightInfoRectEXT = 62,
+  S_LightInfoSphereEXT = 63,
+  S_LightInfoUSDEXT = 64,
+  S_LocalLightGuidingStatisticsEXT = 65,
+  S_LocalLightSetStatisticsEXT = 66,
+  S_LocalLightStatisticsEXT = 67,
+  S_MaterialGradientMapEXT = 68,
+  S_MaterialInfo = 69,
+  S_MaterialInfoEmissionEXT = 70,
+  S_MaterialInfoOpaqueEXT = 71,
+  S_MaterialInfoOpaqueSubsurfaceEXT = 72,
+  S_MaterialInfoPbrEXT = 73,
+  S_MaterialInfoPortalEXT = 74,
+  S_MaterialInfoReplacementHashEXT = 75,
+  S_MaterialInfoScreenCameraEXT = 76,
+  S_MaterialInfoSelfIlluminationEXT = 77,
+  S_MaterialInfoTranslucentEXT = 78,
+  S_MaterialIridescenceEXT = 79,
+  S_MaterialMetalColorEXT = 80,
+  S_MaterialNormalEncodingEXT = 81,
+  S_MaterialNormalScrollEXT = 82,
+  S_MaterialPbrBlurEXT = 83,
+  S_MaterialPbrChannelEXT = 84,
+  S_MaterialPbrRemapEXT = 85,
+  S_MeshInfo = 86,
+  S_MeshInfoDeformEXT = 87,
+  S_MeshInfoMotionEXT = 88,
+  S_MeshInfoSkinning = 89,
+  S_MeshInfoSpriteVerticesEXT = 90,
+  S_MeshInfoSurfaceTriangles = 91,
+  S_MeshInfoUpdateEXT = 92,
+  S_MouseState = 93,
+  S_PresentInfo = 94,
+  S_Rect2D = 95,
+  S_SceneInstanceChangeEXT = 96,
+  S_ScreenCameraEXT = 97,
+  S_ShadowStatisticsEXT = 98,
+  S_SharcStatisticsEXT = 99,
+  S_StartupInfo = 100,
+  S_TextureInfo = 101,
+  S_TextureInfoDynamicEXT = 102,
+  S_TextureInfoGenerateMipsEXT = 103,
+  S_TextureStatisticsEXT = 104,
+  S_TracingStatisticsEXT = 105,
+  S_Transform = 106,
+  S_UIDrawCommand = 107,
+  S_UIDrawList = 108,
+  S_UIVertex = 109,
+  S_VisibilityPartitionEXT = 110,
+  S_WindowMetrics = 111,
+  S_WindowState = 112,
+  S_WoundEllipsoidEXT = 113,
+  S_COUNT = 114,
 };
 
 inline constexpr FieldDesc kAnimatedFloat1DFields[] = {
@@ -628,6 +631,18 @@ inline constexpr FieldDesc kInstanceInfoWireframeEXTFields[] = {
     {4, 8, 8, F_PNEXT, 0, 65535}, // const void * pNext
     {8, 16, 4, F_POD, 0, 65535}, // uint32_t flags
 };
+inline constexpr FieldDesc kInstanceInfoWoundCutEXTFields[] = {
+    {0, 0, 4, F_POD, 0, 65535}, // remixapi_StructType sType
+    {4, 8, 8, F_PNEXT, 0, 65535}, // const void * pNext
+    {8, 16, 8, F_WSTR, 0, 65535}, // remixapi_Path cutTexture
+    {12, 24, 96, F_POD, 0, 65535}, // remixapi_WoundEllipsoidEXT[2] ellipsoids
+    {108, 120, 4, F_POD, 0, 65535}, // float mappingScale
+    {112, 124, 4, F_POD, 0, 65535}, // float secondBlend
+    {116, 128, 16, F_POD, 0, 65535}, // float[4] projectionScale
+    {132, 144, 16, F_POD, 0, 65535}, // float[4] projectionBias
+    {148, 160, 32, F_POD, 0, 65535}, // float[2][4] cutScaleBias
+    {180, 192, 4, F_POD, 0, 65535}, // float threshold
+};
 inline constexpr FieldDesc kInstanceRasterStateEXTFields[] = {
     {0, 0, 4, F_POD, 0, 65535}, // remixapi_StructType sType
     {4, 8, 8, F_PNEXT, 0, 65535}, // const void * pNext
@@ -805,6 +820,19 @@ inline constexpr FieldDesc kLocalLightStatisticsEXTFields[] = {
     {80, 80, 8, F_POD, 0, 65535}, // double gpuDenoiseMilliseconds
     {88, 88, 256, F_POD, 0, 65535}, // char[256] unavailableReason
 };
+inline constexpr FieldDesc kMaterialGradientMapEXTFields[] = {
+    {0, 0, 4, F_POD, 0, 65535}, // remixapi_StructType sType
+    {4, 8, 8, F_PNEXT, 0, 65535}, // const void * pNext
+    {8, 16, 8, F_WSTR, 0, 65535}, // remixapi_Path gradientTexture
+    {12, 24, 8, F_WSTR, 0, 65535}, // remixapi_Path detailTexture
+    {16, 32, 4, F_POD, 0, 65535}, // float skinRow
+    {20, 36, 4, F_POD, 0, 65535}, // float clothRow
+    {24, 40, 8, F_POD, 0, 65535}, // float[2] spriteOffset
+    {32, 48, 8, F_POD, 0, 65535}, // float[2] detailU
+    {40, 56, 8, F_POD, 0, 65535}, // float[2] detailV
+    {48, 64, 12, F_POD, 0, 65535}, // remixapi_Float3D bloodColor
+    {60, 76, 8, F_POD, 0, 65535}, // float[2] bloodRange
+};
 inline constexpr FieldDesc kMaterialInfoFields[] = {
     {0, 0, 4, F_POD, 0, 65535}, // remixapi_StructType sType
     {4, 8, 8, F_PNEXT, 0, 65535}, // void * pNext
@@ -959,7 +987,7 @@ inline constexpr FieldDesc kMeshInfoFields[] = {
     {0, 0, 4, F_POD, 0, 65535}, // remixapi_StructType sType
     {4, 8, 8, F_PNEXT, 0, 65535}, // void * pNext
     {8, 16, 8, F_POD, 0, 65535}, // uint64_t hash
-    {16, 24, 8, F_ARRAY_STRUCT, 89, 4}, // const remixapi_MeshInfoSurfaceTriangles * surfaces_values
+    {16, 24, 8, F_ARRAY_STRUCT, 91, 4}, // const remixapi_MeshInfoSurfaceTriangles * surfaces_values
     {20, 32, 4, F_POD, 0, 65535}, // uint32_t surfaces_count
 };
 inline constexpr FieldDesc kMeshInfoDeformEXTFields[] = {
@@ -989,7 +1017,7 @@ inline constexpr FieldDesc kMeshInfoSurfaceTrianglesFields[] = {
     {16, 16, 8, F_ARRAY, 4, 3}, // const uint32_t * indices_values
     {24, 24, 8, F_POD, 0, 65535}, // uint64_t indices_count
     {32, 32, 4, F_POD, 0, 65535}, // remixapi_Bool skinning_hasvalue
-    {36, 40, 40, F_NESTED, 87, 65535}, // remixapi_MeshInfoSkinning skinning_value
+    {36, 40, 40, F_NESTED, 89, 65535}, // remixapi_MeshInfoSkinning skinning_value
     {56, 80, 8, F_HANDLE_MATERIAL, 0, 65535}, // remixapi_MaterialHandle material
 };
 inline constexpr FieldDesc kMeshInfoUpdateEXTFields[] = {
@@ -1201,6 +1229,12 @@ inline constexpr FieldDesc kWindowStateFields[] = {
     {24, 24, 4, F_POD, 0, 65535}, // uint32_t drawableWidth
     {28, 28, 4, F_POD, 0, 65535}, // uint32_t drawableHeight
 };
+inline constexpr FieldDesc kWoundEllipsoidEXTFields[] = {
+    {0, 0, 12, F_POD, 0, 65535}, // remixapi_Float3D center
+    {12, 12, 12, F_POD, 0, 65535}, // remixapi_Float3D axisX
+    {24, 24, 12, F_POD, 0, 65535}, // remixapi_Float3D axisY
+    {36, 36, 12, F_POD, 0, 65535}, // remixapi_Float3D axisZ
+};
 
 inline constexpr StructDesc kStructs[S_COUNT] = {
   {"remixapi_AnimatedFloat1D", 0x0u, 8, 16, 4, 8, 2, kAnimatedFloat1DFields},
@@ -1254,6 +1288,7 @@ inline constexpr StructDesc kStructs[S_COUNT] = {
   {"remixapi_InstanceInfoReplacementHashEXT", 0x7fff1012u, 16, 24, 8, 8, 3, kInstanceInfoReplacementHashEXTFields},
   {"remixapi_InstanceInfoSpriteEXT", 0x7fff1015u, 24, 32, 4, 8, 6, kInstanceInfoSpriteEXTFields},
   {"remixapi_InstanceInfoWireframeEXT", 0x7fff101du, 12, 24, 4, 8, 3, kInstanceInfoWireframeEXTFields},
+  {"remixapi_InstanceInfoWoundCutEXT", 0x7fff1026u, 184, 200, 4, 8, 10, kInstanceInfoWoundCutEXTFields},
   {"remixapi_InstanceRasterStateEXT", 0x7fff1001u, 24, 32, 4, 8, 6, kInstanceRasterStateEXTFields},
   {"remixapi_LightInfo", 0x6u, 40, 48, 8, 8, 7, kLightInfoFields},
   {"remixapi_LightInfoCookieEXT", 0x7fff101fu, 28, 40, 4, 8, 5, kLightInfoCookieEXTFields},
@@ -1270,6 +1305,7 @@ inline constexpr StructDesc kStructs[S_COUNT] = {
   {"remixapi_LocalLightGuidingStatisticsEXT", 0x0u, 320, 320, 8, 8, 14, kLocalLightGuidingStatisticsEXTFields},
   {"remixapi_LocalLightSetStatisticsEXT", 0x0u, 184, 184, 8, 8, 22, kLocalLightSetStatisticsEXTFields},
   {"remixapi_LocalLightStatisticsEXT", 0x0u, 344, 344, 8, 8, 17, kLocalLightStatisticsEXTFields},
+  {"remixapi_MaterialGradientMapEXT", 0x7fff1027u, 68, 88, 4, 8, 11, kMaterialGradientMapEXTFields},
   {"remixapi_MaterialInfo", 0x2u, 56, 80, 8, 8, 15, kMaterialInfoFields},
   {"remixapi_MaterialInfoEmissionEXT", 0x7fff100au, 12, 24, 4, 8, 3, kMaterialInfoEmissionEXTFields},
   {"remixapi_MaterialInfoOpaqueEXT", 0x5u, 92, 112, 4, 8, 21, kMaterialInfoOpaqueEXTFields},
@@ -1314,6 +1350,7 @@ inline constexpr StructDesc kStructs[S_COUNT] = {
   {"remixapi_VisibilityPartitionEXT", 0x0u, 36, 56, 4, 8, 9, kVisibilityPartitionEXTFields},
   {"remixapi_WindowMetrics", 0x0u, 16, 16, 4, 4, 4, kWindowMetricsFields},
   {"remixapi_WindowState", 0x0u, 32, 32, 4, 4, 8, kWindowStateFields},
+  {"remixapi_WoundEllipsoidEXT", 0x0u, 48, 48, 4, 4, 4, kWoundEllipsoidEXTFields},
 };
 
 } // namespace bridge::layout

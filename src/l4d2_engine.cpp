@@ -362,7 +362,9 @@ void buildCvarTable() {
       {"cl_fastdetailsprites", 0, true},
       {"cl_brushfastpath", 0, true},
       {"cl_tlucfastpath", 0, true},
-      {"cl_modelfastpath", 0, true},
+      // Not cl_modelfastpath: common infected's wounds reach the shader only
+      // through its instance data (no wound there: the shader API binds
+      // ellipsoids at 1e6), and static props still pass DrawModelExecute.
       {"r_queued_ropes", 0, true},
       {"mat_softwarelighting", 0, true},
       {"mat_parallaxmap", 0, true},

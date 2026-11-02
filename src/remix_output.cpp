@@ -1231,6 +1231,13 @@ struct Instance {
   // sprite overlays (remixapi_InstanceInfoSpriteEXT flags; 0: nothing).
   uint32_t spriteFlags = 0;
   float spriteSoft[3] = {}; // soft distance, fade start, fade end (view-space units)
+#ifdef PROXY_GAME_L4D2
+  // An infected's wounds (l4d2::infected): cut out of its bind-pose surface.
+  // `wound.cutTexture` is set at submission, to `woundTexture`.
+  bool woundCut = false;
+  remixapi_InstanceInfoWoundCutEXT wound = {};
+  wchar_t woundTexture[24] = {};
+#endif
 };
 std::vector<Instance> g_instances;
 
@@ -3935,6 +3942,205 @@ bool opaqueTranslucent(const Draw &d) {
   return it->second;
 }
 
+#ifdef PROXY_GAME_L4D2
+// --- Left 4 Dead 2's common infected -------------------------------------------
+// (l4d2::infected tells their draws apart and reads their constants.) Their
+// material is the base texture's, gradient-mapped (remixapi_MaterialGradientMapEXT)
+// by the gradient and detail textures the draw binds and the rows, sprite,
+// detail transform and blood its constants say: one per combination, made on
+// first use and dropped when unused for a while. It holds the records of the
+// textures it names, so they outlive it. Wounded draws get their cut
+// (remixapi_InstanceInfoWoundCutEXT) on the instance.
+namespace {
+struct InfectedMaterial {
+  remixapi_MaterialHandle handle = nullptr;
+  uint64_t lastFrame = 0;
+  std::shared_ptr<RemixTexture> textures[3]; // base, gradient, detail
+};
+std::unordered_map<uint64_t, InfectedMaterial> g_infectedMaterials; // by material hash; under g_textureLock
+
+// A stage's texture record (nullptr: none uploaded). Caller holds g_textureLock.
+std::shared_ptr<RemixTexture> stageRecord(const Draw &d, int stage) {
+  if (stage < 0 || stage >= 8 || !d.stageTextures[stage])
+    return nullptr;
+  auto it = g_textures.find(d.stageTextures[stage]);
+  return it == g_textures.end() || !it->second->texture ? nullptr : it->second;
+}
+
+remixapi_MaterialHandle infectedMaterial(const Draw &d, const l4d2::infected::Params &p, bool nearest) {
+  using namespace l4d2::infected;
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+  const auto base = stageRecord(d, p.baseStage), gradient = stageRecord(d, p.gradientStage),
+             detail = stageRecord(d, p.detailStage);
+  if (!base)
+    noteMissing(kMissingBase);
+  if (!gradient)
+    noteMissing(kMissingGradient);
+  if (p.detailStage >= 0 && d.stageTextures[p.detailStage] && !detail)
+    noteMissing(kMissingDetail);
+  if (!base || !gradient)
+    return nullptr;
+  struct Key {
+    uint64_t base, gradient, detail;
+    float skinRow, clothRow, sprite[2], detailU[2], detailV[2], blood[3], range[2];
+    uint32_t nearest, padding;
+  } key;
+  static_assert(sizeof(Key) == 3 * sizeof(uint64_t) + 16 * sizeof(float), "hashed as bytes: no padding");
+  std::memset(&key, 0, sizeof(key));
+  key.base = base->hash;
+  key.gradient = gradient->hash;
+  key.detail = detail ? detail->hash : 0;
+  key.skinRow = p.skinRow;
+  key.clothRow = p.clothRow;
+  std::copy_n(p.spriteOffset, 2, key.sprite);
+  std::copy_n(p.detailU, 2, key.detailU);
+  std::copy_n(p.detailV, 2, key.detailV);
+  std::copy_n(p.bloodColor, 3, key.blood);
+  std::copy_n(p.bloodRange, 2, key.range);
+  key.nearest = nearest;
+  uint64_t hash = XXH3_64bits_withSeed(&key, sizeof(key), 0x1f3c7ed1f3c7edull);
+  if (!hash || hash == base->hash)
+    hash = ~base->hash;
+  InfectedMaterial &m = g_infectedMaterials[hash];
+  m.lastFrame = g_frame;
+  if (m.handle)
+    return m.handle;
+  wchar_t basePath[24], gradientPath[24], detailPath[24];
+  swprintf(basePath, 24, L"0x%llX", static_cast<unsigned long long>(key.base));
+  swprintf(gradientPath, 24, L"0x%llX", static_cast<unsigned long long>(key.gradient));
+  swprintf(detailPath, 24, L"0x%llX", static_cast<unsigned long long>(key.detail));
+  remixapi_MaterialGradientMapEXT map = {};
+  map.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_GRADIENT_MAP_EXT;
+  map.gradientTexture = gradientPath;
+  map.detailTexture = detail ? detailPath : L""; // empty: no detail step
+  // The shader's rows are v coordinates, (row + 0.5) / height; the runtime
+  // takes the row.
+  float rows = 16;
+  {
+    auto *texture = static_cast<IDirect3DBaseTexture9 *>(const_cast<void *>(d.stageTextures[p.gradientStage]));
+    D3DSURFACE_DESC desc = {};
+    if (texture->GetType() == D3DRTYPE_TEXTURE &&
+        SUCCEEDED(static_cast<IDirect3DTexture9 *>(texture)->GetLevelDesc(0, &desc)) && desc.Height)
+      rows = float(desc.Height);
+  }
+  map.skinRow = key.skinRow * rows - 0.5f;
+  map.clothRow = key.clothRow * rows - 0.5f;
+  std::copy_n(key.sprite, 2, map.spriteOffset);
+  std::copy_n(key.detailU, 2, map.detailU);
+  std::copy_n(key.detailV, 2, map.detailV);
+  // The runtime takes a colour of 0 to 1 and an increasing range.
+  map.bloodColor = {std::clamp(key.blood[0], 0.0f, 1.0f), std::clamp(key.blood[1], 0.0f, 1.0f),
+                    std::clamp(key.blood[2], 0.0f, 1.0f)};
+  std::copy_n(key.range, 2, map.bloodRange);
+  if (!(map.bloodRange[0] < map.bloodRange[1]))
+    map.bloodRange[1] = map.bloodRange[0] + 1.0f / 1024;
+  // As the base texture's lit material (ensureMaterial), gradient-mapped. Its
+  // base alpha is luminance, not coverage: opaque whatever the draw's alpha
+  // state (the draws taken are neither blended nor alpha-tested).
+  remixapi_MaterialInfoOpaqueEXT opaque = {};
+  opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+  opaque.pNext = &map;
+  opaque.albedoConstant = {1, 1, 1};
+  opaque.opacityConstant = 1;
+  opaque.alphaTestType = 7; // always pass
+  opaque.useDrawCallAlphaState = 0;
+  remixapi_MaterialInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+  info.pNext = &opaque;
+  info.hash = hash;
+  info.albedoTexture = basePath;
+  info.filterMode = nearest ? 0 : 1;
+  info.wrapModeU = info.wrapModeV = 1;
+  if (g_api.CreateMaterial(&info, &m.handle) != REMIXAPI_ERROR_CODE_SUCCESS) {
+    g_infectedMaterials.erase(hash);
+    noteMaterialCreated(true);
+    return nullptr;
+  }
+  noteMaterialCreated(false);
+  m.textures[0] = base;
+  m.textures[1] = gradient;
+  m.textures[2] = detail;
+  return m.handle;
+}
+
+// Materials no infected drew for a while (another infected's rows) go.
+void evictInfectedMaterials() {
+  if (g_frame % 64)
+    return;
+  std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+  for (auto it = g_infectedMaterials.begin(); it != g_infectedMaterials.end();) {
+    if (g_frame - it->second.lastFrame > 300) {
+      if (it->second.handle)
+        g_api.DestroyMaterial(it->second.handle);
+      it = g_infectedMaterials.erase(it);
+    } else
+      ++it;
+  }
+}
+
+// The infected draw's material and wound on its instance (inst.material is
+// left as it was when the gradient cannot be had), and the probe.
+void applyInfected(const Draw &d, const l4d2::infected::Params &p, Instance &inst, bool nearest,
+                   uint32_t bonesPerVertex, uint32_t boneCount, bool skinnedLayout, bool dynamicVertices,
+                   bool flexIgnored) {
+  using namespace l4d2::infected;
+  const remixapi_MaterialHandle material = infectedMaterial(d, p, nearest);
+  if (material)
+    inst.material = material;
+  if (p.wounded) {
+    std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+    if (const auto cut = stageRecord(d, p.cutStage)) {
+      inst.woundCut = true;
+      swprintf(inst.woundTexture, 24, L"0x%llX", static_cast<unsigned long long>(cut->hash));
+      auto &w = inst.wound;
+      w = {};
+      w.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_WOUND_CUT_EXT;
+      for (int e = 0; e < 2; ++e) {
+        w.ellipsoids[e].center = {p.center[e][0], p.center[e][1], p.center[e][2]};
+        w.ellipsoids[e].axisX = {p.axisX[e][0], p.axisX[e][1], p.axisX[e][2]};
+        w.ellipsoids[e].axisY = {p.axisY[e][0], p.axisY[e][1], p.axisY[e][2]};
+        w.ellipsoids[e].axisZ = {p.axisZ[e][0], p.axisZ[e][1], p.axisZ[e][2]};
+      }
+      w.mappingScale = p.mappingScale;
+      w.secondBlend = p.secondBlend;
+      std::copy_n(p.projectionScale, 4, w.projectionScale);
+      std::copy_n(p.projectionBias, 4, w.projectionBias);
+      std::memcpy(w.cutScaleBias, p.cutScaleBias, sizeof(w.cutScaleBias));
+      w.threshold = p.threshold;
+    } else
+      noteMissing(kMissingCut);
+  }
+  noteDraw(p.wounded, material != nullptr, inst.woundCut);
+  if (!probing())
+    return;
+  ProbeDraw probe;
+  const int stages[4] = {p.baseStage, p.detailStage, p.gradientStage, p.cutStage};
+  {
+    std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+    for (int i = 0; i < 4; ++i) {
+      probe.textures[i] = stages[i] >= 0 && stages[i] < 8 ? d.stageTextures[stages[i]] : nullptr;
+      auto it = probe.textures[i] ? g_textures.find(probe.textures[i]) : g_textures.end();
+      if (it != g_textures.end()) {
+        probe.hashes[i] = it->second->hash;
+        probe.uploaded[i] = it->second->texture != nullptr;
+      }
+    }
+  }
+  probe.vertices = d.numVertices;
+  probe.primitives = d.primCount;
+  probe.bonesPerVertex = bonesPerVertex;
+  probe.boneCount = boneCount;
+  probe.skinnedLayout = skinnedLayout;
+  probe.dynamicVertices = dynamicVertices;
+  probe.flexIgnored = flexIgnored;
+  probe.material = material != nullptr;
+  probe.woundSent = inst.woundCut;
+  probe.frame = g_frame;
+  l4d2::infected::probe(p, d.psConstants, d.vsConstants, probe);
+}
+} // namespace
+#endif
+
 void onDraw(const Draw &d) {
   // A screen camera's monitor (screenSlot): an opaque surface the runtime
   // traces the camera's view on, however the engine blends the texture.
@@ -4526,7 +4732,26 @@ void onDraw(const Draw &d) {
   // A flexed draw (see flexScale) changes every frame although its own
   // buffers are static. `flexContent` names this frame's deltas: the flex
   // mesh's place and version (0: at rest).
-  const float flex = particle == kNotParticle ? flexScale(d) : 0;
+  // Left 4 Dead 2's common infected (l4d2::infected): their gradient-mapped
+  // material and wounds. Their vertex shader reads no flex stream: the mesh
+  // is the bind pose it sees (c3, the flex scale elsewhere, is a light count there).
+#ifdef PROXY_GAME_L4D2
+  l4d2::infected::Params infected;
+  const bool infectedDraw = !d.blend && !d.alphaTest && !lifted && particle == kNotParticle &&
+                            l4d2::infected::enabled() &&
+                            l4d2::infected::classify(d.pixelShader, d.vertexShader, d.psConstants, d.vsConstants,
+                                                     infected);
+  const bool flexIgnored = infectedDraw && flexScale(d) != 0;
+  if (!infectedDraw && (d.blend || d.alphaTest || lifted || particle != kNotParticle) &&
+      l4d2::infected::enabled()) {
+    l4d2::infected::Params refused;
+    if (l4d2::infected::classify(d.pixelShader, d.vertexShader, d.psConstants, d.vsConstants, refused))
+      l4d2::infected::noteRefused(d.blend, d.alphaTest, lifted, particle != kNotParticle, refused);
+  }
+#else
+  constexpr bool infectedDraw = false;
+#endif
+  const float flex = particle == kNotParticle && !infectedDraw ? flexScale(d) : 0;
   uint64_t flexContent = 0;
   if (flex != 0) {
     const auto &fs = d.streams[findElement(d.elements, D3DDECLUSAGE_POSITION, 1)->Stream];
@@ -4725,6 +4950,10 @@ void onDraw(const Draw &d) {
   } else {
     inst.material = d.texture0 ? materialFor(d.texture0, shading, nearest) : nullptr;
   }
+#ifdef PROXY_GAME_L4D2
+  if (infectedDraw)
+    applyInfected(d, infected, inst, nearest, bonesPerVertex, boneCount, skinnedDraw, ps.dynamic, flexIgnored);
+#endif
   if (!d.texture0 && shading.mode != engine_materials::Shading::Lit)
     ++g_stats.emissiveNoTexture;
   if (d.texture0Target && screenSlot(d.texture0) < 0)
@@ -5918,6 +6147,15 @@ void onPresent() {
           ++g_stats.maskCuts;
         }
       }
+#ifdef PROXY_GAME_L4D2
+      remixapi_InstanceInfoWoundCutEXT wound = {};
+      if (inst.woundCut) {
+        wound = inst.wound;
+        wound.cutTexture = inst.woundTexture;
+        wound.pNext = info.pNext;
+        info.pNext = &wound;
+      }
+#endif
       g_api.DrawInstance(&info);
       ++g_stats.submitted;
     }
@@ -6115,6 +6353,9 @@ void onPresent() {
   serviceFlatDumpRequest();
   serviceMaterialProbeRequest();
   serviceShaderProbeRequest();
+#ifdef PROXY_GAME_L4D2
+  l4d2::infected::servicePresent(g_moduleDir.c_str(), g_frame);
+#endif
   // The first frames, for the diagnostics log: a crash while rendering shows
   // how far the game got.
   static uint32_t presents = 0;
@@ -6176,6 +6417,9 @@ void onPresent() {
   g_stats.transient += g_transient.size();
   g_transient.clear();
   evictEmissiveMaterials();
+#ifdef PROXY_GAME_L4D2
+  evictInfectedMaterials();
+#endif
   // Static meshes keyed by buffer version: a rewritten buffer never matches
   // again, so old entries age out.
   ++g_frame;
@@ -6688,6 +6932,9 @@ void dumpStatistics(FILE *out) {
           g_stats.noData.exchange(0) / f, g_stats.skinned.exchange(0) / f, g_stats.badPrim.exchange(0) / f,
           g_stats.badRange.exchange(0) / f, g_stats.cacheHits.exchange(0) / f, g_stats.created.exchange(0) / f,
           g_stats.transient.exchange(0) / f, g_stats.evicted.exchange(0) / f, g_stats.rigidModels.exchange(0) / f);
+#ifdef PROXY_GAME_L4D2
+  l4d2::infected::dumpStatistics(out, g_infectedMaterials.size());
+#endif
   fprintf(out, "   world-list draws: dropped (BSP world) %.1f, kept blended %.1f, kept dynamic %.1f | $translucent "
                "world draws with an opaque texture, drawn opaque %.1f | screen camera draws %.1f (views %zu, "
                "refused for want of a slot %.1f; instances only screen views see %.1f)\n",
