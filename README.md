@@ -13,6 +13,19 @@ Multiplayer works out of the box since everything lives in the wrapper.
 
 Other source game support is planned
 
+## Installation
+- Ensure you're on the `main` branch of Garry's Mod on Steam (not `x86-64`)
+- Run the vanilla game at least once, especially if you switched branches.
+- Download [RTXLauncher](https://github.com/Xenthio/RTXLauncher/releases) (Use the newer nightly if available).
+- **Windows**
+   - Run the launcher (**as an Administrator**)
+- **Linux**
+   - Ensure Steam Play is forced for Garry's Mod with either Proton Experimental or another recent Proton build.
+   - Run [GModPatchTool](https://github.com/solsticegamestudios/GModPatchTool)
+   - Make sure it's marked as executable `chmod +x ./RTXLauncher.Avalonia.Linux`, and run it.
+- Select `Start Quick Install` on the main screen and follow the prompts when asked.
+- Once it's finished, press `Launch Game` at the bottom of the launcher.
+
 ## Build
 This is primarily built on Linux, Windows support is largely untested.
 
