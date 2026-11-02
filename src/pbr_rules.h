@@ -28,6 +28,9 @@ struct Inputs {
   bool phongAlbedoTint = false, blendTintByBaseAlpha = false, hasColor2 = false, mwb = false;
   float color2[3] = {1, 1, 1};
   float phongBoost = 1;
+  // ExoPBR (screenspace_general_8tex)
+  std::string arm;      // ExoPBR $texture1 (R=AO, G=Rough, B=Metal)
+  bool isExoPbr = false;
   // $surfaceprop (lowercase), and the base texture's mean luminance (-1
   // unknown): asked for (luminance()) only by the dark Phong metal rule.
   std::string surfaceProp;
@@ -68,6 +71,9 @@ Material convert(const Inputs &in);
 bool mwbBase(const std::string &base);
 // The shader is one convert() takes (the lit surface shaders); lowercase.
 bool capable(const std::string &shader);
+inline bool isScreenspacePbr(const std::string &shader) {
+  return shader.rfind("screenspace_general", 0) == 0;
+}
 
 // OPENREMIX_PROXY_PBR=0 turns the conversion off.
 bool enabled();

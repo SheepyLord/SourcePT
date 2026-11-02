@@ -618,8 +618,19 @@ pbr::Material materialPbr(KeyValues &kv) {
   };
   pbr::Inputs in;
   in.shader = kv.shader;
+  const auto &proxies = kv.blocks["proxies"];
+  in.isExoPbr = (pbr::isScreenspacePbr(in.shader) && (kv.values.count("$texture1") || kv.values.count("$texture2"))) ||
+                proxies.count("exopbr") != 0;
+
   in.base = text("$basetexture");
   in.bump = text("$bumpmap");
+
+  if (in.isExoPbr) {
+    in.arm = text("$texture1");
+    if (in.bump.empty())
+      in.bump = text("$texture2");
+  }
+
   in.envmapMask = text("$envmapmask");
   in.phongExponentTexture = text("$phongexponenttexture");
   in.ssbump = number("$ssbump") != 0;
@@ -637,7 +648,6 @@ pbr::Material materialPbr(KeyValues &kv) {
   in.blendTintByBaseAlpha = number("$blendtintbybasealpha") != 0;
   if (kv.values.count("$color2"))
     in.hasColor2 = parseColor(kv.values["$color2"], in.color2);
-  const auto &proxies = kv.blocks["proxies"];
   in.mwb = pbr::mwbBase(in.base) || proxies.count("mwenvmaptint") || proxies.count("arc9envmaptint");
   if (kv.values.count("$phongboost"))
     in.phongBoost = number("$phongboost");

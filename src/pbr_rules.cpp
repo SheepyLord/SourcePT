@@ -35,7 +35,7 @@ float phongRoughness(float exponent, float boost) {
 } // namespace
 
 bool capable(const std::string &shader) {
-  for (const char *name : {"vertexlitgeneric", "lightmappedgeneric", "worldvertextransition"})
+  for (const char *name : {"vertexlitgeneric", "lightmappedgeneric", "worldvertextransition", "screenspace_general"})
     if (shader.rfind(name, 0) == 0)
       return true;
   return false;
@@ -43,8 +43,42 @@ bool capable(const std::string &shader) {
 
 Material convert(const Inputs &in) {
   Material out;
-  if (!capable(in.shader) ||
-      (in.bump.empty() && !in.phong && !in.envmap && in.envmapMask.empty() && in.phongExponentTexture.empty()))
+  if (!capable(in.shader))
+    return out;
+
+  // --- ExoPBR: ARM texture (Red = AO, Green = Roughness, Blue = Metalness) ---
+  if (in.isExoPbr || (!in.arm.empty() && isScreenspacePbr(in.shader))) {
+    out.active = true;
+    out.normal = in.bump;
+    out.ssbump = false;
+    if (!in.arm.empty()) {
+      // Roughness: Green (1)
+      out.maps[0].texture = in.arm;
+      out.maps[0].channel = 1;
+      out.maps[0].invert = false;
+      out.maps[0].curve = 0;
+      out.maps[0].exponent = 1.0f;
+      out.maps[0].bias = 0.0f;
+      out.maps[0].scale = 1.0f;
+      out.roughness = 1.0f;
+
+      // Metalness: Blue (2)
+      out.maps[1].texture = in.arm;
+      out.maps[1].channel = 2;
+      out.maps[1].invert = false;
+      out.maps[1].curve = 0;
+      out.maps[1].exponent = 1.0f;
+      out.maps[1].bias = 0.0f;
+      out.maps[1].scale = 1.0f;
+      out.metallic = 1.0f;
+    } else {
+      out.roughness = 0.5f;
+      out.metallic = 0.0f;
+    }
+    return out;
+  }
+
+  if (in.bump.empty() && !in.phong && !in.envmap && in.envmapMask.empty() && in.phongExponentTexture.empty())
     return out;
   out.active = true;
   out.normal = in.bump;

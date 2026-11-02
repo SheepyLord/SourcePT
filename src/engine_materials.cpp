@@ -72,7 +72,7 @@ constexpr size_t kVarType = 0x24, kVarTexture = 0x39;
 // MaterialVarType_t: float 0, string 1, vector 2, texture 3, int 4, fourcc 5, undefined 6, matrix 7, material 8.
 constexpr uint8_t kTypeFloat = 0, kTypeString = 1, kTypeVector = 2, kTypeTexture = 3, kTypeInt = 4, kTypeUndefined = 6;
 // MaterialVarFlags_t.
-constexpr int kFlagVertexColor = 1 << 4, kFlagVertexAlpha = 1 << 5, kFlagSelfIllum = 1 << 6, kFlagAdditive = 1 << 7,
+constexpr int kFlagModel = 1 << 2, kFlagVertexColor = 1 << 4, kFlagVertexAlpha = 1 << 5, kFlagSelfIllum = 1 << 6, kFlagAdditive = 1 << 7,
               kFlagAlphaTest = 1 << 8, kFlagDecal = 1 << 16, kFlagEnvmapSphere = 1 << 17,
               kFlagBaseAlphaEnvmapMask = 1 << 20, kFlagTranslucent = 1 << 21, kFlagNormalAlphaEnvmapMask = 1 << 22,
               kFlagEnvmapMode = 1 << 25;
@@ -193,6 +193,10 @@ struct Entry {
   int16_t bump = -1, ssbump = -1, phong = -1, phongExponent = -1, phongExponentTexture = -1, baseAlphaPhongMask = -1,
           envmap = -1, envmapTint = -1, phongAlbedoTint = -1, blendTintByBaseAlpha = -1, phongBoost = -1,
           surfaceProp = -1;
+  // ExoPBR.
+  int16_t tex1 = -1, tex2 = -1;
+  int16_t model = -1;
+  bool isExoPbr = false;
   bool pbrCapable = false;
   std::string name, shaderName;
   bool decalShader = false, modulate = false, lightmapped = false; // by shader name
@@ -200,7 +204,8 @@ struct Entry {
   struct TextureName {
     void *texture = nullptr;
     std::string name;
-  } maskTexture, baseTexture, bumpTexture, exponentTexture, envmapMaskTexture;
+  } maskTexture, baseTexture, bumpTexture, exponentTexture, envmapMaskTexture,
+    tex1Texture, tex2Texture;
 };
 std::unordered_map<void *, Entry> g_entries; // render thread
 Shading g_current;                           // render thread
@@ -327,6 +332,9 @@ void resolve(Entry &e, void *material) {
       {"$blendtintbybasealpha", &Entry::blendTintByBaseAlpha},
       {"$phongboost", &Entry::phongBoost},
       {"$surfaceprop", &Entry::surfaceProp},
+      {"$texture1", &Entry::tex1},
+      {"$texture2", &Entry::tex2},
+      {"$model", &Entry::model},
   };
   for (int i = 0; i < e.count; ++i) {
     void *var = paramAt(e, i);
@@ -337,6 +345,8 @@ void resolve(Entry &e, void *material) {
       if (e.*w.index < 0 && _stricmp(name, w.name) == 0)
         e.*w.index = int16_t(i);
   }
+  const std::string shaderLower = lower(e.shaderName.c_str());
+  e.isExoPbr = pbr::isScreenspacePbr(shaderLower) && (e.tex1 >= 0 || e.tex2 >= 0);
 }
 
 void vec3(const Entry &e, int index, float out[3]) {
@@ -419,10 +429,19 @@ void readPbr(Entry &e, int flags, Shading &out) {
   };
   pbr::Inputs in;
   in.shader = lower(e.shaderName.c_str());
+  in.isExoPbr = e.isExoPbr;
   in.base = out.base;
   in.bump = textureName(e.bumpTexture, paramAt(e, e.bump));
   in.envmapMask = textureName(e.envmapMaskTexture, paramAt(e, e.envmapMask));
   in.phongExponentTexture = textureName(e.exponentTexture, paramAt(e, e.phongExponentTexture));
+
+  if (e.isExoPbr) {
+    if (e.tex1 >= 0)
+      in.arm = textureName(e.tex1Texture, paramAt(e, e.tex1));       // $texture1 = ARM
+    if (e.tex2 >= 0 && in.bump.empty())
+      in.bump = textureName(e.tex2Texture, paramAt(e, e.tex2));      // $texture2 = Normal
+  }
+
   in.ssbump = number(e.ssbump) != 0;
   in.phong = number(e.phong) != 0;
   in.envmap = defined(paramAt(e, e.envmap));
@@ -640,6 +659,7 @@ void onBind(void *material) {
     g_bound.translucent = (flags & kFlagTranslucent) != 0;
     g_bound.additive = (flags & kFlagAdditive) != 0;
     g_bound.alphaTest = (flags & kFlagAlphaTest) != 0;
+    g_bound.isModel = (flags & kFlagModel) != 0 || (e.model >= 0 && defined(paramAt(e, e.model)) && g_varInt(paramAt(e, e.model)) != 0);
     g_bound.subRect = subRectName != nullptr;
     g_bound.shader = e.shaderName.c_str();
     if (g_bound.decal || g_bound.decalShader)
@@ -689,7 +709,7 @@ bool currentIsLitOpaque() {
   if (!e)
     return false;
   bool lit = false;
-  for (const char *shader : {"lightmappedgeneric", "vertexlitgeneric", "worldvertextransition", "lightmapped_4wayblend"})
+  for (const char *shader : {"lightmappedgeneric", "vertexlitgeneric", "worldvertextransition", "lightmapped_4wayblend", "screenspace_general"})
     lit |= _strnicmp(e->shaderName.c_str(), shader, std::strlen(shader)) == 0;
   if (!lit)
     return false;
