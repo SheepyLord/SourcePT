@@ -37,6 +37,8 @@ enum Lump {
   kNodes = 5,
   kTexInfo = 6,
   kFaces = 7,
+  kVertNormals = 30,
+  kVertNormalIndices = 31,
   kLeafs = 10,
   kLeafFaces = 16,
   kEdges = 12,
@@ -801,6 +803,7 @@ struct World {
   std::unordered_map<std::string, int> overlayMaterialIndex;
   uint32_t overlays = 0, overlayTriangles = 0, waterMaterials = 0, waterNormalCount = 0, waterAnimated = 0,
            waterDownFaces = 0;
+  uint32_t smoothNormals = 0; // brush face corners VRAD's vertex normal turns off the plane's (build)
   std::string waterNormalFailure; // the last water normal map not loaded, and why
   // Prop placements by 64-unit cell of their origin, for matching engine draws.
   std::unordered_map<uint64_t, std::vector<uint32_t>> propCells;
@@ -2267,6 +2270,25 @@ bool build(const Bsp &bsp) {
   if (!planes || !vertexes || !edges || !surfEdges || !texInfos || !texDatas || !stringTable || !strings || !faces ||
       !models || !modelCount || bsp.lumpVersion(kFaces) > 1 || !leafs)
     return false;
+  // Brush faces' vertex normals as VRAD wrote them (Hammer's smoothing
+  // groups; flat faces get their plane's): per face in lump order, one index
+  // into the normals per corner in edge order, as the engine reads them.
+  // Without them a smoothed pipe drew as flat facets (Portal's chamber
+  // pipes). normalStart[f]: face f's first index; none when the lumps do not
+  // cover every face.
+  const auto [vertNormals, vertNormalCount] = bsp.lump<std::array<float, 3>>(kVertNormals);
+  const auto [vertNormalIndices, vertNormalIndexCount] = bsp.lump<uint16_t>(kVertNormalIndices);
+  std::vector<size_t> normalStart;
+  if (vertNormals && vertNormalIndices) {
+    normalStart.resize(faceCount);
+    size_t at = 0;
+    for (size_t f = 0; f < faceCount; ++f) {
+      normalStart[f] = at;
+      at += size_t(std::max<int>(faces[f].numEdges, 0));
+    }
+    if (at > vertNormalIndexCount)
+      normalStart.clear();
+  }
 
   // The 3D skybox is a sealed room: its own BSP area (Leaf::areaFlags low 9
   // bits). Faces referenced by leaves of the sky camera's area, and points
@@ -2792,8 +2814,21 @@ bool build(const Bsp &bsp) {
       Geometry &g = groupFor(centroid, sky, m, skyboxFace);
       const uint32_t base = uint32_t(g.vertices.size());
       const size_t firstIndex = g.indices.size();
-      for (auto &c : corners)
-        g.vertices.push_back(vertex(c.data(), normal, ti, td));
+      for (size_t e = 0; e < corners.size(); ++e) {
+        // The smoothed normal, on the face's side; else the plane's.
+        const float *n = normal;
+        if (!normalStart.empty()) {
+          const uint16_t index = vertNormalIndices[normalStart[size_t(f)] + e];
+          if (index < vertNormalCount) {
+            const float *smooth = vertNormals[index].data();
+            if (dot(smooth, normal) > 0.1f && std::fabs(dot(smooth, smooth) - 1) < 0.01f) {
+              n = smooth;
+              g_world.smoothNormals += dot(smooth, normal) < 0.9999f;
+            }
+          }
+        }
+        g.vertices.push_back(vertex(corners[e].data(), n, ti, td));
+      }
       g_world.cull.sideFaces += face.side != 0;
       ++(winding < 0 ? g_world.cull.clockwise : winding > 0 ? g_world.cull.counterClockwise : g_world.cull.degenerate);
       for (uint32_t k = 1; k + 1 < corners.size(); ++k) {
@@ -3581,13 +3616,14 @@ void dumpStatistics(FILE *out) {
     meshes += group.mesh != nullptr;
   fprintf(out,
           "   BSP world %s: faces %u displacements %u (sky %u) triangles %u | materials %u/%zu resolved | groups %zu "
-          "(meshes %u) | left to the engine: translucent %u, ignored %u | rtx.conf-ignored brush materials kept %u | sky camera %d\n"
+          "(meshes %u) | left to the engine: translucent %u, ignored %u | rtx.conf-ignored brush materials kept %u | sky camera %d | "
+          "corners with smoothed normals %u\n"
           "   BSP static props: %zu placements (%u in the 3D skybox left to the engine), %zu models (%u failed), %u parts | overlays %u "
           "(%u triangles, %zu groups) | func_lod brushes %u (%u faces; left to the engine %u) | water materials %u, with normal maps %u (animated %u; "
           "OPENREMIX_PROXY_WATER_NORMALS), downward faces left out %u%s%s\n",
           g_world.map.c_str(), g_world.faces, g_world.displacements, g_world.skyFaces, g_world.triangles, resolved,
           g_world.materials.size(), g_world.groups.size(), meshes, g_world.skippedTranslucent, g_world.skippedIgnored, g_world.keptIgnored,
-          int(g_world.skyCamera), g_world.props.size(), g_world.skyProps, g_world.propModels.size(),
+          int(g_world.skyCamera), g_world.smoothNormals, g_world.props.size(), g_world.skyProps, g_world.propModels.size(),
           g_world.propModelsFailed, g_world.propParts, g_world.overlays, g_world.overlayTriangles,
           g_world.overlayGroups.size(), g_world.lodEntities, g_world.lodFaces, g_world.lodLeft, g_world.waterMaterials, g_world.waterNormalCount, g_world.waterAnimated,
           g_world.waterDownFaces,
