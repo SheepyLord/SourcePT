@@ -1,6 +1,6 @@
 """Install a verified runtime bundle into a separate, persistent GMod test host.
 
-Settings are local JSON: source, target, proxy, package, native_repo; optional mods.
+Settings are local JSON: source, target, proxy, package, native_repo; optional mods, bake_cache.
 The initial target may be absent or contain only RTXLauncher bootstrap files.
 Updates preserve game content, user configuration, mods and bake caches.
 """
@@ -97,7 +97,16 @@ def deploy(settings_path, verify=False):
     backup.mkdir(parents=True)
     generated = backup / 'generated'
     generated.mkdir()
-    shutil.copy2(wrapper / 'tools/launch_testing.ps1', generated / 'Play OpenRemix.ps1')
+    launch = (wrapper / 'tools/launch_testing.ps1').read_text(encoding='utf-8-sig')
+    if settings.get('bake_cache'):
+        cache = Path(settings['bake_cache'])
+        if not cache.is_absolute():
+            raise ValueError('bake_cache must be an absolute directory')
+        cache.mkdir(parents=True, exist_ok=True)
+        # Quote as a PowerShell literal, including paths containing apostrophes.
+        literal = str(cache.resolve()).replace("'", "''")
+        launch = f"$env:REMIX_BAKE_CACHE_DIR = '{literal}'\n" + launch
+    (generated / 'Play OpenRemix.ps1').write_text(launch, encoding='utf-8-sig')
     (generated / 'Play OpenRemix.cmd').write_text(
         '@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0Play OpenRemix.ps1" %*\r\n',
         encoding='ascii')

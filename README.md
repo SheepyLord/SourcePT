@@ -189,6 +189,8 @@ placeholder marked as ready.
 `tools/deploy_testing.py` installs a complete Windows runtime package into an
 isolated host and updates it without resetting game settings, mods or bake caches.
 Create a local `_work/testing-install.json` with absolute paths, for example:
+Optional `bake_cache` selects another drive for the generated launcher; existing
+caches are preserved and are not moved or deleted.
 
 ```json
 {

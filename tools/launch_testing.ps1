@@ -2,7 +2,9 @@ $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 Set-Location -LiteralPath $root
 $env:REMIX_CONFIG_DIR = Join-Path $root 'runtime-config'
-$env:REMIX_BAKE_CACHE_DIR = Join-Path $root 'bake-cache'
+if (-not $env:REMIX_BAKE_CACHE_DIR) {
+  $env:REMIX_BAKE_CACHE_DIR = Join-Path $root 'bake-cache'
+}
 $env:OPENREMIX_PROXY_CONTENT_ROOT = $root
 $env:OPENREMIX_PROXY_BACKEND = 'forwardplus'
 # Authored cubemaps override locally; preserve automatic captures elsewhere.
