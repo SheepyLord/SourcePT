@@ -1,9 +1,11 @@
-// shaderapidx9.dll proxy for Garry's Mod (x64): loads the original as
-// shaderapidx9_orig.dll and hands out forwarding wrappers for its interfaces.
+// shaderapidx9.dll proxy for Garry's Mod (x64) and Left 4 Dead 2 (x86, see
+// game.h): loads the original as shaderapidx9_orig.dll and hands out
+// forwarding wrappers for its interfaces.
 // Phase 1: pure pass-through with per-slot call statistics.
 #include "diag.h"
 #include "diagnostic_workers.h"
 #include "d3d_hooks.h"
+#include "game.h"
 #include "engine_lights.h"
 #include "engine_materials.h"
 #include "engine_nocull.h"
@@ -11,6 +13,10 @@
 #include "engine_shadows.h"
 #include "remix_output.h"
 #include "remix_ui.h"
+#ifdef PROXY_GAME_L4D2
+#include "l4d2.h"
+#include "slots_shaderapi_l4d2.h"
+#endif
 #include "vb_origins.h"
 #include "vtable_proxy.h"
 
@@ -59,7 +65,7 @@ std::pair<uintptr_t, uintptr_t> codeRangeOf(const void *p) {
                           static_cast<LPCWSTR>(p), &m))
     return {0, 0};
   auto *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(m);
-  auto *nt = reinterpret_cast<IMAGE_NT_HEADERS64 *>(reinterpret_cast<uint8_t *>(m) + dos->e_lfanew);
+  auto *nt = reinterpret_cast<IMAGE_NT_HEADERS *>(reinterpret_cast<uint8_t *>(m) + dos->e_lfanew);
   auto *sec = IMAGE_FIRST_SECTION(nt);
   for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
     if (sec->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
@@ -79,6 +85,7 @@ uint32_t countSlots(const void *const *vtbl) {
   return n;
 }
 
+#ifdef PROXY_GAME_GMOD
 // The proxy hooks the original's import of d3d9!Direct3DCreate9. Without
 // -nod3d9ex the shader API asks d3d9.dll for Direct3DCreate9Ex instead (by
 // name, at run time) and creates an IDirect3DDevice9Ex nothing here sees: the
@@ -104,8 +111,8 @@ void forceNoD3D9Ex() {
       log("proxy: tier0 command line vtable not as expected; pass -nod3d9ex yourself");
       return;
     }
-  using FindParmFn = int (*)(void *, const char *);
-  using AppendParmFn = void (*)(void *, const char *, const char *);
+  using FindParmFn = int(PROXY_THISCALL *)(void *, const char *);
+  using AppendParmFn = void(PROXY_THISCALL *)(void *, const char *, const char *);
   const auto findParm = reinterpret_cast<FindParmFn>(vt[10]);
   if (findParm(commandLine, kSwitch)) {
     log("proxy: -nod3d9ex given");
@@ -115,6 +122,11 @@ void forceNoD3D9Ex() {
         findParm(commandLine, kSwitch) ? "found there now" : "NOT found afterwards: pass it yourself");
   }
 }
+#else
+// L4D2: l4d2-rtx's proxy saw the plain device without it (tier0's command
+// line slots there are not known); to be checked in game.
+void forceNoD3D9Ex() {}
+#endif
 
 bool loadOriginal() {
   if (g_orig)
@@ -154,8 +166,8 @@ void *wrapInterface(const char *name, void *real);
 // (GMod keeps the classic five, sourcesdk-minimal appframework/iappsystem.h).
 
 // IShaderDeviceMgr slot 2: QueryInterface.
-void *deviceMgrQueryInterface(proxy::Wrapper *self, const char *name) {
-  using Fn = void *(*)(void *, const char *);
+void *PROXY_THISCALL deviceMgrQueryInterface(proxy::Wrapper *self, const char *name) {
+  using Fn = void *(PROXY_THISCALL *)(void *, const char *);
   void *real = proxy::original<Fn>(self, 2)(self->real, name);
   return wrapInterface(name, real);
 }
@@ -169,8 +181,8 @@ void *connectFactory(const char *name, int *rc) {
 }
 
 // IShaderDeviceMgr slot 0: bool Connect(CreateInterfaceFn factory).
-bool deviceMgrConnect(proxy::Wrapper *self, CreateInterfaceFn factory) {
-  using Fn = bool (*)(void *, CreateInterfaceFn);
+bool PROXY_THISCALL deviceMgrConnect(proxy::Wrapper *self, CreateInterfaceFn factory) {
+  using Fn = bool(PROXY_THISCALL *)(void *, CreateInterfaceFn);
   g_connectFactory = factory;
   log("proxy: IShaderDeviceMgr::Connect(factory %p)", reinterpret_cast<void *>(factory));
   proxy::diag::stage("IShaderDeviceMgr::Connect");
@@ -191,8 +203,8 @@ int deviceMgrInit(proxy::Wrapper *self) {
 // IShaderDeviceMgr slot 4: void Shutdown() (IAppSystem). The material system
 // shuts the shader device down on quit, on the main thread: OpenRemix stops
 // here rather than in exit-time teardown.
-void deviceMgrShutdown(proxy::Wrapper *self) {
-  using Fn = void (*)(void *);
+void PROXY_THISCALL deviceMgrShutdown(proxy::Wrapper *self) {
+  using Fn = void(PROXY_THISCALL *)(void *);
   log("proxy: IShaderDeviceMgr::Shutdown");
   proxy::diag::stage("IShaderDeviceMgr::Shutdown (the game is quitting)");
   g_workers.stop();
@@ -209,8 +221,8 @@ void *setModeFactory(const char *name, int *rc) {
   void *real = g_setModeFactory ? g_setModeFactory(name, rc) : nullptr;
   return wrapInterface(name, real);
 }
-CreateInterfaceFn deviceMgrSetMode(proxy::Wrapper *self, void *hwnd, int adapter, const void *mode) {
-  using Fn = CreateInterfaceFn (*)(void *, void *, int, const void *);
+CreateInterfaceFn PROXY_THISCALL deviceMgrSetMode(proxy::Wrapper *self, void *hwnd, int adapter, const void *mode) {
+  using Fn = CreateInterfaceFn(PROXY_THISCALL *)(void *, void *, int, const void *);
   proxy::diag::stage("IShaderDeviceMgr::SetMode(hwnd %p, adapter %d): the engine creates its Direct3D device", hwnd, adapter);
   CreateInterfaceFn factory = proxy::original<Fn>(self, 12)(self->real, hwnd, adapter, mode);
   log("proxy: SetMode(hwnd=%p, adapter=%d) -> factory %p", hwnd, adapter, reinterpret_cast<void *>(factory));
@@ -229,8 +241,8 @@ void *restoreFactory(const char *name, int *rc) {
   void *real = g_restoreFactory ? g_restoreFactory(name, rc) : nullptr;
   return wrapInterface(name, real);
 }
-void shaderUtilRestoreShaderObjects(proxy::Wrapper *self, CreateInterfaceFn factory, int flags) {
-  using Fn = void (*)(void *, CreateInterfaceFn, int);
+void PROXY_THISCALL shaderUtilRestoreShaderObjects(proxy::Wrapper *self, CreateInterfaceFn factory, int flags) {
+  using Fn = void(PROXY_THISCALL *)(void *, CreateInterfaceFn, int);
   log("proxy: IShaderUtil::RestoreShaderObjects(factory %p, flags %d)", reinterpret_cast<void *>(factory), flags);
   if (factory && factory != restoreFactory)
     g_restoreFactory = factory;
@@ -239,29 +251,33 @@ void shaderUtilRestoreShaderObjects(proxy::Wrapper *self, CreateInterfaceFn fact
 
 // IShaderAPI (ShaderApi030) slot 127: void SetLight(int lightNum,
 // const LightDesc_t &desc) (copies 88 bytes into its light array). SDK 2013
-// sets the model lights one at a time (L4D2 passes an array).
-void shaderApiSetLight(proxy::Wrapper *self, int index, const void *desc) {
-  using Fn = void (*)(void *, int, const void *);
-  proxy::remix::onSetLights(1, desc);
-  proxy::original<Fn>(self, 127)(self->real, index, desc);
+// sets the model lights one at a time; L4D2's IShaderAPIDX8 slot 88 is
+// void SetLights(int nCount, const LightDesc_t *pDesc), an array (game.h).
+void PROXY_THISCALL shaderApiSetLight(proxy::Wrapper *self, int index, const void *desc) {
+  using Fn = void(PROXY_THISCALL *)(void *, int, const void *);
+  proxy::remix::onSetLights(proxy::game::kSetLightsArray ? index : 1, desc);
+  proxy::original<Fn>(self, proxy::game::kSlotSetLight)(self->real, index, desc);
 }
 
 // IShaderAPI slot 114: void Bind(IMaterial *pMaterial): the material of the
 // draws that follow (those buffered for the previous one are flushed inside).
 // Hooked only when engine_materials validated the slot.
-void shaderApiBind(proxy::Wrapper *self, void *material) {
-  using Fn = void (*)(void *, void *);
-  proxy::original<Fn>(self, 114)(self->real, material);
+#ifdef PROXY_GAME_GMOD
+void PROXY_THISCALL shaderApiBind(proxy::Wrapper *self, void *material) {
+  using Fn = void(PROXY_THISCALL *)(void *, void *);
+  proxy::original<Fn>(self, proxy::game::kSlotBind)(self->real, material);
   proxy::engine_materials::onBind(material);
 }
+#endif
 
-// IShaderAPI slot 216: void SetPIXMarker(unsigned long color, const char *name)
-// (an empty stub in release builds). Markers "openremix:..." are ours.
-void shaderApiSetPIXMarker(proxy::Wrapper *self, unsigned long color, const char *name) {
-  using Fn = void (*)(void *, unsigned long, const char *);
+// IShaderAPI slot 216 (L4D2 181): void SetPIXMarker(unsigned long color,
+// const char *name) (an empty stub in release builds). Markers
+// "openremix:..." are ours.
+void PROXY_THISCALL shaderApiSetPIXMarker(proxy::Wrapper *self, unsigned long color, const char *name) {
+  using Fn = void(PROXY_THISCALL *)(void *, unsigned long, const char *);
   if (proxy::remix::onMarker(name))
     return;
-  proxy::original<Fn>(self, 216)(self->real, color, name);
+  proxy::original<Fn>(self, proxy::game::kSlotSetPIXMarker)(self->real, color, name);
 }
 
 struct KnownInterface {
@@ -278,18 +294,27 @@ const KnownInterface kKnown[] = {
        proxy::setHook(k, 4, reinterpret_cast<void *>(&deviceMgrShutdown));
        proxy::setHook(k, 12, reinterpret_cast<void *>(&deviceMgrSetMode));
      }},
-    {"ShaderApi030",
+    {proxy::game::kShaderApiInterface,
      [](proxy::Kind *k) {
-       proxy::setHook(k, 127, reinterpret_cast<void *>(&shaderApiSetLight));
-       proxy::setHook(k, 216, reinterpret_cast<void *>(&shaderApiSetPIXMarker));
+#ifdef PROXY_GAME_L4D2
+       k->slotNames.assign(proxy::slots::kShaderApi, proxy::slots::kShaderApi + std::size(proxy::slots::kShaderApi));
+#endif
+       proxy::setHook(k, proxy::game::kSlotSetLight, reinterpret_cast<void *>(&shaderApiSetLight));
+       proxy::setHook(k, proxy::game::kSlotSetPIXMarker, reinterpret_cast<void *>(&shaderApiSetPIXMarker));
+#ifdef PROXY_GAME_GMOD
        if (proxy::engine_materials::install(k->realVtbl))
-         proxy::setHook(k, 114, reinterpret_cast<void *>(&shaderApiBind));
+         proxy::setHook(k, proxy::game::kSlotBind, reinterpret_cast<void *>(&shaderApiBind));
+#endif
      }},
     {"ShaderDevice001", nullptr},
     {"ShaderShadow010", nullptr},
     {"DebugTextureInfo001", nullptr},
-    {"MaterialSystemHardwareConfig012", nullptr},
-    {"VBAllocTracker001", [](proxy::Kind *k) { proxy::vb_origins::install(k); }},
+    {proxy::game::kHardwareConfigInterface, nullptr},
+    {"VBAllocTracker001",
+     [](proxy::Kind *k) {
+       if (proxy::game::kHookVBAllocTracker)
+         proxy::vb_origins::install(k);
+     }},
     // Material system interface handed to the shader API.
     {"VShaderUtil001",
      [](proxy::Kind *k) { proxy::setHook(k, 12, reinterpret_cast<void *>(&shaderUtilRestoreShaderObjects)); }},
@@ -311,7 +336,7 @@ void *wrapInterface(const char *name, void *real) {
     if (created && k.setup)
       k.setup(kind);
     void *w = proxy::wrap(kind, real);
-    if (std::strcmp(name, "ShaderApi030") == 0)
+    if (std::strcmp(name, proxy::game::kShaderApiInterface) == 0)
       proxy::remix::setShaderApi(real);
     log("proxy: %s real %p (vtable %p, %u slots) -> wrapper %p", name, real, static_cast<const void *>(vtbl),
         kind->slotCount, w);
@@ -333,7 +358,7 @@ void scanForRealPointers() {
     if (!m)
       continue;
     auto *dos = reinterpret_cast<IMAGE_DOS_HEADER *>(m);
-    auto *nt = reinterpret_cast<IMAGE_NT_HEADERS64 *>(reinterpret_cast<uint8_t *>(m) + dos->e_lfanew);
+    auto *nt = reinterpret_cast<IMAGE_NT_HEADERS *>(reinterpret_cast<uint8_t *>(m) + dos->e_lfanew);
     auto *sec = IMAGE_FIRST_SECTION(nt);
     for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec) {
       if (!(sec->Characteristics & IMAGE_SCN_MEM_WRITE))
@@ -351,10 +376,19 @@ void scanForRealPointers() {
   log("scan: done");
 }
 
+// A suspended thread's instruction and stack pointers.
+#ifdef _WIN64
+uintptr_t instructionPointer(const CONTEXT &c) { return c.Rip; }
+uintptr_t stackPointer(const CONTEXT &c) { return c.Rsp; }
+#else
+uintptr_t instructionPointer(const CONTEXT &c) { return c.Eip; }
+uintptr_t stackPointer(const CONTEXT &c) { return c.Esp; }
+#endif
+
 // Dev aid: `shaderapi_proxy_profile.request` next to the DLL samples every
 // thread for 5 s into shaderapi_proxy_profile.txt as
 // "<samples> <thread> <ip> [< [rsp] <code address at the stack top>]".
-std::string symbolAt(DWORD64 pc) {
+std::string symbolAt(uintptr_t pc) {
   HMODULE module = nullptr;
   char name[MAX_PATH] = "?";
   if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -389,13 +423,14 @@ void sampleThreads() {
       // While suspended: no allocation, no locks (the thread may hold the
       // heap or loader lock). Instruction pointer and the qword at RSP: the
       // return address when the thread is in a leaf function (memcpy).
-      DWORD64 pc = 0, top[8] = {};
+      uintptr_t pc = 0, top[8] = {};
       if (GetThreadContext(thread, &context)) {
-        pc = context.Rip;
+        pc = instructionPointer(context);
+        const uintptr_t sp = stackPointer(context);
         MEMORY_BASIC_INFORMATION stack = {};
-        if (VirtualQuery(reinterpret_cast<void *>(context.Rsp), &stack, sizeof(stack)) && stack.State == MEM_COMMIT &&
-            context.Rsp + sizeof(top) <= uintptr_t(stack.BaseAddress) + stack.RegionSize)
-          std::memcpy(top, reinterpret_cast<void *>(context.Rsp), sizeof(top));
+        if (VirtualQuery(reinterpret_cast<void *>(sp), &stack, sizeof(stack)) && stack.State == MEM_COMMIT &&
+            sp + sizeof(top) <= uintptr_t(stack.BaseAddress) + stack.RegionSize)
+          std::memcpy(top, reinterpret_cast<void *>(sp), sizeof(top));
       }
       ResumeThread(thread);
       if (!pc)
@@ -404,7 +439,7 @@ void sampleThreads() {
       // slots (leaf functions that saved registers keep it a few slots up).
       std::string chain = symbolAt(pc);
       const auto own = codeRangeOf(reinterpret_cast<void *>(pc));
-      for (DWORD64 v : top) {
+      for (uintptr_t v : top) {
         const auto range = codeRangeOf(reinterpret_cast<void *>(v));
         if (range.first && range != own) {
           chain += " < " + symbolAt(v);
@@ -425,6 +460,7 @@ void sampleThreads() {
   fclose(f);
 }
 
+#ifdef PROXY_GAME_GMOD
 // Dev aid: `shaderapi_proxy_close.request` closes the game's windows
 // (WM_CLOSE, as the window's close button; GMod blocks `quit` from Lua).
 BOOL CALLBACK closeWindow(HWND window, LPARAM) {
@@ -434,15 +470,20 @@ BOOL CALLBACK closeWindow(HWND window, LPARAM) {
     PostMessageW(window, WM_CLOSE, 0, 0);
   return TRUE;
 }
+#endif
 
 DWORD WINAPI profilerThread(void *) {
   const std::wstring request = g_dir + L"\\shaderapi_proxy_profile.request";
+#ifdef PROXY_GAME_GMOD
   const std::wstring close = g_dir + L"\\shaderapi_proxy_close.request";
+#endif
   while (!g_workers.wait(250)) {
+#ifdef PROXY_GAME_GMOD
     if (GetFileAttributesW(close.c_str()) != INVALID_FILE_ATTRIBUTES) {
       DeleteFileW(close.c_str());
       EnumWindows(closeWindow, 0);
     }
+#endif
     if (GetFileAttributesW(request.c_str()) == INVALID_FILE_ATTRIBUTES)
       continue;
     DeleteFileW(request.c_str());
@@ -471,6 +512,7 @@ struct FileOpens {
 std::mutex g_openLock;
 std::map<std::string, FileOpens> g_opens;
 std::atomic_bool g_noteOpens{false};
+#ifdef PROXY_GAME_GMOD
 using CreateFileAFn = HANDLE(WINAPI *)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 using CreateFileWFn = HANDLE(WINAPI *)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 CreateFileAFn g_createFileA = nullptr;
@@ -571,9 +613,9 @@ bool videoOptionsLayout(const std::string &key) {
   return replace && key.size() > suffix.size() && key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
-using OnCommandFn = void (*)(void *, const char *);
+using OnCommandFn = void(PROXY_THISCALL *)(void *, const char *);
 OnCommandFn g_videoOnCommand = nullptr;
-void videoOnCommand(void *self, const char *command) {
+void PROXY_THISCALL videoOnCommand(void *self, const char *command) {
   if (command && _stricmp(command, "openremix_settings") == 0)
     proxy::remix_ui::open();
   else
@@ -589,7 +631,7 @@ bool hookVideoOnCommand() {
   if (!module)
     return false;
   const auto base = reinterpret_cast<uintptr_t>(module);
-  const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS64 *>(base + reinterpret_cast<const IMAGE_DOS_HEADER *>(module)->e_lfanew);
+  const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(base + reinterpret_cast<const IMAGE_DOS_HEADER *>(module)->e_lfanew);
   const uintptr_t size = nt->OptionalHeader.SizeOfImage;
   auto inside = [&](uintptr_t address, size_t bytes) { return address >= base && address - base + bytes <= size; };
   auto **vtable = reinterpret_cast<void **>(base + kVtable);
@@ -748,6 +790,11 @@ void hookFileOpens() {
   log("file opens: CreateFileA %p CreateFileW %p\n", reinterpret_cast<void *>(g_createFileA),
       reinterpret_cast<void *>(g_createFileW));
 }
+#else
+// L4D2: neither the remembered misses nor the video options' layout (GMod's
+// GameUI build, its search paths); the opens are not counted.
+void hookFileOpens() {}
+#endif
 
 void writeFileOpens(bool reset) {
   std::lock_guard<std::mutex> lock(g_openLock);
@@ -787,7 +834,7 @@ DWORD WINAPI stallThread(void *parameter) {
   std::map<std::string, unsigned> counts;
   HANDLE thread = nullptr;
   DWORD opened = 0;
-  static DWORD64 stack[384];
+  static uintptr_t stack[384];
   ULONGLONG written = GetTickCount64();
   unsigned samples = 0;
   g_noteOpens = true;
@@ -804,18 +851,18 @@ DWORD WINAPI stallThread(void *parameter) {
       }
       CONTEXT context = {};
       context.ContextFlags = CONTEXT_CONTROL;
-      DWORD64 pc = 0;
+      uintptr_t pc = 0;
       size_t n = 0;
       if (thread && SuspendThread(thread) != DWORD(-1)) {
         // While suspended: no allocation, no locks.
         if (GetThreadContext(thread, &context)) {
-          pc = context.Rip;
+          pc = instructionPointer(context);
+          const uintptr_t sp = stackPointer(context);
           MEMORY_BASIC_INFORMATION region = {};
-          if (VirtualQuery(reinterpret_cast<void *>(context.Rsp), &region, sizeof(region)) &&
-              region.State == MEM_COMMIT) {
+          if (VirtualQuery(reinterpret_cast<void *>(sp), &region, sizeof(region)) && region.State == MEM_COMMIT) {
             const uintptr_t end = uintptr_t(region.BaseAddress) + region.RegionSize;
-            n = std::min<size_t>(std::size(stack), (end - context.Rsp) / sizeof(DWORD64));
-            std::memcpy(stack, reinterpret_cast<void *>(context.Rsp), n * sizeof(DWORD64));
+            n = std::min<size_t>(std::size(stack), (end - sp) / sizeof(uintptr_t));
+            std::memcpy(stack, reinterpret_cast<void *>(sp), n * sizeof(uintptr_t));
           }
         }
         ResumeThread(thread);
@@ -872,6 +919,9 @@ DWORD WINAPI statisticsThread(void *) {
       proxy::engine_nocull::dumpStatistics(f);
       proxy::engine_lights::dumpStatistics(f);
       proxy::engine_shadows::dumpStatistics(f);
+#ifdef PROXY_GAME_L4D2
+      proxy::l4d2::dumpStatistics(f);
+#endif
       proxy::engine_materials::dumpStatistics(f);
       proxy::dumpStatistics(f);
       fclose(f);

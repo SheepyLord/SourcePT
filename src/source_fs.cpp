@@ -1,5 +1,6 @@
 #include "source_fs.h"
 
+#include "game.h"
 #include "lzma_source.h"
 
 #include <windows.h>
@@ -243,7 +244,10 @@ void addContentMounts() {
 // for what the proxy's index lacks: workshop addons (steamapps/workshop/.gma,
 // LZMA legacy archives), mounted games, downloads. Slots: Read 0, Open 2,
 // Close 3, Seek 4, Tell 5 (Size's two overloads are not relied on).
+// L4D2: not asked (its slots are not verified there); the index is all.
 void *engineFileSystem() {
+  if (!game::kGMod)
+    return nullptr;
   static void *fs = nullptr;
   if (!fs) {
     using CreateInterfaceFn = void *(*)(const char *, int *);
@@ -260,11 +264,11 @@ bool engineRead(const std::string &path, std::vector<uint8_t> *out, uint64_t off
   if (!fs)
     return false;
   void **vt = *static_cast<void ***>(fs);
-  using OpenFn = void *(*)(void *, const char *, const char *, const char *);
-  using CloseFn = void (*)(void *, void *);
-  using SeekFn = void (*)(void *, void *, long long, int);
-  using TellFn = unsigned int (*)(void *, void *);
-  using ReadFn = int (*)(void *, void *, int, void *);
+  using OpenFn = void *(PROXY_THISCALL *)(void *, const char *, const char *, const char *);
+  using CloseFn = void(PROXY_THISCALL *)(void *, void *);
+  using SeekFn = void(PROXY_THISCALL *)(void *, void *, long long, int);
+  using TellFn = unsigned int(PROXY_THISCALL *)(void *, void *);
+  using ReadFn = int(PROXY_THISCALL *)(void *, void *, int, void *);
   void *file = reinterpret_cast<OpenFn>(vt[2])(fs, path.c_str(), "rb", "GAME");
   if (!file)
     return false;
@@ -304,6 +308,7 @@ void index() {
   if (g_indexed)
     return;
   g_indexed = true;
+#ifdef PROXY_GAME_GMOD
   // garrysmod/gameinfo.txt SearchPaths (GMod x64 layout: the exe sits in the
   // game root). Loose addon folders (not .gma archives) come first.
   WIN32_FIND_DATAW found;
@@ -329,6 +334,16 @@ void index() {
   addVpk(g_root + L"\\sourceengine\\content_hl2_dir.vpk");
   addVpk(g_root + L"\\sourceengine\\content_cstrike_dir.vpk");
   addVpk(g_root + L"\\garrysmod\\fallbacks_dir.vpk");
+#else
+  // left4dead2/gameinfo.txt SearchPaths: each directory loose, then its
+  // pak01_dir.vpk.
+  for (const wchar_t *dir : {L"update", L"left4dead2_dlc3", L"left4dead2_dlc2", L"left4dead2_dlc1", L"left4dead2",
+                             L"hl2"}) {
+    const auto base = g_root + L"\\" + dir;
+    addLoose(base);
+    addVpk(base + L"\\pak01_dir.vpk");
+  }
+#endif
 }
 
 } // namespace

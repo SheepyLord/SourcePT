@@ -79,6 +79,7 @@ struct Bound {
   bool modulate = false;    // DecalModulate: dst x src x 2
   bool lightmapped = false; // LightmappedGeneric and the other world shaders
   bool vertexColor = false, vertexAlpha = false, translucent = false, additive = false, alphaTest = false;
+  bool isModel = false;     // $model / MATERIAL_VAR_MODEL (1 << 2)
   bool subRect = false;     // bound through a CMaterialSubRect
   int flags = 0;
   const char *shader = "";
