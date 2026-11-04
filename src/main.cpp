@@ -82,48 +82,52 @@ uint32_t countSlots(const void *const *vtbl) {
   return n;
 }
 
-#ifdef PROXY_GAME_GMOD
-// The proxy hooks the original's import of d3d9!Direct3DCreate9. Without
-// -nod3d9ex the shader API asks d3d9.dll for Direct3DCreate9Ex instead (by
-// name, at run time) and creates an IDirect3DDevice9Ex nothing here sees: the
-// game then runs without the proxy's D3D hooks. The original looks the switch
-// up when it connects (tier0's ICommandLine::FindParm), so it is appended to
-// the command line before the original is loaded.
-// ICommandLine slots, as the original calls them in GMod x64: AppendParm 5
-// (after CreateCmdLine x2, GetCmdLine, CheckParm, RemoveParm), ParmValue
-// (name, int) 7, FindParm 10.
-void forceNoD3D9Ex() {
-  constexpr char kSwitch[] = "-nod3d9ex";
+// Appends a switch to tier0's command line before the original is loaded,
+// for the engine to find when it looks it up (ICommandLine::FindParm).
+// ICommandLine slots, the same in GMod x64 and L4D2 x86 (L4D2's engine calls
+// FindParm at vtable +0x28): AppendParm 5 (after CreateCmdLine x2,
+// GetCmdLine, CheckParm, RemoveParm), FindParm 10.
+void appendSwitch(const char *name) {
   HMODULE tier0 = GetModuleHandleW(L"tier0.dll");
   auto get = tier0 ? reinterpret_cast<void *(*)()>(GetProcAddress(tier0, "CommandLine_Tier0")) : nullptr;
   void *commandLine = get ? get() : nullptr;
   if (!commandLine) {
-    log("proxy: no tier0 command line; pass -nod3d9ex yourself");
+    log("proxy: no tier0 command line; pass %s yourself", name);
     return;
   }
   void **vt = *static_cast<void ***>(commandLine);
   const auto [begin, end] = codeRangeOf(vt[0]);
   for (int slot : {5, 10})
     if (reinterpret_cast<uintptr_t>(vt[slot]) < begin || reinterpret_cast<uintptr_t>(vt[slot]) >= end) {
-      log("proxy: tier0 command line vtable not as expected; pass -nod3d9ex yourself");
+      log("proxy: tier0 command line vtable not as expected; pass %s yourself", name);
       return;
     }
   using FindParmFn = int(PROXY_THISCALL *)(void *, const char *);
   using AppendParmFn = void(PROXY_THISCALL *)(void *, const char *, const char *);
   const auto findParm = reinterpret_cast<FindParmFn>(vt[10]);
-  if (findParm(commandLine, kSwitch)) {
-    log("proxy: -nod3d9ex given");
+  if (findParm(commandLine, name)) {
+    log("proxy: %s given", name);
   } else {
-    reinterpret_cast<AppendParmFn>(vt[5])(commandLine, kSwitch, nullptr);
-    log("proxy: -nod3d9ex appended to the command line (%s)",
-        findParm(commandLine, kSwitch) ? "found there now" : "NOT found afterwards: pass it yourself");
+    reinterpret_cast<AppendParmFn>(vt[5])(commandLine, name, nullptr);
+    log("proxy: %s appended to the command line (%s)", name,
+        findParm(commandLine, name) ? "found there now" : "NOT found afterwards: pass it yourself");
   }
 }
+
+void forceSwitches() {
+#ifdef PROXY_GAME_GMOD
+  // The proxy hooks the original's import of d3d9!Direct3DCreate9. Without
+  // -nod3d9ex the shader API asks d3d9.dll for Direct3DCreate9Ex instead (by
+  // name, at run time) and creates an IDirect3DDevice9Ex nothing here sees:
+  // the game then runs without the proxy's D3D hooks.
+  appendSwitch("-nod3d9ex");
 #else
-// L4D2: l4d2-rtx's proxy saw the plain device without it (tier0's command
-// line slots there are not known); to be checked in game.
-void forceNoD3D9Ex() {}
+  // L4D2 (l4d2-rtx's proxy saw the plain device without -nod3d9ex): the proxy
+  // patches engine code and hooks its vtables, which VAC must never see, so
+  // the game stays off VAC-secured servers.
+  appendSwitch("-insecure");
 #endif
+}
 
 bool loadOriginal() {
   if (g_orig)
@@ -135,7 +139,7 @@ bool loadOriginal() {
   g_log = _wfopen((g_dir + L"\\shaderapi_proxy.log").c_str(), L"w");
   proxy::diag::reinstall();
   proxy::diag::stage("first CreateInterface: loading shaderapidx9_orig.dll");
-  forceNoD3D9Ex();
+  forceSwitches();
   g_orig = LoadLibraryW((g_dir + L"\\shaderapidx9_orig.dll").c_str());
   if (!g_orig) {
     const DWORD error = GetLastError();
