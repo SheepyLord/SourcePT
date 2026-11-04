@@ -43,6 +43,11 @@ shared_library('shaderapidx9',
   link_args: ['-static', '-static-libgcc', '-static-libstdc++'],
 )
 
+material_parameters_test = executable('material-parameters-test', 'tests/material_parameters.cpp',
+  include_directories: include_directories('src'),
+  link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
+test('Material name queries preserve names, misses and layout replacement', material_parameters_test)
+
 bake_charts_test = executable('bsp-bake-charts-test', 'tests/bake_charts.cpp',
   include_directories: include_directories('src'),
   link_args: ['-static', '-static-libgcc', '-static-libstdc++'])

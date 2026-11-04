@@ -1,4 +1,5 @@
 #include "engine_materials.h"
+#include "material_parameters.h"
 #include "bsp_world.h"
 #include "remix_output.h"
 
@@ -185,6 +186,7 @@ struct Entry {
   void *shader = nullptr;
   uint16_t nameSymbol = 0;
   uint8_t count = 0;
+  mutable ParameterNames parameterNames;
   Shading::Mode kind = Shading::Lit; // by shader: Lit (nothing to read), Unlit, SelfIllumBaseAlpha (capable)
   // Indices into the shader params (-1: the shader has no such parameter).
   int16_t flags = -1, color = -1, color2 = -1, tint = -1, mask = -1, maskScale = -1, envmapMask = -1,
@@ -244,6 +246,13 @@ void *paramAt(const Entry &e, int index) {
     return nullptr;
   }
   return var;
+}
+
+const std::vector<uint16_t> &namedParameters(const Entry &entry, const char *name) {
+  return entry.parameterNames.find(name, entry.count, [&](uint16_t index) -> const char * {
+    void *var = paramAt(entry, index);
+    return var ? g_varName(var) : nullptr;
+  });
 }
 
 bool defined(void *var) { return var && varType(var) != kTypeUndefined; }
@@ -679,12 +688,9 @@ std::string currentTextureName(const char *name) {
   const Entry *e = g_currentEntry;
   if (!e)
     return {};
-  for (int i = 0; i < e->count; ++i) {
+  for (const uint16_t i : namedParameters(*e, name)) {
     void *var = paramAt(*e, i);
     if (!var || varType(var) != kTypeTexture)
-      continue;
-    const char *varName = g_varName(var);
-    if (!varName || _stricmp(varName, name) != 0)
       continue;
     void *texture;
     std::memcpy(&texture, static_cast<const uint8_t *>(var) + kVarTexture, sizeof(texture));
@@ -697,15 +703,12 @@ bool currentFloat(const char *name, float &out) {
   const Entry *e = g_currentEntry;
   if (!e)
     return false;
-  for (int i = 0; i < e->count; ++i) {
+  for (const uint16_t i : namedParameters(*e, name)) {
     void *var = paramAt(*e, i);
     if (!var)
       continue;
     const uint8_t type = varType(var);
     if (type != kTypeFloat && type != kTypeVector && type != kTypeInt)
-      continue;
-    const char *varName = g_varName(var);
-    if (!varName || _stricmp(varName, name) != 0)
       continue;
     const float value = g_varFloat(var); // a vector's first component, an int as a float
     if (!std::isfinite(value))
@@ -720,12 +723,9 @@ bool currentVector(const char *name, float out[3]) {
   const Entry *e = g_currentEntry;
   if (!e)
     return false;
-  for (int i = 0; i < e->count; ++i) {
+  for (const uint16_t i : namedParameters(*e, name)) {
     void *var = paramAt(*e, i);
     if (!var || varType(var) != kTypeVector)
-      continue;
-    const char *varName = g_varName(var);
-    if (!varName || _stricmp(varName, name) != 0)
       continue;
     const float *v = g_varVec(var);
     if (!std::isfinite(v[0]) || !std::isfinite(v[1]) || !std::isfinite(v[2]))
