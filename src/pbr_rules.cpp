@@ -41,10 +41,23 @@ bool capable(const std::string &shader) {
   return false;
 }
 
-Material convert(const Inputs &in) {
+Material convert(const Inputs &given) {
   Material out;
-  if (!capable(in.shader))
+  if (!capable(given.shader))
     return out;
+  // Phong is drawn by the shaders that have its parameters: VertexLitGeneric
+  // and (in GMod) LightmappedGeneric, not WorldVertexTransition. Blends
+  // written for later branches (zs_verystill_v1a's forest/blend_*:
+  // WorldVertexTransition with $phong 1, $phongexponent 170 under a 0.01
+  // $envmaptint) read as glossy from their VMT, where the game shows them
+  // matte (the world's materials come from the VMT text, bsp_world.cpp, not
+  // from the shader's parameters).
+  Inputs in = given;
+  if (in.shader.rfind("vertexlitgeneric", 0) != 0 && in.shader.rfind("lightmappedgeneric", 0) != 0) {
+    in.phong = false;
+    in.phongExponentTexture.clear();
+    in.baseAlphaPhongMask = false;
+  }
 
   // --- ExoPBR: ARM texture (Red = AO, Green = Roughness, Blue = Metalness) ---
   if (in.isExoPbr || (!in.arm.empty() && isScreenspacePbr(in.shader))) {
@@ -100,6 +113,11 @@ Material convert(const Inputs &in) {
     // a glossy 0.47 that mirrored the low sun across the ground (issue #84);
     // as strong a tint as Source allows stays as smooth (0.2).
     roughness = in.hasEnvmapTint ? 1 - 0.8f * (in.envmapTint[0] + in.envmapTint[1] + in.envmapTint[2]) / 3 : 0.4f;
+  } else if (in.envmapMask.empty()) {
+    // Only a bump map: Source draws it diffuse, without any highlight.
+    // ToPBR's 0.5 put a sun glare on HL2's bumped rock and gravel
+    // (d2_coast_03's nature/blendrockgravel001a).
+    roughness = 1;
   }
   out.roughness = roughness = std::clamp(roughness, 0.04f, 1.0f);
   Map &rough = out.maps[0], &metal = out.maps[1];

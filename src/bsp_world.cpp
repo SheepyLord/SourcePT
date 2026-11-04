@@ -810,6 +810,7 @@ struct World {
   std::map<std::array<int32_t, 5>, OverlayGroup> layerGroups;
   std::unordered_map<int, SecondLayer> secondLayers; // by base material index
   LayerStatistics layers;
+  std::string pbrNames; // statistics: each world material's PBR conversion
   CullStatistics cull;
   std::unordered_map<std::string, int> overlayMaterialIndex;
   uint32_t overlays = 0, overlayTriangles = 0, waterMaterials = 0, waterNormalCount = 0, waterAnimated = 0,
@@ -1560,8 +1561,21 @@ int materialByName(const std::string &name, bool brush) {
     }
     if (emissiveEnabled())
       m.shading = materialShading(kv, m.maskCandidates);
-    if (pbr::enabled() && (m.shading.pbr = materialPbr(kv)).active)
+    if (pbr::enabled() && (m.shading.pbr = materialPbr(kv)).active) {
       m.shading.base = lower(kv.values["$basetexture"]);
+      if (g_world.pbrNames.size() < 60000) {
+        const auto &p = m.shading.pbr;
+        char line[700];
+        std::snprintf(line, sizeof(line),
+                      "      %s (%s): roughness %g metallic %g normal %s | rough %s ch %u inv %d exp %g bias %g scale %g | "
+                      "metal %s ch %u inv %d | blur %g%s\n",
+                      name.c_str(), kv.shader.c_str(), p.roughness, p.metallic, p.normal.c_str(), p.maps[0].texture.c_str(),
+                      p.maps[0].channel, int(p.maps[0].invert), p.maps[0].exponent, p.maps[0].bias, p.maps[0].scale,
+                      p.maps[1].texture.c_str(), p.maps[1].channel, int(p.maps[1].invert), p.blur,
+                      p.metalColored ? " metal colour" : "");
+        g_world.pbrNames += line;
+      }
+    }
   }
   for (uint64_t h : m.candidates)
     m.categories |= categories::lookup(h);
@@ -3660,6 +3674,7 @@ void dumpStatistics(FILE *out) {
             l.secondTriangles, l.blendedTriangles, g_world.layerGroups.size(), meshes, l.flat, l.withoutTexture,
             l.noHash, waiting, l.modulated, l.modulateUnread, l.fourWay, l.brushFaces, l.names.c_str());
   }
+  fprintf(out, "   BSP materials with a PBR conversion:\n%s", g_world.pbrNames.c_str());
   {
     const auto &c = g_world.cull;
     fprintf(out,
