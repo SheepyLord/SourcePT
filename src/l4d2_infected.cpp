@@ -9,7 +9,11 @@
 // into two ellipsoids (centre, side, up, look-at registers) and projects it
 // into the cut texture (g_vWoundUvScales / Biases); the pixel shader discards
 // where the cut texture (scale-biased by g_vWoundUVScaleBias1/2) is above
-// g_vGradSelect.z, and deepens the blood there.
+// g_vGradSelect.z, and deepens the blood there. Burning (BurnSampler): the
+// burn texture, read at the detail coordinates swapped, takes over as
+// g_vShaderParams.x rises, skin last. Fading: the eye-glow and Phong
+// combinations write g_DiffuseModulation's alpha as the pixel's, and an
+// alpha-blended draw of theirs is a model fading out.
 //
 // Here the draws are told apart by their shaders' constant tables, and their
 // constants become remixapi_MaterialGradientMapEXT (remix_output: the
@@ -102,7 +106,8 @@ bool parseConstantTable(const std::vector<uint32_t> &code, ConstantTable &out) {
 struct PixelShader {
   bool infected = false, wounded = false;
   int gradSelect = -1, blood = -1, wound1 = -1, wound2 = -1, uvTransform = -1;
-  int base = -1, detail = -1, gradient = -1, cut = -1;
+  int eyeGlow = -1, modulation = -1, shaderParams = -1;
+  int base = -1, detail = -1, gradient = -1, cut = -1, burn = -1;
 };
 struct VertexShader {
   bool known = false, wound = false;
@@ -131,12 +136,21 @@ PixelShader describePixel(const std::vector<uint32_t> &code) {
   s.detail = t.sampler("DetailSampler");
   s.gradient = t.sampler("ColorLookupSampler");
   s.cut = t.sampler("g_tCutOutDecalMap");
+  s.burn = t.sampler("BurnSampler");
+  s.eyeGlow = t.floatRegister("g_cEyeGlowColor");
+  s.modulation = t.floatRegister("g_DiffuseModulation");
+  s.shaderParams = t.floatRegister("g_vShaderParams");
   s.infected = s.gradSelect >= 0 && s.blood >= 0 && s.uvTransform >= 0 && s.base >= 0 && s.gradient >= 0 &&
                s.gradSelect < 224 && s.blood < 224 && s.uvTransform < 224 && s.base < 16 && s.gradient < 16;
   s.wounded = s.infected && s.cut >= 0 && s.cut < 16 && s.wound1 >= 0 && s.wound1 < 224 && s.wound2 >= 0 &&
               s.wound2 < 224;
   if (s.detail >= 16)
     s.detail = -1;
+  for (int *r : {&s.eyeGlow, &s.modulation, &s.shaderParams})
+    if (*r >= 224)
+      *r = -1;
+  if (s.burn >= 16 || s.shaderParams < 0)
+    s.burn = -1;
   return s;
 }
 
@@ -196,19 +210,27 @@ bool nearby(const float *center) {
          std::fabs(center[2]) < 1e5f;
 }
 
+// 0 to 1 in steps of 1 / Params::kQuantum (not finite: 0).
+float quantize(float v) {
+  return std::isfinite(v) ? std::round(std::clamp(v, 0.0f, 1.0f) * Params::kQuantum) / Params::kQuantum : 0;
+}
+
 struct Stats {
   std::atomic<uint64_t> draws{0}, wounded{0}, woundSent{0}, materials{0}, materialsCreated{0}, materialsFailed{0},
-      woundCombo{0}, noVertexTable{0};
-  std::atomic<uint64_t> refused{0}, refusedBlend{0}, refusedAlphaTest{0}, refusedLifted{0}, refusedParticle{0},
-      refusedWoundCombo{0}, refusedWounded{0};
+      woundCombo{0}, noVertexTable{0}, burning{0}, faded{0};
+  std::atomic<uint64_t> refused{0}, refusedBlend{0}, refusedFadeable{0}, refusedAlphaTest{0}, refusedLifted{0},
+      refusedParticle{0}, refusedWoundCombo{0}, refusedWounded{0};
   std::atomic<uint64_t> missing[kMissingCount] = {};
 } g_stats;
 
 // The probe (render thread).
 uint32_t g_probeLeft = 0;
-bool g_probeWoundedOnly = false; // "wounded [count]": only draws with an ellipsoid near the model
+// "wounded [count]": only draws with an ellipsoid near the model; "refused
+// [count]": only draws not taken (the others only those taken).
+enum ProbeMode { kProbeTaken, kProbeWounded, kProbeRefused } g_probeMode = kProbeTaken;
 uint64_t g_probeSkipped = 0;
 std::wstring g_probePath;
+std::vector<const void *> g_probeNamed; // pixel shaders whose names this probe printed
 
 } // namespace
 
@@ -217,7 +239,8 @@ bool enabled() {
   return on;
 }
 
-bool classify(const void *pixelShader, const void *vertexShader, const float *ps, const float *vs, Params &out) {
+bool classify(const void *pixelShader, const void *vertexShader, const float *ps, const float *vs, bool alphaBlended,
+              Params &out) {
   if (!ps || !vs)
     return false;
   const PixelShader *p = lookup(g_pixelShaders, pixelShader, describePixel);
@@ -228,6 +251,15 @@ bool classify(const void *pixelShader, const void *vertexShader, const float *ps
   out.baseStage = p->base;
   out.gradientStage = p->gradient;
   out.detailStage = p->detail;
+  out.eyeGlowRegister = p->eyeGlow;
+  out.modulationRegister = p->modulation;
+  out.shaderParamsRegister = p->shaderParams;
+  out.fadeable = p->modulation >= 0;
+  out.burnStage = p->burn;
+  if (p->burn >= 0)
+    out.burnStrength = quantize(ps[p->shaderParams * 4]);
+  if (alphaBlended && p->modulation >= 0)
+    out.opacity = quantize(ps[p->modulation * 4 + 3]);
   const float *gradSelect = ps + p->gradSelect * 4, *blood = ps + p->blood * 4, *uv = ps + p->uvTransform * 4;
   out.spriteOffset[0] = uv[0];
   out.spriteOffset[1] = uv[1];
@@ -278,15 +310,18 @@ bool classify(const void *pixelShader, const void *vertexShader, const float *ps
   return true;
 }
 
-void noteDraw(bool wounded, bool material, bool woundSent) {
+void noteDraw(const Params &p, bool material, bool woundSent) {
   ++g_stats.draws;
-  g_stats.wounded += wounded;
+  g_stats.wounded += p.wounded;
   g_stats.materials += material;
   g_stats.woundSent += woundSent;
+  g_stats.burning += p.burnStrength > 0;
+  g_stats.faded += p.opacity < 1;
 }
 void noteRefused(bool blend, bool alphaTest, bool lifted, bool particle, const Params &p) {
   ++g_stats.refused;
   g_stats.refusedBlend += blend;
+  g_stats.refusedFadeable += blend && p.fadeable;
   g_stats.refusedAlphaTest += alphaTest;
   g_stats.refusedLifted += lifted;
   g_stats.refusedParticle += particle;
@@ -308,20 +343,22 @@ void dumpStatistics(FILE *out, size_t materials) {
   }
   fprintf(out,
           "== L4D2 infected: per second: draws %.1f (gradient material %.1f; wounded combination %.1f, wounded %.1f, "
-          "wound cut sent %.1f; vertex shader without a constant table %.1f) | materials made %.1f, failed %.1f, "
-          "cached %zu | textures missing: base %.1f gradient %.1f detail %.1f cut %.1f | shaders known: %zu pixel, "
-          "%zu vertex\n",
+          "wound cut sent %.1f; burning %.1f, faded %.1f; vertex shader without a constant table %.1f) | materials "
+          "made %.1f, failed %.1f, cached %zu | textures missing: base %.1f gradient %.1f detail %.1f cut %.1f burn "
+          "%.1f | shaders known: %zu pixel, %zu vertex\n",
           rate(g_stats.draws), rate(g_stats.materials), rate(g_stats.woundCombo), rate(g_stats.wounded),
-          rate(g_stats.woundSent), rate(g_stats.noVertexTable), rate(g_stats.materialsCreated),
-          rate(g_stats.materialsFailed), materials, rate(g_stats.missing[kMissingBase]),
-          rate(g_stats.missing[kMissingGradient]), rate(g_stats.missing[kMissingDetail]),
-          rate(g_stats.missing[kMissingCut]), g_pixelShaders.size(), g_vertexShaders.size());
+          rate(g_stats.woundSent), rate(g_stats.burning), rate(g_stats.faded), rate(g_stats.noVertexTable),
+          rate(g_stats.materialsCreated), rate(g_stats.materialsFailed), materials,
+          rate(g_stats.missing[kMissingBase]), rate(g_stats.missing[kMissingGradient]),
+          rate(g_stats.missing[kMissingDetail]), rate(g_stats.missing[kMissingCut]),
+          rate(g_stats.missing[kMissingBurn]), g_pixelShaders.size(), g_vertexShaders.size());
   fprintf(out,
-          "   infected shader draws refused per second: %.1f (blended %.1f, alpha tested %.1f, lifted %.1f, particle "
-          "%.1f; wounded combination %.1f, with a wound near the model %.1f)\n",
-          rate(g_stats.refused), rate(g_stats.refusedBlend), rate(g_stats.refusedAlphaTest),
-          rate(g_stats.refusedLifted), rate(g_stats.refusedParticle), rate(g_stats.refusedWoundCombo),
-          rate(g_stats.refusedWounded));
+          "   infected shader draws refused per second: %.1f (blended %.1f, of which declaring g_DiffuseModulation "
+          "%.1f; alpha tested %.1f, lifted %.1f, particle %.1f; wounded combination %.1f, with a wound near the "
+          "model %.1f)\n",
+          rate(g_stats.refused), rate(g_stats.refusedBlend), rate(g_stats.refusedFadeable),
+          rate(g_stats.refusedAlphaTest), rate(g_stats.refusedLifted), rate(g_stats.refusedParticle),
+          rate(g_stats.refusedWoundCombo), rate(g_stats.refusedWounded));
 }
 
 // "shaders": every model shader seen so far, with the names its constant table declares.
@@ -348,7 +385,7 @@ void servicePresent(const wchar_t *directory, uint64_t frame) {
   if (GetFileAttributesW(request.c_str()) == INVALID_FILE_ATTRIBUTES)
     return;
   int count = 32;
-  g_probeWoundedOnly = false;
+  g_probeMode = kProbeTaken;
   if (FILE *in = _wfopen(request.c_str(), L"r")) {
     char line[64] = {};
     if (std::fgets(line, sizeof(line), in)) {
@@ -368,8 +405,8 @@ void servicePresent(const wchar_t *directory, uint64_t frame) {
         }
         return;
       }
-      if (line[0] == 'w' || line[0] == 'W') {
-        g_probeWoundedOnly = true;
+      if (line[0] == 'w' || line[0] == 'W' || line[0] == 'r' || line[0] == 'R') {
+        g_probeMode = line[0] == 'w' || line[0] == 'W' ? kProbeWounded : kProbeRefused;
         number = std::strpbrk(line, "0123456789");
         number = number ? number : "";
       }
@@ -379,13 +416,14 @@ void servicePresent(const wchar_t *directory, uint64_t frame) {
     fclose(in);
   }
   g_probeSkipped = 0;
+  g_probeNamed.clear();
   DeleteFileW(request.c_str());
   g_probeLeft = uint32_t(std::min(count, 4096));
   g_probePath = dir + L"\\infected_probe.txt";
   if (FILE *out = _wfopen(g_probePath.c_str(), L"w")) {
+    static const char *modes[3] = {"", "wounded ", "refused (not taken) "};
     fprintf(out, "== infected probe: the next %u %sinfected draws, from frame %llu (OPENREMIX_PROXY_INFECTED %s)\n",
-            g_probeLeft, g_probeWoundedOnly ? "wounded " : "", static_cast<unsigned long long>(frame),
-            enabled() ? "on" : "off");
+            g_probeLeft, modes[g_probeMode], static_cast<unsigned long long>(frame), enabled() ? "on" : "off");
     fclose(out);
   }
 }
@@ -393,9 +431,9 @@ void servicePresent(const wchar_t *directory, uint64_t frame) {
 bool probing() { return g_probeLeft != 0; }
 
 void probe(const Params &p, const float *ps, const float *vs, const ProbeDraw &draw) {
-  if (!g_probeLeft)
+  if (!g_probeLeft || draw.refused != (g_probeMode == kProbeRefused))
     return;
-  if (g_probeWoundedOnly && !(p.woundCombo && (nearby(p.center[0]) || nearby(p.center[1])))) {
+  if (g_probeMode == kProbeWounded && !(p.woundCombo && (nearby(p.center[0]) || nearby(p.center[1])))) {
     ++g_probeSkipped;
     return;
   }
@@ -403,7 +441,7 @@ void probe(const Params &p, const float *ps, const float *vs, const ProbeDraw &d
   FILE *out = _wfopen(g_probePath.c_str(), L"a");
   if (!out)
     return;
-  if (g_probeWoundedOnly)
+  if (g_probeMode == kProbeWounded)
     fprintf(out, "(%llu unwounded draws skipped before this one)\n", static_cast<unsigned long long>(g_probeSkipped));
   g_probeSkipped = 0;
   // Textures the shader is known to bind, by the hashes of their files.
@@ -417,20 +455,46 @@ void probe(const Params &p, const float *ps, const float *vs, const ProbeDraw &d
                              "models/infected/common/body_wounds/wound_cull_texture",
                              "models/infected/common/body_wounds/wound_slash_cull_texture",
                              "models/infected/common/l4d2/ci_gradient_palette",
-                             "models/infected/common/l4d2/detail/ci_detail_dirt"})
+                             "models/infected/common/l4d2/detail/ci_detail_dirt",
+                             "models/infected/common/l4d2/ci_burning"})
       k.push_back({name, bsp::textureCandidates(name)});
     return k;
   }();
-  fprintf(out, "f%llu verts %u prims %u | layout skinned %d, bones/vertex %u, bones %u -> %s | dynamic vertices %d%s | "
-               "material %s | wounded %d (combination %d), cut sent %d\n",
-          static_cast<unsigned long long>(draw.frame), draw.vertices, draw.primitives, int(draw.skinnedLayout),
-          draw.bonesPerVertex, draw.boneCount,
-          draw.boneCount > 1    ? "bind pose + bone transforms"
-          : draw.boneCount == 1 ? "bind pose, rigid (model transform)"
-          : draw.skinnedLayout  ? "CPU-skinned vertices (world space)"
-                                : "unskinned layout (model transform)",
-          int(draw.dynamicVertices), draw.flexIgnored ? " | flex stream ignored" : "",
-          draw.material ? "gradient map" : "plain (fallback)", int(p.wounded), int(p.woundCombo), int(draw.woundSent));
+  if (draw.refused)
+    fprintf(out, "f%llu REFUSED (blended %d, alpha tested %d, lifted %d, particle %d) verts %u prims %u | wounded "
+                 "combination %d\n",
+            static_cast<unsigned long long>(draw.frame), int(draw.blend), int(draw.alphaTest), int(draw.lifted),
+            int(draw.particle), draw.vertices, draw.primitives, int(p.woundCombo));
+  else
+    fprintf(out, "f%llu verts %u prims %u | layout skinned %d, bones/vertex %u, bones %u -> %s | dynamic vertices "
+                 "%d%s | material %s | wounded %d (combination %d), cut sent %d\n",
+            static_cast<unsigned long long>(draw.frame), draw.vertices, draw.primitives, int(draw.skinnedLayout),
+            draw.bonesPerVertex, draw.boneCount,
+            draw.boneCount > 1    ? "bind pose + bone transforms"
+            : draw.boneCount == 1 ? "bind pose, rigid (model transform)"
+            : draw.skinnedLayout  ? "CPU-skinned vertices (world space)"
+                                  : "unskinned layout (model transform)",
+            int(draw.dynamicVertices), draw.flexIgnored ? " | flex stream ignored" : "",
+            draw.material ? "gradient map" : "plain (fallback)", int(p.wounded), int(p.woundCombo),
+            int(draw.woundSent));
+  // D3DBLEND / D3DBLENDOP / D3DCMP values as numbers (SRCALPHA 5, INVSRCALPHA 6, ONE 2; ADD 1).
+  fprintf(out, "   blend %d src %u dst %u op %u | separate alpha %d src %u dst %u op %u | alpha test %d func %u ref %u\n",
+          int(draw.blend), draw.srcBlend, draw.dstBlend, draw.blendOp, int(draw.separateAlpha), draw.srcBlendAlpha,
+          draw.dstBlendAlpha, draw.blendOpAlpha, int(draw.alphaTest), draw.alphaFunc, draw.alphaRef);
+  // The pixel shader's names, the first time this probe meets it.
+  if (draw.pixelShader &&
+      std::find(g_probeNamed.begin(), g_probeNamed.end(), draw.pixelShader) == g_probeNamed.end()) {
+    g_probeNamed.push_back(draw.pixelShader);
+    auto it = g_pixelShaders.find(draw.pixelShader);
+    ConstantTable t;
+    if (it != g_pixelShaders.end() && parseConstantTable(*it->second.code, t)) {
+      fprintf(out, "   ps %p declares:", draw.pixelShader);
+      static const char *sets[4] = {"b", "i", "c", "s"};
+      for (const auto &e : t.entries)
+        fprintf(out, " %s=%s%u", e.name.c_str(), e.set < 4 ? sets[e.set] : "?", unsigned(e.index));
+      fprintf(out, "\n");
+    }
+  }
   auto reg = [&](const char *label, const float *bank, int r) {
     const float *c = bank + r * 4;
     fprintf(out, " %s%d (%g %g %g %g)", label, r, c[0], c[1], c[2], c[3]);
@@ -438,6 +502,19 @@ void probe(const Params &p, const float *ps, const float *vs, const ProbeDraw &d
   fprintf(out, "   ps:");
   for (int r : {3, 4, 7, 8, 10})
     reg("c", ps, r);
+  fprintf(out, "\n   ps:");
+  const struct {
+    const char *name;
+    int r;
+  } named[3] = {{"eye glow", p.eyeGlowRegister}, {"modulation", p.modulationRegister},
+                {"shader params", p.shaderParamsRegister}};
+  for (const auto &n : named) {
+    fprintf(out, " %s", n.name);
+    if (n.r >= 0)
+      reg("c", ps, n.r);
+    else
+      fprintf(out, " -");
+  }
   fprintf(out, "\n   vs:");
   for (int r : {14, 15, 48, 49, 50, 51})
     reg("c", vs, r);
@@ -447,6 +524,7 @@ void probe(const Params &p, const float *ps, const float *vs, const ProbeDraw &d
   fprintf(out, "\n   taken: rows skin %g cloth %g sprite %g %g detail u (%g %g) v (%g %g) blood (%g %g %g) range %g..%g",
           p.skinRow, p.clothRow, p.spriteOffset[0], p.spriteOffset[1], p.detailU[0], p.detailU[1], p.detailV[0],
           p.detailV[1], p.bloodColor[0], p.bloodColor[1], p.bloodColor[2], p.bloodRange[0], p.bloodRange[1]);
+  fprintf(out, " | burn strength %g opacity %g", p.burnStrength, p.opacity);
   if (p.woundCombo) {
     fprintf(out, " | mapping scale %g second blend %g threshold %g", p.mappingScale, p.secondBlend, p.threshold);
     for (int e = 0; e < 2; ++e)
@@ -460,10 +538,12 @@ void probe(const Params &p, const float *ps, const float *vs, const ProbeDraw &d
             p.cutScaleBias[1][1], p.cutScaleBias[1][2], p.cutScaleBias[1][3]);
   }
   fprintf(out, "\n");
-  static const int stages[4] = {0, 4, 5, 6};
-  for (int i = 0; i < 4; ++i) {
+  static const char *roles[ProbeDraw::kTextures] = {"base", "detail", "gradient", "cut", "burn"};
+  for (int i = 0; i < ProbeDraw::kTextures; ++i) {
+    if (draw.stages[i] < 0)
+      continue;
     const void *texture = draw.textures[i];
-    fprintf(out, "   s%d %p", stages[i], texture);
+    fprintf(out, "   s%d %s %p srgb %u", draw.stages[i], roles[i], texture, draw.srgb[i]);
     if (texture) {
       auto *base = static_cast<IDirect3DBaseTexture9 *>(const_cast<void *>(texture));
       D3DSURFACE_DESC desc = {};
