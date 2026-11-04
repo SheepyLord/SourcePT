@@ -87,7 +87,7 @@ struct Bound {
   bool modulate = false;    // DecalModulate: dst x src x 2
   bool lightmapped = false; // LightmappedGeneric and the other world shaders
   bool vertexColor = false, vertexAlpha = false, translucent = false, additive = false, alphaTest = false;
-  bool isModel = false;     // $model / MATERIAL_VAR_MODEL (L4D2 1 << 11; GMod tests 1 << 2, see kFlagModel)
+  bool isModel = false;     // $model / MATERIAL_VAR_MODEL (1 << 11), or its $model var
   bool subRect = false;     // bound through a CMaterialSubRect
   int flags = 0;
   const char *shader = "";

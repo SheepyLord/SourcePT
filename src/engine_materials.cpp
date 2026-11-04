@@ -106,9 +106,6 @@ constexpr uintptr_t kBind = 0x11540;
 constexpr size_t kMaterialCount = 0x32, kMaterialParams = 0x38, kMaterialName = 0x28, kMaterialShader = 0x20;
 // CMaterialVar: type nibble, ITexture * of a texture var.
 constexpr size_t kVarType = 0x24, kVarTexture = 0x39;
-// (GMod's materialsystem names bit 2 $no_draw and bit 11 $model in its table
-// of the $flags names; the $model var is read as well.)
-constexpr int kFlagModel = 1 << 2;
 #else
 // L4D2: as the code checked at install reads them (see above).
 constexpr unsigned kSlotGetName = 0, kSlotParamCount = 40, kSlotParams = 41, kSlotShaderName = 49;
@@ -119,11 +116,13 @@ constexpr unsigned kSlotBind = game::kSlotBind;
 constexpr size_t kSubRectPageOffset = 0x4, kSubRectNameOffset = 0x10;
 constexpr size_t kMaterialCount = 0x22, kMaterialParams = 0x24, kMaterialName = 0x18, kMaterialShader = 0x14;
 constexpr size_t kVarType = 0x1c, kVarTexture = 0x24;
-constexpr int kFlagModel = 1 << 11;
 #endif
 // MaterialVarType_t: float 0, string 1, vector 2, texture 3, int 4, fourcc 5, undefined 6, matrix 7, material 8.
 constexpr uint8_t kTypeFloat = 0, kTypeString = 1, kTypeVector = 2, kTypeTexture = 3, kTypeInt = 4, kTypeUndefined = 6;
 // MaterialVarFlags_t.
+// $model is bit 11 in both games (each materialsystem's table of the $flags
+// names; bit 2 is $no_draw).
+constexpr int kFlagModel = 1 << 11;
 constexpr int kFlagVertexColor = 1 << 4, kFlagVertexAlpha = 1 << 5, kFlagSelfIllum = 1 << 6, kFlagAdditive = 1 << 7,
               kFlagAlphaTest = 1 << 8, kFlagDecal = 1 << 16, kFlagEnvmapSphere = 1 << 17,
               kFlagBaseAlphaEnvmapMask = 1 << 20, kFlagTranslucent = 1 << 21, kFlagNormalAlphaEnvmapMask = 1 << 22,
