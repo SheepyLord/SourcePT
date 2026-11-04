@@ -41,7 +41,7 @@ sources = [
   'src/main.cpp', 'src/vtable_proxy.cpp', 'src/d3d_hooks.cpp', 'src/remix_output.cpp', 'src/texture_formats.cpp',
   'src/dxvk_hash.cpp', 'src/texture_categories.cpp', 'src/source_fs.cpp', 'src/bsp_world.cpp',
   'src/engine_materials.cpp', 'src/pbr_rules.cpp',
-  'src/vertex_program.cpp', 'src/particles.cpp', 'src/diag.cpp', 'src/lzma_source.cpp', 'src/host_passes.cpp', 'src/vb_origins.cpp',
+  'src/vertex_program.cpp', 'src/shader_tables.cpp', 'src/particles.cpp', 'src/diag.cpp', 'src/lzma_source.cpp', 'src/host_passes.cpp', 'src/vb_origins.cpp',
   'deps/lzma/LzmaDec.c', host_shaders,
 ]
 cpp_args = []

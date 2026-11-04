@@ -22,6 +22,7 @@
 
 #include "bsp_world.h"
 #include "d3d_hooks.h"
+#include "shader_tables.h"
 
 #include <d3d9.h>
 
@@ -37,70 +38,9 @@
 namespace proxy::l4d2::infected {
 namespace {
 
-// A shader's constants by name, from its CTAB comment (D3DXSHADER_CONSTANTTABLE).
-struct ConstantTable {
-  struct Entry {
-    std::string name;
-    uint16_t set, index, count; // set: D3DXRS_BOOL 0, INT4 1, FLOAT4 2, SAMPLER 3
-  };
-  std::vector<Entry> entries;
-  const Entry *find(const char *name) const {
-    for (const auto &e : entries)
-      if (e.name == name)
-        return &e;
-    return nullptr;
-  }
-  int floatRegister(const char *name) const {
-    const Entry *e = find(name);
-    return e && e->set == 2 ? int(e->index) : -1;
-  }
-  int sampler(const char *name) const {
-    const Entry *e = find(name);
-    return e && e->set == 3 ? int(e->index) : -1;
-  }
-};
-
-bool parseConstantTable(const std::vector<uint32_t> &code, ConstantTable &out) {
-  constexpr uint32_t kCtab = 0x42415443; // "CTAB"
-  for (size_t i = 1; i < code.size();) {
-    const uint32_t token = code[i];
-    if (token == 0x0000ffff)
-      break; // end
-    if ((token & 0xffff) == 0xfffe) { // comment
-      const size_t words = (token >> 16) & 0x7fff;
-      if (words >= 8 && i + 1 + words <= code.size() && code[i + 1] == kCtab) {
-        const auto *table = reinterpret_cast<const uint8_t *>(&code[i + 2]);
-        const size_t bytes = (words - 1) * 4;
-        uint32_t header[7];
-        if (bytes < sizeof(header))
-          return false;
-        std::memcpy(header, table, sizeof(header));
-        const uint32_t constants = header[3], info = header[4];
-        if (info > bytes || uint64_t(constants) * 20 > bytes - info)
-          return false;
-        for (uint32_t c = 0; c < constants; ++c) {
-          const uint8_t *e = table + info + size_t(c) * 20;
-          uint32_t nameAt;
-          uint16_t set, index, count;
-          std::memcpy(&nameAt, e, 4);
-          std::memcpy(&set, e + 4, 2);
-          std::memcpy(&index, e + 6, 2);
-          std::memcpy(&count, e + 8, 2);
-          if (nameAt >= bytes)
-            continue;
-          const char *name = reinterpret_cast<const char *>(table + nameAt);
-          const size_t length = strnlen(name, bytes - nameAt);
-          out.entries.push_back({std::string(name, length), set, index, count});
-        }
-        return true;
-      }
-      i += 1 + words;
-      continue;
-    }
-    i += 1 + ((token >> 24) & 0xf); // SM2+: instruction length in the opcode token
-  }
-  return false;
-}
+using shader_tables::Cache;
+using shader_tables::ConstantTable;
+using shader_tables::lookup;
 
 // What a pixel shader is (registers -1: not declared).
 struct PixelShader {
@@ -115,17 +55,13 @@ struct VertexShader {
   int center = -1, lookAt = -1, up = -1, side = -1, center2 = -1, lookAt2 = -1, up2 = -1, side2 = -1;
 };
 
-template <typename Info> struct Cached {
-  std::shared_ptr<const std::vector<uint32_t>> code; // identity: a new shader at this address has new code
-  Info info;
-};
-std::unordered_map<const void *, Cached<PixelShader>> g_pixelShaders;
-std::unordered_map<const void *, Cached<VertexShader>> g_vertexShaders;
+Cache<PixelShader> g_pixelShaders;
+Cache<VertexShader> g_vertexShaders;
 
 PixelShader describePixel(const std::vector<uint32_t> &code) {
   PixelShader s;
   ConstantTable t;
-  if (!parseConstantTable(code, t))
+  if (!shader_tables::parse(code, t))
     return s;
   s.gradSelect = t.floatRegister("g_vGradSelect");
   s.blood = t.floatRegister("g_cBloodColor_WaterFogOORange");
@@ -157,7 +93,7 @@ PixelShader describePixel(const std::vector<uint32_t> &code) {
 VertexShader describeVertex(const std::vector<uint32_t> &code) {
   VertexShader s;
   ConstantTable t;
-  if (!parseConstantTable(code, t))
+  if (!shader_tables::parse(code, t))
     return s;
   s.detail = t.floatRegister("cDetailTexCoordTransform");
   s.scales = t.floatRegister("g_vWoundUvScales");
@@ -175,26 +111,6 @@ VertexShader describeVertex(const std::vector<uint32_t> &code) {
   for (int r : {s.scales, s.biases, s.center, s.lookAt, s.up, s.side, s.center2, s.lookAt2, s.up2, s.side2})
     s.wound = s.wound && r >= 0 && r < 256;
   return s;
-}
-
-template <typename Info>
-const Info *lookup(std::unordered_map<const void *, Cached<Info>> &cache, const void *shader,
-                   Info (*describe)(const std::vector<uint32_t> &)) {
-  if (!shader)
-    return nullptr;
-  auto code = d3d::shaderCode(shader);
-  if (!code)
-    return nullptr;
-  auto it = cache.find(shader);
-  if (it == cache.end() || it->second.code != code) {
-    if (cache.size() > 16384)
-      cache.clear();
-    Cached<Info> entry;
-    entry.info = describe(*code);
-    entry.code = std::move(code);
-    it = cache.insert_or_assign(shader, std::move(entry)).first;
-  }
-  return &it->second.info;
 }
 
 bool finite(const float *v, int n) {
@@ -363,12 +279,11 @@ void dumpStatistics(FILE *out, size_t materials) {
 
 // "shaders": every model shader seen so far, with the names its constant table declares.
 template <typename Info, typename Flags>
-void dumpShaders(FILE *out, const char *kind, const std::unordered_map<const void *, Cached<Info>> &cache,
-                 Flags flags) {
+void dumpShaders(FILE *out, const char *kind, const Cache<Info> &cache, Flags flags) {
   for (const auto &[shader, entry] : cache) {
     fprintf(out, "%s %p, %zu words, %s:", kind, shader, entry.code->size(), flags(entry.info));
     ConstantTable t;
-    if (!parseConstantTable(*entry.code, t))
+    if (!shader_tables::parse(*entry.code, t))
       fprintf(out, " (no constant table)");
     static const char *sets[4] = {"b", "i", "c", "s"};
     for (const auto &e : t.entries)
@@ -487,7 +402,7 @@ void probe(const Params &p, const float *ps, const float *vs, const ProbeDraw &d
     g_probeNamed.push_back(draw.pixelShader);
     auto it = g_pixelShaders.find(draw.pixelShader);
     ConstantTable t;
-    if (it != g_pixelShaders.end() && parseConstantTable(*it->second.code, t)) {
+    if (it != g_pixelShaders.end() && shader_tables::parse(*it->second.code, t)) {
       fprintf(out, "   ps %p declares:", draw.pixelShader);
       static const char *sets[4] = {"b", "i", "c", "s"};
       for (const auto &e : t.entries)

@@ -14,6 +14,7 @@
 #include "l4d2.h"
 #endif
 #include "particles.h"
+#include "shader_tables.h"
 #include "texture_categories.h"
 #include "vb_origins.h"
 #include <unordered_set>
@@ -45,12 +46,16 @@
 namespace proxy::remix {
 namespace {
 
-// Source vertex shader registers (common_vs_fxc.h layout).
+// Source vertex shader registers (common_vs_fxc.h layout; the same in L4D2's
+// shaders but for cFlexScale). cFlexScale and the iris projection are taken
+// from the draw's vertex shader's constant table when it names them (see
+// ModelShader); these are the fallback.
 constexpr unsigned kRegModelViewProj = 4; // c4..c7: model * view * projection (columns)
 constexpr unsigned kRegViewProj = 8;  // c8..c11: view * projection
 constexpr unsigned kRegModel = 58;    // c58..c60: model (object to world) 3x4 rows
 constexpr unsigned kRegEyeIrisU = 50; // c50, c51: Eyes shader iris projection U, V (world position -> iris texture)
-constexpr unsigned kRegFlexScale = 3; // c3.x: 1 while a flex mesh is bound to stream 2, else 0 (cFlexScale)
+// c3.x (L4D2: c13.x): 1 while a flex mesh is bound to stream 2, else 0 (cFlexScale)
+constexpr unsigned kRegFlexScale = game::kGMod ? 3 : 13;
 constexpr unsigned kRegAmbientUp = 25; // c21..c26: ambient cube +X -X +Y -Y +Z -Z (linear)
 // MaterialMatrixMode_t
 constexpr int kMatrixView = 0;
@@ -83,10 +88,13 @@ struct Stats {
   // PBR conversions (pbr_rules): draws with one, and why some stayed diffuse.
   std::atomic<uint32_t> underwaterFrames{0}, refractOverlaysDropped{0};
   std::atomic<uint32_t> pbrDraws{0}, pbrNormalDraws{0}, pbrMapDraws{0}, pbrMetalDraws{0}, pbrNotBase{0}, pbrMapsMissing{0}, pbrCreated{0};
-  // Flexed draws (facial animation, see flexScale): rebuilt this frame, and flex streams whose scale was 0.
-  std::atomic<uint32_t> flexed{0}, flexUnscaled{0}, flexRefreshed{0};
-  // Eye draws (the Eyes shader), and the iris overlays made for them.
-  std::atomic<uint32_t> eyes{0}, eyeIrises{0}, eyeRefracts{0};
+  // Flexed draws (facial animation, see flexScale): rebuilt this frame, flex
+  // streams whose scale was 0, and flex streams whose vertex shader's
+  // constant table did not name cFlexScale (kRegFlexScale assumed).
+  std::atomic<uint32_t> flexed{0}, flexUnscaled{0}, flexRefreshed{0}, flexAssumed{0};
+  // Eye draws (the Eyes shader), and the iris overlays made for them; of the
+  // eye draws, those told by their vertex shader (no material name: L4D2).
+  std::atomic<uint32_t> eyes{0}, eyeIrises{0}, eyeRefracts{0}, eyesByShader{0};
   // Rope draws (the Cable shader): with their base texture found by name, and without.
   std::atomic<uint32_t> cableDraws{0}, cableNoBase{0};
   // Decals (onDraw): by kind (DecalKind order), by what marked them, and how
@@ -1852,12 +1860,51 @@ void captureUi(const Draw &d) {
   ++g_stats.uiDraws;
 }
 
+// What a model draw's vertex shader declares (its constant table, read once
+// per shader object): where cFlexScale and the eye shaders' iris projection
+// are (-1: not named), and whether it is the Eyes or the EyeRefract shader's
+// (eyes_vs*: cIrisProjectionU and cGlintProjectionU; eye_refract_vs*:
+// g_vIrisProjectionU and g_cEyeOrigin; their flashlight passes declare no
+// glint, and are blended). The eye shaders are told by the material's shader
+// name where it is known (engine_materials), by these where it is not.
+enum EyeShader : uint8_t { kNotEyes, kEyesShader, kEyeRefractShader };
+struct ModelShader {
+  int flexScale = -1, irisU = -1; // irisU: U, and V the register after it
+  EyeShader eye = kNotEyes;
+};
+ModelShader describeModelShader(const std::vector<uint32_t> &code) {
+  ModelShader s;
+  shader_tables::ConstantTable t;
+  if (!shader_tables::parse(code, t))
+    return s;
+  s.flexScale = t.floatRegister("cFlexScale");
+  if (s.flexScale >= 256)
+    s.flexScale = -1;
+  const int eyesU = t.floatRegister("cIrisProjectionU"), eyesV = t.floatRegister("cIrisProjectionV");
+  const int refractU = t.floatRegister("g_vIrisProjectionU"), refractV = t.floatRegister("g_vIrisProjectionV");
+  if (eyesU >= 0 && eyesU < 255 && eyesV == eyesU + 1 && t.floatRegister("cGlintProjectionU") >= 0) {
+    s.eye = kEyesShader;
+    s.irisU = eyesU;
+  } else if (refractU >= 0 && refractU < 255 && refractV == refractU + 1 && t.floatRegister("g_cEyeOrigin") >= 0) {
+    s.eye = kEyeRefractShader;
+    s.irisU = refractU;
+  }
+  return s;
+}
+shader_tables::Cache<ModelShader> g_modelShaders; // render thread
+const ModelShader &modelShader(const Draw &d) {
+  static const ModelShader none;
+  const ModelShader *s = shader_tables::lookup(g_modelShaders, d.vertexShader, describeModelShader);
+  return s ? *s : none;
+}
+
 // Flexes (facial animation, common_vs_fxc.h ApplyMorph). Every model
 // declaration ends with POSITION1 (float3, or float4 with the wrinkle weight)
 // and NORMAL1 on stream 2. Without flexes that stream is a buffer of zeros
 // with stride 0; for a flexed strip group studiorender writes this frame's
 // deltas into a dynamic "flex mesh" and binds it there, and the vertex shader
-// adds delta * cFlexScale.x to the position and the normal before skinning.
+// adds delta * cFlexScale.x to the position and the normal before skinning
+// (c3 in GMod's shaders, c13 in L4D2's: as the shader's table says).
 // Returns that scale (0: nothing to add). A flex mesh whose deltas are all
 // zero (a face at rest) counts as none: the draw keeps its cached mesh.
 float flexScale(const Draw &d) {
@@ -1867,7 +1914,9 @@ float flexScale(const Draw &d) {
   const auto &s = d.streams[delta->Stream];
   if (!s.data || !s.stride)
     return 0;
-  const float scale = d.vsConstants[kRegFlexScale * 4];
+  const int named = modelShader(d).flexScale;
+  g_stats.flexAssumed += named < 0;
+  const float scale = d.vsConstants[(named >= 0 ? unsigned(named) : kRegFlexScale) * 4];
   if (!std::isfinite(scale) || scale == 0) {
     ++g_stats.flexUnscaled; // a flex stream with the switch off: not this build's register?
     return 0;
@@ -5180,7 +5229,17 @@ void onDraw(const Draw &d) {
   // its size. The eyeball
   // is submitted with that texture and those coordinates: a mesh of its own,
   // refreshed in place as the gaze and the head move (g_flexMeshes).
-  if (!d.blend && d.texture1 && bound.known && nameStarts(bound.shader, "eyerefract")) {
+  const EyeShader eyeShader =
+      d.blend || !d.texture1 ? kNotEyes
+      : bound.known          ? nameStarts(bound.shader, "eyerefract") ? kEyeRefractShader
+                               : nameStarts(bound.shader, "eyes")     ? kEyesShader
+                                                                      : kNotEyes
+                             : modelShader(d).eye;
+  // The iris projection's registers, as the vertex shader names them.
+  const int irisNamed = eyeShader != kNotEyes ? modelShader(d).irisU : -1;
+  const float *irisProjection = d.vsConstants + (irisNamed >= 0 ? unsigned(irisNamed) : kRegEyeIrisU) * 4;
+  g_stats.eyesByShader += eyeShader != kNotEyes && !bound.known;
+  if (eyeShader == kEyeRefractShader) {
     ++g_stats.eyes;
     uint32_t eyeBones = 0;
     g_liftVertexStep = 0;
@@ -5188,7 +5247,7 @@ void onDraw(const Draw &d) {
     const uint64_t eyeHash = (eyesPerFrame ? hash : flexHash) ^ 0xe7e2ef2ac7e7e2efull;
     remixapi_MeshHandle eyeMesh =
         eyeMaterial ? buildMesh(d, eyeHash, bonesPerVertex, &eyeBones, 0, false, false, 1, nullptr, flex,
-                                d.vsConstants + kRegEyeIrisU * 4, !eyesPerFrame, 0.5f)
+                                irisProjection, !eyesPerFrame, 0.5f)
                     : nullptr;
     if (eyesPerFrame) {
       if (eyeMesh)
@@ -5239,7 +5298,7 @@ void onDraw(const Draw &d) {
   // coordinates change every frame: one mesh per eye, refreshed in place like
   // a flexed face (g_flexMeshes), which the tracer refits instead of building
   // anew and which stays one instance from frame to frame.
-  if (!d.blend && d.texture1 && bound.known && nameStarts(bound.shader, "eyes")) {
+  if (eyeShader == kEyesShader) {
     constexpr float kIrisLift = 0.03f; // inches; an eye is about one across
     ++g_stats.eyes;
     uint32_t irisBones = 0;
@@ -5253,7 +5312,7 @@ void onDraw(const Draw &d) {
         // iris inside it, where only a decal's attachment still found it).
         irisMaterial ? buildMesh(d, irisHash, bonesPerVertex, &irisBones, kIrisLift, false, false,
                                  faceNormalSign(d.cullMode), nullptr, flex,
-                                 d.vsConstants + kRegEyeIrisU * 4, !eyesPerFrame)
+                                 irisProjection, !eyesPerFrame)
                      : nullptr;
     if (eyesPerFrame) {
       if (irisMesh)
@@ -7468,11 +7527,12 @@ void dumpStatistics(FILE *out) {
           g_stats.cableDraws.exchange(0) / f, g_stats.cableNoBase.exchange(0) / f);
   fprintf(out, "   wireframe draws (D3DFILL_WIREFRAME, raster-only lines) per frame: %.1f\n",
           g_stats.wireframeDraws.exchange(0) / f);
-  fprintf(out, "   flexed draws per frame (faces with flex deltas this frame): %.1f, meshes refreshed in place %.1f (%zu flex meshes live) | flex stream bound with scale 0: %.1f\n",
+  fprintf(out, "   flexed draws per frame (faces with flex deltas this frame): %.1f, meshes refreshed in place %.1f (%zu flex meshes live) | flex stream bound with scale 0: %.1f, with cFlexScale not named by the shader (c%u assumed): %.1f\n",
           g_stats.flexed.exchange(0) / f, g_stats.flexRefreshed.exchange(0) / f, g_flexMeshes.size(),
-          g_stats.flexUnscaled.exchange(0) / f);
-  fprintf(out, "   eye draws per frame (Eyes and EyeRefract shaders): %.1f, iris overlays submitted %.1f, EyeRefract eyes retextured %.1f\n",
-          g_stats.eyes.exchange(0) / f, g_stats.eyeIrises.exchange(0) / f, g_stats.eyeRefracts.exchange(0) / f);
+          g_stats.flexUnscaled.exchange(0) / f, kRegFlexScale, g_stats.flexAssumed.exchange(0) / f);
+  fprintf(out, "   eye draws per frame (Eyes and EyeRefract shaders): %.1f (told by the vertex shader, material not read: %.1f), iris overlays submitted %.1f, EyeRefract eyes retextured %.1f\n",
+          g_stats.eyes.exchange(0) / f, g_stats.eyesByShader.exchange(0) / f, g_stats.eyeIrises.exchange(0) / f,
+          g_stats.eyeRefracts.exchange(0) / f);
   {
     // Cached meshes built more than once in the interval (see MeshBuilds).
     std::lock_guard<std::mutex> lock(g_transientSampleLock);
