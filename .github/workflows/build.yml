@@ -6,13 +6,13 @@ name: Build
 
 on:
   push:
-    branches: [main]
+    branches: [main, forward-plus-renderer]
   pull_request:
   workflow_dispatch:
     inputs:
       openremix_ref:
         description: OpenRemix branch, tag or commit for the headers
-        default: main
+        default: ''
 
 jobs:
   build:
@@ -33,8 +33,8 @@ jobs:
       - name: Check out OpenRemix headers
         uses: actions/checkout@v4
         with:
-          repository: sambow23/OpenRemix
-          ref: ${{ inputs.openremix_ref || 'main' }}
+          repository: OpenRenderCollective/OpenRemix
+          ref: ${{ inputs.openremix_ref || ((github.ref_name == 'forward-plus-renderer' || github.base_ref == 'forward-plus-renderer') && 'forward-plus-renderer') || 'main' }}
           path: openremix
           sparse-checkout: |
             public/include
