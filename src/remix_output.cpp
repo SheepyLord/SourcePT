@@ -2329,9 +2329,10 @@ void probeMaterialDraw(const void *texture, const engine_materials::Shading &bou
   FILE *out = _wfopen((g_moduleDir + L"\\material_probe.txt").c_str(), L"a");
   if (!out)
     return;
-  const auto &b = engine_materials::bound();
+  // As read, whatever reaches the draw (L4D2: OPENREMIX_PROXY_MATERIALS).
+  const auto &b = engine_materials::boundRead();
   fprintf(out, "f%llu texture %016llX | bound %s (%s, flags %08X) base %s pbr %d | taken mode %d base %s pbr %d normal %s rough %s ch %u bias %g scale %g, roughness %g | metal %s ch %u inv %d bias %g scale %g, metallic %g, colour %d (%g %g %g)%s%s\n",
-          static_cast<unsigned long long>(g_frame), static_cast<unsigned long long>(hash), engine_materials::currentName(),
+          static_cast<unsigned long long>(g_frame), static_cast<unsigned long long>(hash), engine_materials::nameRead(),
           b.known ? b.shader : "?", unsigned(b.flags), bound.base.c_str(), int(bound.pbr.active), int(taken.mode),
           taken.base.c_str(), int(taken.pbr.active), taken.pbr.normal.c_str(), taken.pbr.maps[0].texture.c_str(),
           taken.pbr.maps[0].channel, taken.pbr.maps[0].bias, taken.pbr.maps[0].scale, taken.pbr.roughness,
@@ -2382,7 +2383,8 @@ void serviceShaderProbeRequest() {
 void probeShaderDraw(const Draw &d, const engine_materials::Shading &taken) {
   if (!g_shaderProbe.left)
     return;
-  const auto &b = engine_materials::bound();
+  // As read, whatever reaches the draw (L4D2: OPENREMIX_PROXY_MATERIALS).
+  const auto &b = engine_materials::boundRead();
   if (!b.known)
     return;
   std::string shader = b.shader;
@@ -2391,7 +2393,7 @@ void probeShaderDraw(const Draw &d, const engine_materials::Shading &taken) {
   if (shader.rfind(g_shaderProbe.shader, 0) != 0)
     return;
   if (!g_shaderProbe.material.empty()) {
-    std::string material = engine_materials::currentName();
+    std::string material = engine_materials::nameRead();
     for (char &c : material)
       c = char(std::tolower(static_cast<unsigned char>(c)));
     if (material.find(g_shaderProbe.material) == std::string::npos)
@@ -2402,8 +2404,8 @@ void probeShaderDraw(const Draw &d, const engine_materials::Shading &taken) {
   if (!out)
     return;
   fprintf(out, "f%llu %s (%s, translucent %d alphaTest %d) base \"%s\" | blend %d %u/%u alphaTest %d | taken mode %d base \"%s\" | verts %u prims %u\n",
-          static_cast<unsigned long long>(g_frame), engine_materials::currentName(), b.shader, int(b.translucent),
-          int(b.alphaTest), engine_materials::current().base.c_str(), int(d.blend), d.srcBlend, d.dstBlend, int(d.alphaTest),
+          static_cast<unsigned long long>(g_frame), engine_materials::nameRead(), b.shader, int(b.translucent),
+          int(b.alphaTest), engine_materials::currentRead().base.c_str(), int(d.blend), d.srcBlend, d.dstBlend, int(d.alphaTest),
           int(taken.mode), taken.base.c_str(), d.numVertices, d.primCount);
   // Skinning: dynamic buffers (rewritten per draw: per-frame meshes), bones,
   // flex, the first vertex's position and bone 0's translation.
@@ -2507,11 +2509,11 @@ void dumpFlat(const Draw &d) {
         std::memcpy(&color, s.data + at + col->Offset, 4);
     }
   }
-  const auto &b = engine_materials::bound();
+  const auto &b = engine_materials::boundRead(); // as read (L4D2: whatever OPENREMIX_PROXY_MATERIALS says)
   fprintf(g_dumpFlat,
           "f%llu %s [%s] tex0=%p%s%s tex1=%p blend=%d %u/%u op%u sep=%d write=%x alphaTest=%d stencil=%d z=%d prim=%u verts=%u "
           "color(argb)=%08x bounds=%.0f,%.0f-%.0f,%.0f target=%ux%u main=%d",
-          (unsigned long long)g_frame, engine_materials::currentName(), b.known ? b.shader : "?", d.texture0,
+          (unsigned long long)g_frame, engine_materials::nameRead(), b.known ? b.shader : "?", d.texture0,
           d.texture0Target ? "(target)" : "", d.texture0 && !uiTextureFor(d.texture0) ? "(no ui)" : "", d.texture1,
           int(d.blend), d.srcBlend, d.dstBlend, d.blendOp, int(d.separateAlpha), d.colorWrite, int(d.alphaTest),
           int(d.stencil), int(d.depthTest), d.primCount, d.numVertices, color, x0, y0, x1, y1, d.targetWidth,

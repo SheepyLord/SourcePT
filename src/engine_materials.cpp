@@ -2,6 +2,9 @@
 #include "bsp_world.h"
 #include "game.h"
 #include "remix_output.h"
+#ifdef PROXY_GAME_L4D2
+#include "l4d2.h"
+#endif
 
 #include <windows.h>
 
@@ -14,6 +17,7 @@
 #include <map>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // The material system binds a material with IShaderAPI::Bind(IMaterial *)
@@ -23,12 +27,12 @@
 // for the previous material before it stores the new one, so every D3D draw
 // belongs to the material bound last.
 //
-// Everything below is for one build of materialsystem.dll and of the shader
-// API (shaderapidx9_orig.dll). install() requires each function used at its
-// RVA with these instruction bytes, the offsets read are the ones in those
-// instructions, and per object the vtable must be the class's: anything else
-// (another build, CMaterialSubRect, a material var of another class) is not
-// read and counts as Lit.
+// GMod (x64): everything below is for one build of materialsystem.dll and of
+// the shader API (shaderapidx9_orig.dll). install() requires each function
+// used at its RVA with these instruction bytes, the offsets read are the ones
+// in those instructions, and per object the vtable must be the class's:
+// anything else (another build, CMaterialSubRect, a material var of another
+// class) is not read and counts as Lit.
 //
 //   CMaterial (IMaterial, materialsystem.dll): 0 GetName, 40 ShaderParamCount
 //     (movzx eax, byte [rcx+0x32]), 41 GetShaderParams (mov rax, [rcx+0x38]),
@@ -50,9 +54,41 @@
 //   CShaderAPIDx8 (IShaderAPI, ShaderApi030): 114 Bind(IMaterial *). Between
 //     two sub-rectangles of one page it neither flushes nor stores (they draw
 //     as one batch), but the hook still sees every call.
+//
+// Left 4 Dead 2 (x86, materialsystem.dll and shaderapidx9_orig.dll of build
+// 2.2.x, Sep 2026): the same interfaces in an older layout, found instead of
+// assumed. The classes' vtables by their RTTI type names, each slot used
+// checked by its code (the bytes below, with the offsets they read), so
+// another build that moved a field or a slot is refused, not misread.
+// Disassembled offline (objdump -d of both modules):
+//   CShaderAPIDx8 (IShaderAPIDX8, ShaderApi029; its vtable at +0x21c of the
+//     object CreateInterface hands out): 76 Bind(IMaterial *), the slot
+//     CMatRenderContext::Bind calls on the material system's shader API after
+//     the bind proxies (call [edx+0x130]). It compares the pages of two
+//     sub-rectangles (InMaterialPage, GetMaterialPage: slots 7 and 10) and
+//     stores m_pMaterial ([this+0x2bd4]) without a flush: L4D2 has no
+//     buffered meshes (no CBufferedMeshDX8 class), every draw follows its Bind.
+//   CMaterial: 0 GetName (add ecx,0x18: its name symbol; jmp CUtlSymbol::
+//     String), 40 ShaderParamCount (movzx eax, byte [ecx+0x22]), 41
+//     GetShaderParams (mov eax,[ecx+0x24]), 49 GetShaderName (the shader at
+//     [ecx+0x14], its slot 0; no PrecacheVars as in GMod's).
+//   CMaterialVar: the GMod slots (1 GetName, 6 GetStringValue, 17 IsDefined,
+//     26 GetIntValueInternal, 27 GetFloatValueInternal, 29
+//     GetVecValueInternal()); its fields: string +4, int +8, float = vector
+//     +0xc, type the low nibble of +0x1c (0x80 there: a fake var), its
+//     queue-thread twin's index +0x1d (0xff: none), name symbol +0x1e, ITexture
+//     (texture vars) +0x24. The getters forward to the twin only while the
+//     calling thread's render context has a call queue (CMaterialSystem slot
+//     137: the thread's render context's slot 221, null in CMatRenderContext),
+//     as in GMod.
+//   CMaterialSubRect: 0 GetName (its name symbol at +0x10), 7 InMaterialPage
+//     (true), 10 GetMaterialPage (mov eax,[ecx+4]).
+//   MaterialVarFlags_t (materialsystem's table of the $flags names, by bit):
+//     SDK 2013's, $model at bit 11.
 namespace proxy::engine_materials {
 namespace {
 
+#ifdef PROXY_GAME_GMOD
 constexpr uintptr_t kMaterialVtable = 0xadf08, kVarVtable = 0xb3260;
 constexpr unsigned kSlotGetName = 0, kSlotParamCount = 40, kSlotParams = 41, kSlotShaderName = 49;
 constexpr unsigned kVarGetName = 1, kVarGetString = 6, kVarIsDefined = 17, kVarGetInt = 26, kVarGetFloat = 27,
@@ -70,14 +106,30 @@ constexpr uintptr_t kBind = 0x11540;
 constexpr size_t kMaterialCount = 0x32, kMaterialParams = 0x38, kMaterialName = 0x28, kMaterialShader = 0x20;
 // CMaterialVar: type nibble, ITexture * of a texture var.
 constexpr size_t kVarType = 0x24, kVarTexture = 0x39;
+// (GMod's materialsystem names bit 2 $no_draw and bit 11 $model in its table
+// of the $flags names; the $model var is read as well.)
+constexpr int kFlagModel = 1 << 2;
+#else
+// L4D2: as the code checked at install reads them (see above).
+constexpr unsigned kSlotGetName = 0, kSlotParamCount = 40, kSlotParams = 41, kSlotShaderName = 49;
+constexpr unsigned kVarGetName = 1, kVarGetString = 6, kVarIsDefined = 17, kVarGetInt = 26, kVarGetFloat = 27,
+                   kVarGetVec = 29;
+constexpr unsigned kSlotInPage = 7, kSlotPage = 10;
+constexpr unsigned kSlotBind = game::kSlotBind;
+constexpr size_t kSubRectPageOffset = 0x4, kSubRectNameOffset = 0x10;
+constexpr size_t kMaterialCount = 0x22, kMaterialParams = 0x24, kMaterialName = 0x18, kMaterialShader = 0x14;
+constexpr size_t kVarType = 0x1c, kVarTexture = 0x24;
+constexpr int kFlagModel = 1 << 11;
+#endif
 // MaterialVarType_t: float 0, string 1, vector 2, texture 3, int 4, fourcc 5, undefined 6, matrix 7, material 8.
 constexpr uint8_t kTypeFloat = 0, kTypeString = 1, kTypeVector = 2, kTypeTexture = 3, kTypeInt = 4, kTypeUndefined = 6;
 // MaterialVarFlags_t.
-constexpr int kFlagModel = 1 << 2, kFlagVertexColor = 1 << 4, kFlagVertexAlpha = 1 << 5, kFlagSelfIllum = 1 << 6, kFlagAdditive = 1 << 7,
+constexpr int kFlagVertexColor = 1 << 4, kFlagVertexAlpha = 1 << 5, kFlagSelfIllum = 1 << 6, kFlagAdditive = 1 << 7,
               kFlagAlphaTest = 1 << 8, kFlagDecal = 1 << 16, kFlagEnvmapSphere = 1 << 17,
               kFlagBaseAlphaEnvmapMask = 1 << 20, kFlagTranslucent = 1 << 21, kFlagNormalAlphaEnvmapMask = 1 << 22,
               kFlagEnvmapMode = 1 << 25;
 
+#ifdef PROXY_GAME_GMOD
 struct Expected {
   bool shaderApi; // else materialsystem.dll
   uintptr_t rva;
@@ -127,6 +179,7 @@ constexpr Expected kExpected[] = {
     // mov rax,[rcx]; call [rax]
     {false, 0x26dc0, "48 8B 01 FF 10", "ITexture::GetName call"},
 };
+#endif
 
 struct Module {
   uintptr_t base = 0, size = 0;
@@ -161,6 +214,52 @@ struct Module {
 
 std::atomic<bool> g_installed{false}, g_subRects{false};
 std::atomic<const char *> g_status{"not installed"}, g_detail{""};
+// The classes' vtables (addresses), set by install.
+uintptr_t g_materialVtable = 0, g_varVtable = 0, g_subRectVtable = 0;
+
+// Which of the lookup's answers reach the proxy (see install).
+enum Use : unsigned { kUseBound = 1, kUseName = 2, kUseShading = 4, kUseParams = 8, kUseAll = 15 };
+unsigned g_uses = kUseAll;
+std::string g_usesText = "all"; // for the statistics
+#ifdef PROXY_GAME_L4D2
+// OPENREMIX_PROXY_MATERIALS: 0 none, 1 all (the default), else a comma list.
+void readUses() {
+  static const struct {
+    const char *name;
+    Use use;
+  } kGroups[] = {{"bound", kUseBound}, {"name", kUseName}, {"shading", kUseShading}, {"params", kUseParams}};
+  char v[128] = {};
+  const DWORD n = GetEnvironmentVariableA("OPENREMIX_PROXY_MATERIALS", v, sizeof(v));
+  const std::string text = n && n < sizeof(v) ? v : "1";
+  std::string unknown;
+  const bool all = text == "1" || _stricmp(text.c_str(), "all") == 0;
+  g_uses = all ? unsigned(kUseAll) : 0u;
+  for (size_t at = 0; !all && text != "0" && at < text.size();) {
+    const size_t end = std::min(text.find(',', at), text.size());
+    const std::string item = text.substr(at, end - at);
+    at = end + 1;
+    bool known = false;
+    for (const auto &g : kGroups)
+      if (_stricmp(item.c_str(), g.name) == 0) {
+        g_uses |= g.use;
+        known = true;
+      }
+    if (!known && !item.empty())
+      unknown += " \"" + item + "\"";
+  }
+  if (g_uses == kUseAll) {
+    g_usesText = "all";
+  } else if (!g_uses) {
+    g_usesText = "none (read and counted only)";
+  } else {
+    g_usesText.clear();
+    for (const auto &g : kGroups)
+      if (g_uses & g.use)
+        g_usesText += (g_usesText.empty() ? "" : ",") + std::string(g.name);
+  }
+  g_usesText += " (OPENREMIX_PROXY_MATERIALS=" + text + (unknown.empty() ? "" : "; not known:" + unknown) + ")";
+}
+#endif
 
 using NameFn = const char *(PROXY_THISCALL *)(void *);
 using IntFn = int(PROXY_THISCALL *)(void *);
@@ -245,7 +344,7 @@ void *paramAt(const Entry &e, int index) {
   if (index < 0 || index >= e.count)
     return nullptr;
   void *var = e.params[index];
-  if (!var || *static_cast<uintptr_t *>(var) != g_materialSystem.base + kVarVtable) {
+  if (!var || *static_cast<uintptr_t *>(var) != g_varVtable) {
     g_stats.foreignVar.fetch_add(1, std::memory_order_relaxed);
     return nullptr;
   }
@@ -471,6 +570,124 @@ void readPbr(Entry &e, int flags, Shading &out) {
   out.pbr = pbr::convert(in);
 }
 
+#ifdef PROXY_GAME_L4D2
+// The CMaterialVar getters: whether the calling thread's render context has a
+// call queue (g_pMaterialSystem, slot 137), and while it does the queue
+// thread's twin; then the value (the tail).
+#define L4D2_VAR_GETTER(tail)                                                                                         \
+  "56 8B F1 8B 0D ? ? ? ? 8B 01 8B 90 24 02 00 00 FF D2 85 C0 74 2E F6 46 1C 80 75 28 8A 46 1D 3C FF 74 21 8B 0D ? ? " \
+  "? ? 0F B6 C0 8D 34 80 8B 01 8B 90 24 02 00 00 8D 34 F5 ? ? ? ? FF D2 85 C0 75 D2 " tail
+
+bool installL4D2(const void *const *shaderApiVtable) {
+  static l4d2::Module materials, shaderApi;
+  if (!materials.open("materialsystem.dll")) {
+    g_status = "no materialsystem.dll";
+    return false;
+  }
+  if (!shaderApi.open("shaderapidx9_orig.dll") || !shaderApi.holds(shaderApiVtable) ||
+      !shaderApi.holds(shaderApiVtable + kSlotBind)) {
+    g_status = "no shader API module";
+    g_detail = "shaderapidx9_orig.dll";
+    return false;
+  }
+  auto code = [](const l4d2::Module &m, const void *function, const char *bytes) {
+    return m.inCode(function) && l4d2::bytesAt(m, reinterpret_cast<uintptr_t>(function) - m.base, bytes);
+  };
+  // push esi; mov esi,[ebp+8]; push edi; mov edi,ecx; mov ecx,[edi+0x2bd4]
+  // (m_pMaterial); ... InMaterialPage (slot 7) on both; ...; GetMaterialPage
+  // (slot 10) on both; ...; mov [edi+0x2bd4],esi; ...; ret 4
+  if (!code(shaderApi, shaderApiVtable[kSlotBind],
+            "55 8B EC 56 8B 75 08 57 8B F9 8B 8F D4 2B 00 00 85 C9 74 ? 85 F6 74 ? 8B 01 8B 50 1C FF D2 84 C0 74 ? 8B 06 "
+            "8B 50 1C 8B CE FF D2 84 C0 74 ? 8B 8F D4 2B 00 00 8B 01 8B 50 28 53 FF D2 8B D8 8B 06 8B 50 28 8B CE FF D2 "
+            "3B D8 0F 95 C0 5B 84 C0 74 ? 89 B7 D4 2B 00 00 5F 5E 5D C2 04 00")) {
+    g_status = "code mismatch";
+    g_detail = "IShaderAPI::Bind (slot 76)";
+    return false;
+  }
+  void **material = l4d2::rttiVtable(materials, ".?AVCMaterial@@");
+  void **var = l4d2::rttiVtable(materials, ".?AVCMaterialVar@@");
+  if (!material || !var) {
+    g_status = "class not found (RTTI)";
+    g_detail = material ? "CMaterialVar" : "CMaterial";
+    return false;
+  }
+  struct Slot {
+    void **vtable;
+    unsigned slot;
+    const char *bytes;
+    const char *name;
+  };
+  const Slot slots[] = {
+      // add ecx,0x18 (the name symbol); jmp CUtlSymbol::String
+      {material, kSlotGetName, "83 C1 18 E9", "CMaterial::GetName"},
+      {material, kSlotParamCount, "0F B6 41 22 C3", "CMaterial::ShaderParamCount"},
+      {material, kSlotParams, "8B 41 24 C3", "CMaterial::GetShaderParams"},
+      // cmp [ecx+0x14],0; je; mov ecx,[ecx+0x14]; mov eax,[ecx]; mov edx,[eax]; jmp edx (IShader::GetName)
+      {material, kSlotShaderName, "83 79 14 00 74 09 8B 49 14 8B 01 8B 10 FF E2", "CMaterial::GetShaderName"},
+      // push esi; movzx esi, word [ecx+0x1e] (the name symbol); 0xffff: none
+      {var, kVarGetName, "56 0F B7 71 1E B8 FF FF 00 00 66 3B F0", "CMaterialVar::GetName"},
+      // mov al,[ecx+0x1c]; and al,0xf; xor ecx,ecx; cmp al,6; setne al; ret
+      {var, kVarIsDefined, "8A 41 1C 24 0F 33 C9 3C 06 0F 95 C0 C3", "CMaterialVar::IsDefined"},
+      // ...; mov eax,[esi+8]; pop esi; ret
+      {var, kVarGetInt, L4D2_VAR_GETTER("8B 46 08 5E C3"), "CMaterialVar::GetIntValueInternal"},
+      // ...; fld dword [esi+0xc]; pop esi; ret
+      {var, kVarGetFloat, L4D2_VAR_GETTER("D9 46 0C 5E C3"), "CMaterialVar::GetFloatValueInternal"},
+      // ...; lea eax,[esi+0xc]; pop esi; ret
+      {var, kVarGetVec, L4D2_VAR_GETTER("8D 46 0C 5E C3"), "CMaterialVar::GetVecValueInternal"},
+      // The twin as above (in ebx); movzx eax, byte [ebx+0x1c]; and eax,0xf;
+      // cmp eax,8; ja; jmp [eax*4+table] (by type)
+      {var, kVarGetString,
+       "55 8B EC 83 EC 08 53 8B D9 8B 0D ? ? ? ? 8B 01 8B 90 24 02 00 00 56 57 FF D2 85 C0 74 2F 90 F6 43 1C 80 75 28 8A "
+       "43 1D 3C FF 74 21 8B 0D ? ? ? ? 0F B6 C0 8D 1C 80 8B 01 8B 90 24 02 00 00 8D 1C DD ? ? ? ? FF D2 85 C0 75 D2 0F "
+       "B6 43 1C 83 E0 0F 83 F8 08 0F 87 ? ? ? ? FF 24 85",
+       "CMaterialVar::GetStringValue"},
+  };
+  for (const Slot &s : slots)
+    if (!materials.holds(s.vtable + s.slot) || !code(materials, s.vtable[s.slot], s.bytes)) {
+      g_status = "code mismatch";
+      g_detail = s.name;
+      return false;
+    }
+  // GetStringValue's jump table (its address in the jmp above): the string
+  // case returns [ebx+4]; the texture case returns "env_cubemap" for the
+  // ITexture -1 at [ebx+0x24], else formats that texture's name (its slot 0).
+  {
+    const auto *string = static_cast<const uint8_t *>(var[kVarGetString]);
+    uint32_t table;
+    std::memcpy(&table, string + 97, sizeof(table));
+    const void *const *cases = reinterpret_cast<const void *const *>(uintptr_t(table));
+    if (!materials.holds(cases) || !materials.holds(cases + kTypeTexture) ||
+        !code(materials, cases[kTypeString], "8B 43 04 5F 5E 5B 8B E5 5D C3") ||
+        !code(materials, cases[kTypeTexture],
+              "83 7B 24 FF 75 0C 5F 5E B8 ? ? ? ? 5B 8B E5 5D C3 8B 4B 24 8B 11 8B 02 FF D0")) {
+      g_status = "code mismatch";
+      g_detail = "CMaterialVar::GetStringValue's string and texture cases";
+      return false;
+    }
+  }
+  g_materialVtable = reinterpret_cast<uintptr_t>(material);
+  g_varVtable = reinterpret_cast<uintptr_t>(var);
+  g_materialName = reinterpret_cast<NameFn>(material[kSlotGetName]);
+  g_shaderName = reinterpret_cast<NameFn>(material[kSlotShaderName]);
+  g_varName = reinterpret_cast<NameFn>(var[kVarGetName]);
+  g_varString = reinterpret_cast<NameFn>(var[kVarGetString]);
+  g_varInt = reinterpret_cast<IntFn>(var[kVarGetInt]);
+  g_varFloat = reinterpret_cast<FloatFn>(var[kVarGetFloat]);
+  g_varVec = reinterpret_cast<VecFn>(var[kVarGetVec]);
+  // Sub-rectangle materials (optional, as in GMod): add ecx,0x10 (its name
+  // symbol), jmp CUtlSymbol::String; mov al,1; mov eax,[ecx+4] (the page).
+  if (void **subRect = l4d2::rttiVtable(materials, ".?AVCMaterialSubRect@@");
+      subRect && materials.holds(subRect + kSlotPage) && code(materials, subRect[kSlotGetName], "83 C1 10 E9") &&
+      code(materials, subRect[kSlotInPage], "B0 01 C3") && code(materials, subRect[kSlotPage], "8B 41 04 C3")) {
+    g_subRectName = reinterpret_cast<NameFn>(subRect[kSlotGetName]);
+    g_subRectVtable = reinterpret_cast<uintptr_t>(subRect);
+    g_subRects = true;
+  }
+  return true;
+}
+#undef L4D2_VAR_GETTER
+#endif
+
 } // namespace
 
 Shading::Mode shaderMode(const char *shaderName) {
@@ -499,12 +716,9 @@ bool install(const void *const *shaderApiVtable) {
   static std::atomic<bool> done{false};
   if (done.exchange(true))
     return g_installed;
-  // L4D2: the RVAs, slots and offsets below are GMod's materialsystem.dll and
-  // shader API; L4D2's are not known yet, so nothing is read (every draw Lit).
-  if (!game::kGMod) {
-    g_status = "not available for this game (GMod's material system only)";
-    return false;
-  }
+#ifdef PROXY_GAME_L4D2
+  readUses();
+#endif
   char v[8] = {};
   if (GetEnvironmentVariableA("OPENREMIX_PROXY_EMISSIVE", v, sizeof(v)) && v[0] == '0') {
     g_status = "disabled (OPENREMIX_PROXY_EMISSIVE=0)";
@@ -522,6 +736,7 @@ bool install(const void *const *shaderApiVtable) {
     g_status = "no shader API module";
     return false;
   }
+#ifdef PROXY_GAME_GMOD
   if (!g_shaderApi.inside(reinterpret_cast<uintptr_t>(shaderApiVtable), (kSlotBind + 1) * sizeof(void *)) ||
       reinterpret_cast<uintptr_t>(shaderApiVtable[kSlotBind]) != g_shaderApi.base + kBind) {
     g_status = "slot mismatch";
@@ -562,6 +777,8 @@ bool install(const void *const *shaderApiVtable) {
       return false;
     }
   auto at = [](uintptr_t rva) { return reinterpret_cast<void *>(g_materialSystem.base + rva); };
+  g_materialVtable = g_materialSystem.base + kMaterialVtable;
+  g_varVtable = g_materialSystem.base + kVarVtable;
   g_materialName = reinterpret_cast<NameFn>(at(kGetName));
   g_shaderName = reinterpret_cast<NameFn>(at(kShaderName));
   g_varName = reinterpret_cast<NameFn>(at(kVarName));
@@ -582,16 +799,24 @@ bool install(const void *const *shaderApiVtable) {
         g_materialSystem.bytesAt(kSubRectName, "48 83 C1 14 E9") && g_materialSystem.bytesAt(kSubRectInPage, "B0 01 C3") &&
         g_materialSystem.bytesAt(kSubRectPage, "48 8B 41 08 C3")) {
       g_subRectName = reinterpret_cast<NameFn>(at(kSubRectName));
+      g_subRectVtable = g_materialSystem.base + kSubRectVtable;
       g_subRects = true;
     }
   }
   g_status = g_subRects ? "ok (IShaderAPI::Bind read, sub-rectangle materials through their page)"
                         : "ok (IShaderAPI::Bind read; CMaterialSubRect layout not recognized: decal atlases unread)";
+#else
+  if (!installL4D2(shaderApiVtable))
+    return false;
+  g_status = g_subRects ? "ok (IShaderAPI::Bind read, classes by RTTI, sub-rectangle materials through their page)"
+                        : "ok (IShaderAPI::Bind read, classes by RTTI; CMaterialSubRect not recognized: decal atlases unread)";
+#endif
   g_installed = true;
   return true;
 }
 
-void onBind(void *material) {
+namespace {
+void bindMaterial(void *material) {
   g_current = Shading{};
   g_currentEntry = nullptr;
   g_bound = Bound{};
@@ -602,7 +827,7 @@ void onBind(void *material) {
   // A sub-rectangle of an atlas: its page is the material the draw uses.
   const char *subRectName = nullptr;
   if (g_subRects.load(std::memory_order_relaxed) &&
-      *static_cast<uintptr_t *>(material) == g_materialSystem.base + kSubRectVtable) {
+      *static_cast<uintptr_t *>(material) == g_subRectVtable) {
     void *page;
     uint16_t symbol;
     std::memcpy(&page, static_cast<const uint8_t *>(material) + kSubRectPageOffset, sizeof(page));
@@ -623,7 +848,7 @@ void onBind(void *material) {
     g_stats.subRects.fetch_add(1, std::memory_order_relaxed);
   }
   // CMaterial only (its vars are its own).
-  if (*static_cast<uintptr_t *>(material) != g_materialSystem.base + kMaterialVtable) {
+  if (*static_cast<uintptr_t *>(material) != g_materialVtable) {
     g_stats.otherClass.fetch_add(1, std::memory_order_relaxed);
     return;
   }
@@ -677,13 +902,14 @@ void onBind(void *material) {
   // Draws are matched to the material by its base texture as well
   // (remix::onMaterialBound): some reach D3D while another one is bound.
   if (e.base >= 0)
-    if (void *var = e.params[e.base]; var && *static_cast<uintptr_t *>(var) == g_materialSystem.base + kVarVtable)
+    if (void *var = e.params[e.base]; var && *static_cast<uintptr_t *>(var) == g_varVtable)
       g_current.base = textureName(e.baseTexture, var);
   if (e.pbrCapable && pbr::enabled()) {
     void *flagsVar = paramAt(e, e.flags);
     readPbr(e, flagsVar ? g_varInt(flagsVar) : 0, g_current);
   }
-  remix::onMaterialBound(g_current, e.name.c_str());
+  if (g_uses & kUseShading)
+    remix::onMaterialBound(g_current, e.name.c_str());
   if (g_current.mode == Shading::Lit)
     return;
   switch (g_current.mode) {
@@ -705,14 +931,122 @@ void onBind(void *material) {
   }
 }
 
-const Shading &current() { return g_current; }
+// Dev aid: bin/shaderapi_proxy_binds.request (its contents: a count, default
+// 64; "params" after it: with each material's defined parameters) describes
+// the next distinct materials bound in bin/binds_probe.txt: their class, name
+// (and page), shader, $flags, what bound() makes of them and the shading
+// read, whatever OPENREMIX_PROXY_MATERIALS lets through. Polled once a second.
+struct BindProbe {
+  uint32_t left = 0;
+  bool params = false;
+  std::unordered_set<void *> seen;
+  ULONGLONG checked = 0;
+  std::wstring dir;
+} g_bindProbe; // render thread
 
-const char *currentName() { return g_currentName; }
+void serviceBindProbe() {
+  const ULONGLONG now = GetTickCount64();
+  if (now - g_bindProbe.checked < 1000)
+    return;
+  g_bindProbe.checked = now;
+  if (g_bindProbe.dir.empty()) {
+    HMODULE self = nullptr;
+    wchar_t path[MAX_PATH] = {};
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&serviceBindProbe), &self);
+    GetModuleFileNameW(self, path, MAX_PATH);
+    g_bindProbe.dir = path;
+    g_bindProbe.dir.resize(g_bindProbe.dir.find_last_of(L"\\/") + 1);
+  }
+  const std::wstring request = g_bindProbe.dir + L"shaderapi_proxy_binds.request";
+  if (GetFileAttributesW(request.c_str()) == INVALID_FILE_ATTRIBUTES)
+    return;
+  char line[64] = {};
+  if (FILE *in = _wfopen(request.c_str(), L"r")) {
+    if (!std::fgets(line, sizeof(line), in))
+      line[0] = 0;
+    fclose(in);
+  }
+  DeleteFileW(request.c_str());
+  const int count = std::atoi(line);
+  g_bindProbe.left = count > 0 ? uint32_t(count) : 64;
+  g_bindProbe.params = std::strstr(line, "params") != nullptr;
+  g_bindProbe.seen.clear();
+  if (FILE *out = _wfopen((g_bindProbe.dir + L"binds_probe.txt").c_str(), L"w")) {
+    fprintf(out, "== the next %u distinct materials bound; answers to the proxy: %s\n", g_bindProbe.left,
+            g_usesText.c_str());
+    fclose(out);
+  }
+}
 
-const Bound &bound() { return g_bound; }
+void probeBind(void *material) {
+  if (!g_bindProbe.seen.insert(material).second)
+    return;
+  --g_bindProbe.left;
+  FILE *out = _wfopen((g_bindProbe.dir + L"binds_probe.txt").c_str(), L"a");
+  if (!out)
+    return;
+  const uintptr_t vtable = *static_cast<uintptr_t *>(material);
+  const char *kind = vtable == g_materialVtable                 ? "CMaterial"
+                     : g_subRects && vtable == g_subRectVtable ? "CMaterialSubRect"
+                                                                : "other class";
+  const Bound &b = g_bound;
+  const Shading &c = g_current;
+  static const char *const modes[] = {"lit", "unlit", "selfillum base alpha", "selfillum mask", "selfillum envmap mask alpha"};
+  fprintf(out, "%s", kind);
+  if (*kind == 'o')
+    fprintf(out, " (vtable %s+0x%llx)", g_materialSystem.inside(vtable, 1) ? "materialsystem" : "?",
+            static_cast<unsigned long long>(g_materialSystem.inside(vtable, 1) ? vtable - g_materialSystem.base : vtable));
+  if (!b.known) {
+    fprintf(out, " %p: not read\n", material);
+    fclose(out);
+    return;
+  }
+  fprintf(out,
+          " %s%s%s | shader %s flags %08X:%s%s%s%s%s%s%s%s%s%s | %s base \"%s\" tint %.2f %.2f %.2f",
+          g_currentName, b.subRect ? " in " : "", b.subRect && g_currentEntry ? g_currentEntry->name.c_str() : "",
+          b.shader, unsigned(b.flags), b.decal ? " decal" : "", b.decalShader ? " decal-shader" : "",
+          b.modulate ? " modulate" : "", b.lightmapped ? " lightmapped" : "", b.vertexColor ? " vertexcolor" : "",
+          b.vertexAlpha ? " vertexalpha" : "", b.translucent ? " translucent" : "", b.additive ? " additive" : "",
+          b.alphaTest ? " alphatest" : "", b.isModel ? " model" : "", modes[c.mode], c.base.c_str(), c.tint[0],
+          c.tint[1], c.tint[2]);
+  if (!c.mask.empty())
+    fprintf(out, " mask %s x %.2f", c.mask.c_str(), c.maskScale);
+  fprintf(out, " pbr %d\n", int(c.pbr.active));
+  if (g_bindProbe.params)
+    describeCurrent(out, "    ");
+  fclose(out);
+}
+} // namespace
+
+void onBind(void *material) {
+  bindMaterial(material);
+  if (!g_installed.load(std::memory_order_relaxed) || !material)
+    return;
+  serviceBindProbe();
+  if (g_bindProbe.left)
+    probeBind(material);
+}
+
+// The answers to the proxy (see install): what was read, or "not known".
+const Shading &current() {
+  static const Shading none;
+  return g_uses & kUseShading ? g_current : none;
+}
+
+const char *currentName() { return g_uses & kUseName ? g_currentName : ""; }
+
+const Bound &bound() {
+  static const Bound none;
+  return g_uses & kUseBound ? g_bound : none;
+}
+
+const Shading &currentRead() { return g_current; }
+const char *nameRead() { return g_currentName; }
+const Bound &boundRead() { return g_bound; }
 
 bool currentIsLitOpaque() {
-  const Entry *e = g_currentEntry;
+  const Entry *e = g_uses & kUseBound ? g_currentEntry : nullptr;
   if (!e)
     return false;
   bool lit = false;
@@ -725,7 +1059,7 @@ bool currentIsLitOpaque() {
 }
 
 std::string currentTextureName(const char *name) {
-  const Entry *e = g_currentEntry;
+  const Entry *e = g_uses & kUseParams ? g_currentEntry : nullptr;
   if (!e)
     return {};
   for (int i = 0; i < e->count; ++i) {
@@ -743,7 +1077,7 @@ std::string currentTextureName(const char *name) {
 }
 
 bool currentFloat(const char *name, float &out) {
-  const Entry *e = g_currentEntry;
+  const Entry *e = g_uses & kUseParams ? g_currentEntry : nullptr;
   if (!e)
     return false;
   for (int i = 0; i < e->count; ++i) {
@@ -766,7 +1100,7 @@ bool currentFloat(const char *name, float &out) {
 }
 
 bool currentVector(const char *name, float out[3]) {
-  const Entry *e = g_currentEntry;
+  const Entry *e = g_uses & kUseParams ? g_currentEntry : nullptr;
   if (!e)
     return false;
   for (int i = 0; i < e->count; ++i) {
@@ -818,6 +1152,8 @@ void dumpStatistics(FILE *out) {
   fprintf(out, "engine materials: %s%s%s\n", g_status.load(), *detail ? ": " : "", detail);
   if (!g_installed)
     return;
+  if (!game::kGMod)
+    fprintf(out, "   answers to the proxy: %s\n", g_usesText.c_str());
   static ULONGLONG last = GetTickCount64();
   const ULONGLONG now = GetTickCount64();
   const double seconds = now > last ? double(now - last) / 1000 : 1;

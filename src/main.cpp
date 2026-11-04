@@ -242,16 +242,14 @@ void PROXY_THISCALL shaderApiSetLight(proxy::Wrapper *self, int index, const voi
   proxy::original<Fn>(self, proxy::game::kSlotSetLight)(self->real, index, desc);
 }
 
-// IShaderAPI slot 114: void Bind(IMaterial *pMaterial): the material of the
-// draws that follow (those buffered for the previous one are flushed inside).
-// Hooked only when engine_materials validated the slot.
-#ifdef PROXY_GAME_GMOD
+// IShaderAPI slot 114 (L4D2 76): void Bind(IMaterial *pMaterial): the
+// material of the draws that follow (GMod: those buffered for the previous one
+// are flushed inside). Hooked only when engine_materials validated the slot.
 void PROXY_THISCALL shaderApiBind(proxy::Wrapper *self, void *material) {
   using Fn = void(PROXY_THISCALL *)(void *, void *);
   proxy::original<Fn>(self, proxy::game::kSlotBind)(self->real, material);
   proxy::engine_materials::onBind(material);
 }
-#endif
 
 // IShaderAPI slot 216 (L4D2 181): void SetPIXMarker(unsigned long color,
 // const char *name) (an empty stub in release builds). Markers
@@ -283,10 +281,8 @@ const KnownInterface kKnown[] = {
 #endif
        proxy::setHook(k, proxy::game::kSlotSetLight, reinterpret_cast<void *>(&shaderApiSetLight));
        proxy::setHook(k, proxy::game::kSlotSetPIXMarker, reinterpret_cast<void *>(&shaderApiSetPIXMarker));
-#ifdef PROXY_GAME_GMOD
        if (proxy::engine_materials::install(k->realVtbl))
          proxy::setHook(k, proxy::game::kSlotBind, reinterpret_cast<void *>(&shaderApiBind));
-#endif
      }},
     {"ShaderDevice001", nullptr},
     {"ShaderShadow010", nullptr},

@@ -51,6 +51,16 @@ float fresnelShare(float minimum, float maximum, float exponent);
 
 // Validates the engine's material classes and IShaderAPI::Bind (the real
 // shader API's vtable). False: nothing is read, every draw is Lit.
+//
+// Left 4 Dead 2: the lookup is installed and read at every Bind (statistics,
+// dev dumps), and its answers reach the rest of the proxy as
+// OPENREMIX_PROXY_MATERIALS says: 0 none, every query below answers "not
+// known"; 1 all (the default); or a comma list of the queries' groups:
+//   bound    bound(), currentIsLitOpaque()          (decals, shaders by name)
+//   name     currentName()                          (particle paths, host passes)
+//   shading  current(), remix::onMaterialBound      (unlit, self-illum, PBR)
+//   params   currentFloat/Vector/TextureName()      ($color, $alpha, sprite flags)
+// GMod: all, always.
 bool install(const void *const *shaderApiVtable);
 
 // The name of an ITexture of the material system, lower case ("" when the
@@ -77,7 +87,7 @@ struct Bound {
   bool modulate = false;    // DecalModulate: dst x src x 2
   bool lightmapped = false; // LightmappedGeneric and the other world shaders
   bool vertexColor = false, vertexAlpha = false, translucent = false, additive = false, alphaTest = false;
-  bool isModel = false;     // $model / MATERIAL_VAR_MODEL (1 << 2)
+  bool isModel = false;     // $model / MATERIAL_VAR_MODEL (L4D2 1 << 11; GMod tests 1 << 2, see kFlagModel)
   bool subRect = false;     // bound through a CMaterialSubRect
   int flags = 0;
   const char *shader = "";
@@ -100,6 +110,12 @@ bool currentVector(const char *name, float out[3]);
 std::string currentTextureName(const char *name);
 // The bound material's defined parameters, one per line (dev dumps).
 void describeCurrent(FILE *out, const char *indent);
+
+// What the last Bind read, whether or not it reaches the proxy
+// (OPENREMIX_PROXY_MATERIALS): for dev dumps only.
+const Bound &boundRead();
+const char *nameRead();
+const Shading &currentRead();
 
 void dumpStatistics(FILE *out);
 

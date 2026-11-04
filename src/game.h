@@ -80,7 +80,8 @@ constexpr bool kHookVBAllocTracker = false;
 // void SetLights(int nCount, const LightDesc_t *pDesc): an array (stack 8).
 constexpr unsigned kSlotSetLight = 88;
 constexpr bool kSetLightsArray = true;
-// L4D2: Bind (76) is not hooked: engine_materials reads GMod's material system only.
+// void Bind(IMaterial *) (engine_materials, which checks its code).
+constexpr unsigned kSlotBind = 76;
 // void SetPIXMarker(unsigned long color, const char *name) (reached from
 // IMatRenderContext slot 137).
 constexpr unsigned kSlotSetPIXMarker = 181;
