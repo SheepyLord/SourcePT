@@ -1,9 +1,10 @@
 project('gmodrtx', ['cpp', 'c'], version: '0.1.0',
         default_options: ['cpp_std=c++17', 'warning_level=2', 'buildtype=release', 'b_ndebug=if-release'])
 
-# One tree, two games, chosen at configure time (-Dgame=, default by the
-# cross file): Garry's Mod x64 (cross/x86_64-w64-mingw32.txt) or Left 4 Dead 2
-# x86 (cross/i686-w64-mingw32.txt). src/game.h holds what differs.
+# One tree, three games, chosen at configure time (-Dgame=, default by the
+# cross file): Garry's Mod x64 (cross/x86_64-w64-mingw32.txt), Left 4 Dead 2
+# x86 or Half-Life 2 RTX x86 (cross/i686-w64-mingw32.txt, -Dgame=hl2rtx).
+# src/game.h holds what differs.
 game = get_option('game')
 cpu = host_machine.cpu_family()
 if game == 'auto'
@@ -14,6 +15,9 @@ if game == 'gmod' and cpu != 'x86_64'
 endif
 if game == 'l4d2' and cpu != 'x86'
   error('the Left 4 Dead 2 proxy is a 32-bit DLL: configure with cross/i686-w64-mingw32.txt')
+endif
+if game == 'hl2rtx' and cpu != 'x86'
+  error('the Half-Life 2 RTX proxy is a 32-bit DLL: configure with cross/i686-w64-mingw32.txt')
 endif
 
 remix_inc = get_option('openremix_include')
@@ -41,7 +45,7 @@ sources = [
   'src/main.cpp', 'src/vtable_proxy.cpp', 'src/d3d_hooks.cpp', 'src/remix_output.cpp', 'src/texture_formats.cpp',
   'src/dxvk_hash.cpp', 'src/texture_categories.cpp', 'src/source_fs.cpp', 'src/bsp_world.cpp',
   'src/engine_materials.cpp', 'src/pbr_rules.cpp',
-  'src/vertex_program.cpp', 'src/shader_tables.cpp', 'src/particles.cpp', 'src/diag.cpp', 'src/lzma_source.cpp', 'src/host_passes.cpp', 'src/vb_origins.cpp',
+  'src/vertex_program.cpp', 'src/shader_tables.cpp', 'src/particles.cpp', 'src/fixed_function.cpp', 'src/diag.cpp', 'src/lzma_source.cpp', 'src/host_passes.cpp', 'src/vb_origins.cpp',
   'deps/lzma/LzmaDec.c', host_shaders,
 ]
 cpp_args = []
@@ -54,14 +58,23 @@ if game == 'gmod'
   def_file = 'shaderapidx9.def'
 else
   # x86: the Remix API is used through the bridge (remix_c.h is 64-bit only
-  # unless allowed; empty, as the headers that define it themselves).
-  cpp_args += ['-DPROXY_GAME_L4D2', '-DREMIX_ALLOW_X86=']
-  # The GMod-only modules' entry points as no-ops; L4D2's own engine side
-  # (src/l4d2.h) and the runtime UI in the bridge host.
-  sources += ['src/gmod_only_stubs.cpp', 'src/l4d2_engine.cpp', 'src/l4d2_cull.cpp', 'src/l4d2_lights.cpp',
-              'src/l4d2_ui.cpp', 'src/l4d2_infected.cpp']
-  def_file = 'shaderapidx9_l4d2.def'
+  # unless allowed; empty, as the headers that define it themselves). The
+  # GMod-only modules' entry points as no-ops, the 32-bit module helpers and
+  # the runtime UI in the bridge host.
+  cpp_args += ['-DREMIX_ALLOW_X86=']
+  sources += ['src/gmod_only_stubs.cpp', 'src/x86_module.cpp', 'src/bridge_ui.cpp']
   link_args += '-Wl,--enable-stdcall-fixup'
+  if game == 'l4d2'
+    # L4D2's own engine side (src/l4d2.h).
+    cpp_args += '-DPROXY_GAME_L4D2'
+    sources += ['src/l4d2_engine.cpp', 'src/l4d2_cull.cpp', 'src/l4d2_lights.cpp', 'src/l4d2_infected.cpp']
+    def_file = 'shaderapidx9_l4d2.def'
+  else
+    # Half-Life 2 RTX: no engine side yet (src/hl2rtx_engine.cpp).
+    cpp_args += '-DPROXY_GAME_HL2RTX'
+    sources += ['src/hl2rtx_engine.cpp']
+    def_file = 'shaderapidx9_hl2rtx.def'
+  endif
 endif
 
 shared_library('shaderapidx9', sources,

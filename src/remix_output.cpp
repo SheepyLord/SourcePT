@@ -8,6 +8,7 @@
 #include "dxvk_hash.h"
 #include "engine_lights.h"
 #include "engine_materials.h"
+#include "fixed_function.h"
 #include "game.h"
 #include "host_passes.h"
 #ifdef PROXY_GAME_L4D2
@@ -47,15 +48,15 @@ namespace proxy::remix {
 namespace {
 
 // Source vertex shader registers (common_vs_fxc.h layout; the same in L4D2's
-// shaders but for cFlexScale). cFlexScale and the iris projection are taken
-// from the draw's vertex shader's constant table when it names them (see
-// ModelShader); these are the fallback.
+// and Half-Life 2 RTX's shaders but for L4D2's cFlexScale). cFlexScale and the
+// iris projection are taken from the draw's vertex shader's constant table
+// when it names them (see ModelShader); these are the fallback.
 constexpr unsigned kRegModelViewProj = 4; // c4..c7: model * view * projection (columns)
 constexpr unsigned kRegViewProj = 8;  // c8..c11: view * projection
 constexpr unsigned kRegModel = 58;    // c58..c60: model (object to world) 3x4 rows
 constexpr unsigned kRegEyeIrisU = 50; // c50, c51: Eyes shader iris projection U, V (world position -> iris texture)
 // c3.x (L4D2: c13.x): 1 while a flex mesh is bound to stream 2, else 0 (cFlexScale)
-constexpr unsigned kRegFlexScale = game::kGMod ? 3 : 13;
+constexpr unsigned kRegFlexScale = game::kRegFlexScale;
 constexpr unsigned kRegAmbientUp = 25; // c21..c26: ambient cube +X -X +Y -Y +Z -Z (linear)
 // MaterialMatrixMode_t
 constexpr int kMatrixView = 0;
@@ -78,7 +79,7 @@ float g_modulationSample[4] = {}; // the last tinted draw's modulation colour (g
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, bspBrushEntitiesDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, projectedCopies{0}, lightCookies{0}, lightCookieFrameMax{0}, shatteredSolid{0}, shatteredEdges{0}, shatteredTinted{0}, shatteredTextures{0}, opaqueTranslucent{0}, screenDraws{0}, screenInstances{0}, screenViewsFull{0}, flashlightLitPasses{0}, cameraCulledModels{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, bspBrushEntitiesDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, contentNamed{0}, contentRefreshSkipped{0}, projectedCopies{0}, lightCookies{0}, lightCookieFrameMax{0}, shatteredSolid{0}, shatteredEdges{0}, shatteredTinted{0}, shatteredTextures{0}, opaqueTranslucent{0}, screenDraws{0}, screenInstances{0}, screenViewsFull{0}, flashlightLitPasses{0}, cameraCulledModels{0};
   std::atomic<uint32_t> setLightKept[4] = {};
   // Unlit and self-illuminated draws (engine_materials): by kind, and why some stayed lit.
   std::atomic<uint32_t> luaLitDraws{0}; // unlit Lua meshes lit as surfaces (onDraw)
@@ -149,6 +150,64 @@ std::atomic<unsigned long> g_frameThread{0};
 // (Formerly FNV-1a, byte by byte: a hot spot at ~1200 draws per frame.)
 uint64_t fnv(const void *data, size_t size, uint64_t h = 1469598103934665603ull) {
   return XXH3_64bits_withSeed(data, size, h);
+}
+
+// A draw's geometry by its contents (game::kFixedFunction engines): its
+// indices relative to the first vertex they use, and the bytes of the
+// vertices from that one to the last they use in every stream its layout
+// reads. (The declared range may be the whole dynamic buffer: Source names
+// its batches so.) 0 when the draw cannot be read.
+uint64_t contentHash(const Draw &d) {
+  const uint32_t indexCount = d.type == D3DPT_TRIANGLELIST ? d.primCount * 3
+                              : d.type == D3DPT_TRIANGLESTRIP || d.type == D3DPT_TRIANGLEFAN ? d.primCount + 2
+                                                                                               : 0;
+  if (!indexCount || !d.indices.data || !d.numVertices)
+    return 0;
+  const uint32_t size = d.indices.is32 ? 4 : 2;
+  const uint64_t first = uint64_t(d.startIndex) * size;
+  if (first + uint64_t(indexCount) * size > d.indices.size)
+    return 0;
+  const uint8_t *at = d.indices.data + first;
+  const auto index = [&](uint32_t k) {
+    if (size == 2) {
+      uint16_t v;
+      std::memcpy(&v, at + k * 2, 2);
+      return uint32_t(v);
+    }
+    uint32_t v;
+    std::memcpy(&v, at + k * 4, 4);
+    return v;
+  };
+  uint32_t low = ~0u, high = 0;
+  for (uint32_t k = 0; k < indexCount; ++k) {
+    const uint32_t v = index(k);
+    low = std::min(low, v);
+    high = std::max(high, v);
+  }
+  uint64_t h = 1469598103934665603ull;
+  bool streams[4] = {};
+  for (const D3DVERTEXELEMENT9 *e = d.elements; e && e->Stream != 0xff; ++e)
+    if (e->Stream < 4)
+      streams[e->Stream] = true;
+  for (int i = 0; i < 4; ++i) {
+    if (!streams[i])
+      continue;
+    const auto &st = d.streams[i];
+    const int64_t begin = int64_t(st.offset) + (int64_t(d.baseVertex) + low) * st.stride;
+    const int64_t bytes = (int64_t(high) - low + 1) * st.stride;
+    if (!st.data || !st.stride || begin < 0 || begin + bytes > int64_t(st.size))
+      return 0;
+    h = fnv(st.data + begin, size_t(bytes), h);
+  }
+  // The indices, relative to the first used.
+  std::vector<uint32_t> &relative = [] () -> std::vector<uint32_t> & {
+    static thread_local std::vector<uint32_t> v;
+    return v;
+  }();
+  relative.resize(indexCount);
+  for (uint32_t k = 0; k < indexCount; ++k)
+    relative[k] = index(k) - low;
+  return fnv(relative.data(), relative.size() * sizeof(uint32_t), h) | 1;
 }
 
 struct CachedMesh {
@@ -1332,6 +1391,7 @@ struct View {
   bool cameraSpace = false;
   float view[16], projection[16];
   float cameraToWorld[3][4] = {}; // a view with a camera: its camera space (as the engine has it) to world
+  bool fixedFunction = false;     // its matrices are D3D's transforms (a fixed-function draw's)
   // Drawn into a screen camera's render-target texture (screenSlot): the
   // entities that camera sees, which the main view may not draw.
   const void *screenTarget = nullptr;
@@ -1588,6 +1648,34 @@ const D3DVERTEXELEMENT9 *findElement(const D3DVERTEXELEMENT9 *e, BYTE usage, BYT
   return nullptr;
 }
 
+// A fixed-function draw's (render thread; set by onFixedFunctionDraw, see
+// fixed_function.h): how its vertices pick their bones and how many matrices
+// D3D blends (0: the shader convention: indices in memory order, bone count
+// from the shader API), its base texture's transform (8 floats as
+// g_screenUv's) and its coordinates projected from the world position.
+ff::Blend g_ffBlend = ff::kBlendNone;
+uint32_t g_ffMatrices = 0;
+const float *g_ffUv = nullptr, *g_ffGenerated = nullptr;
+// The fixed-function draw onDraw is converting (nullptr: a shader draw).
+const ff::Converted *g_ffDraw = nullptr;
+
+// The draw's bones as cModel's rows, and how many it can index: a shader
+// draw's registers (kMaxBones), a fixed-function draw's world matrices.
+const float *boneRows(const Draw &d) { return g_ffDraw ? g_ffDraw->bones : d.vsConstants + kRegModel * 4; }
+uint32_t boneLimit() { return g_ffDraw ? g_ffDraw->boneRows : kMaxBones; }
+// Fixed-function draws (fixed_function.h): what they were, what was made of
+// them, per statistics interval.
+struct FixedFunctionStats {
+  std::atomic<uint32_t> draws{0}, rigid{0}, indexed{0}, indexedColor{0}, nonIndexed{0}, flat{0}, pretransformed{0},
+      fvf{0}, tweening{0}, fourMatrices{0}, uvTransforms{0}, projected{0}, generated{0}, untextured{0},
+      otherStage{0}, irises{0}, textureFactor{0}, layers{0}, views{0}, flatViews{0}, mainFrames{0};
+  std::atomic<uint32_t> outcomes[11] = {};
+} g_ffStats;
+const char *const kFfOutcomes[11] = {"instance",      "UI",          "flat, not UI", "off target",
+                                     "depth only",    "no position", "no data",      "mesh refused",
+                                     "pass layer",    "rtx.conf ignored", "other (onDraw rules)"};
+std::map<std::string, uint32_t> g_ffSkipped; // reason -> draws (render thread; read under g_transientSampleLock)
+
 // UI texture (re)registrations: count, bytes and time since the last dump.
 std::atomic<uint32_t> g_usUiRegister{0}, g_usUiRegisterApi{0};
 std::atomic<uint64_t> g_uiRegistrations{0}, g_uiRegionUpdates{0}, g_uiRegisteredBytes{0};
@@ -1807,6 +1895,11 @@ void captureUi(const Draw &d) {
       if (const uint8_t *t = fetch(tex, v, 8)) {
         std::memcpy(&out.u, t, 4);
         std::memcpy(&out.v, t + 4, 4);
+        if (g_ffUv) { // a fixed-function texture transform
+          const float u = out.u, w = out.v;
+          out.u = g_ffUv[0] * u + g_ffUv[1] * w + g_ffUv[3];
+          out.v = g_ffUv[4] * u + g_ffUv[5] * w + g_ffUv[7];
+        }
       }
     out.color = 0xffffffff;
     if (col && col->Type == D3DDECLTYPE_D3DCOLOR)
@@ -1904,7 +1997,8 @@ const ModelShader &modelShader(const Draw &d) {
 // with stride 0; for a flexed strip group studiorender writes this frame's
 // deltas into a dynamic "flex mesh" and binds it there, and the vertex shader
 // adds delta * cFlexScale.x to the position and the normal before skinning
-// (c3 in GMod's shaders, c13 in L4D2's: as the shader's table says).
+// (c3 in GMod's and Half-Life 2 RTX's shaders, c13 in L4D2's: as the shader's
+// table says).
 // Returns that scale (0: nothing to add). A flex mesh whose deltas are all
 // zero (a face at rest) counts as none: the draw keeps its cached mesh.
 float flexScale(const Draw &d) {
@@ -2059,6 +2153,11 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
         std::memcpy(out.texcoord, t, 8);
       if (!std::isfinite(out.texcoord[0]) || !std::isfinite(out.texcoord[1]))
         out.texcoord[0] = out.texcoord[1] = 0;
+      if (g_ffUv) { // a fixed-function texture transform
+        const float u = out.texcoord[0], v = out.texcoord[1];
+        out.texcoord[0] = g_ffUv[0] * u + g_ffUv[1] * v + g_ffUv[3];
+        out.texcoord[1] = g_ffUv[4] * u + g_ffUv[5] * v + g_ffUv[7];
+      }
       if (g_screenUv) {
         const float u = out.texcoord[0], v = out.texcoord[1];
         out.texcoord[0] = g_screenUv[0] * u + g_screenUv[1] * v + g_screenUv[3];
@@ -2119,7 +2218,47 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
     weights.resize(size_t(count) * bonesPerVertex);
     bones.resize(weights.size());
     for (uint32_t v = 0; v < count; ++v) {
-      const uint8_t *bi = fetch(boneIndices, v, 4);
+      const uint8_t *bi = boneIndices ? fetch(boneIndices, v, 4) : nullptr;
+      if (g_ffBlend != ff::kBlendNone) {
+        // D3D's vertex blending (fixed_function.h): the stored weights the
+        // element has (missing ones 0), the last of D3D's matrices 1 minus
+        // their sum; bonesPerVertex of them, summing to one.
+        float stored[4] = {};
+        const int components = boneWeights && boneWeights->Type <= D3DDECLTYPE_FLOAT4 ? boneWeights->Type + 1 : 0;
+        if (components)
+          if (const uint8_t *bw = fetch(boneWeights, v, uint32_t(components) * 4))
+            std::memcpy(stored, bw, size_t(components) * 4);
+        float w[4] = {}, last = 1;
+        const uint32_t matrices = std::clamp<uint32_t>(g_ffMatrices, 1, 4);
+        for (uint32_t k = 0; k + 1 < matrices; ++k) {
+          w[k] = std::isfinite(stored[k]) ? stored[k] : 0;
+          last -= w[k];
+        }
+        w[matrices - 1] = last;
+        // Four matrices (D3DVBF_3WEIGHTS) for three bones: the three that
+        // weigh most (a two-weight layout leaves the third at 0).
+        uint32_t order[4] = {0, 1, 2, 3};
+        if (matrices > bonesPerVertex)
+          std::stable_sort(order, order + matrices, [&](uint32_t a, uint32_t b) { return w[a] > w[b]; });
+        float sum = 0;
+        for (uint32_t k = 0; k < bonesPerVertex; ++k)
+          sum += w[order[k]] = std::clamp(w[order[k]], 0.0f, 1.0f);
+        static const int kColorOrder[4] = {2, 1, 0, 3}; // D3DCOLOR's R, G, B, A in memory
+        for (uint32_t j = 0; j < bonesPerVertex; ++j) {
+          const uint32_t k = order[j];
+          const uint32_t bone = g_ffBlend == ff::kBlendNonIndexed ? k
+                                : !bi                             ? 0
+                                : g_ffBlend == ff::kBlendIndexedColor ? bi[kColorOrder[k]]
+                                                                      : bi[k];
+          const float weight = sum > 0 ? w[k] / sum : (j == 0 ? 1.0f : 0.0f);
+          weights[size_t(v) * bonesPerVertex + j] = weight;
+          bones[size_t(v) * bonesPerVertex + j] = bone;
+          maxBone = std::max(maxBone, bone);
+          if (weight > 0)
+            maxWeightedBone = std::max(maxWeightedBone, bone);
+        }
+        continue;
+      }
       float stored[2] = {1, 0};
       if (boneWeights && boneWeights->Type == D3DDECLTYPE_FLOAT2) {
         if (const uint8_t *bw = fetch(boneWeights, v, 8))
@@ -2159,7 +2298,7 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
           maxWeightedBone = std::max(maxWeightedBone, bone);
       }
     }
-    if (maxBone >= kMaxBones) {
+    if (maxBone >= boneLimit()) {
       ++g_stats.badRange;
       return nullptr;
     }
@@ -2169,8 +2308,10 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
   // position, u = dot(c50, (world, 1)), v = dot(c51, (world, 1)), which
   // studiorender aims along the eyeball's gaze every frame. The world position
   // is this bind-pose vertex moved by its bones, as the runtime will skin it.
+  if (!eyeProjection && g_ffGenerated) // fixed-function coordinates generated from the position
+    eyeProjection = g_ffGenerated;
   if (eyeProjection) {
-    const float *model = d.vsConstants + kRegModel * 4;
+    const float *model = boneRows(d);
     for (uint32_t v = 0; v < count; ++v) {
       const float *p = vertices[v].position;
       float world[3] = {0, 0, 0};
@@ -2329,7 +2470,7 @@ void probeMaterialDraw(const void *texture, const engine_materials::Shading &bou
   FILE *out = _wfopen((g_moduleDir + L"\\material_probe.txt").c_str(), L"a");
   if (!out)
     return;
-  // As read, whatever reaches the draw (L4D2: OPENREMIX_PROXY_MATERIALS).
+  // As read, whatever reaches the draw (the x86 games: OPENREMIX_PROXY_MATERIALS).
   const auto &b = engine_materials::boundRead();
   fprintf(out, "f%llu texture %016llX | bound %s (%s, flags %08X) base %s pbr %d | taken mode %d base %s pbr %d normal %s rough %s ch %u bias %g scale %g, roughness %g | metal %s ch %u inv %d bias %g scale %g, metallic %g, colour %d (%g %g %g)%s%s\n",
           static_cast<unsigned long long>(g_frame), static_cast<unsigned long long>(hash), engine_materials::nameRead(),
@@ -2383,7 +2524,7 @@ void serviceShaderProbeRequest() {
 void probeShaderDraw(const Draw &d, const engine_materials::Shading &taken) {
   if (!g_shaderProbe.left)
     return;
-  // As read, whatever reaches the draw (L4D2: OPENREMIX_PROXY_MATERIALS).
+  // As read, whatever reaches the draw (the x86 games: OPENREMIX_PROXY_MATERIALS).
   const auto &b = engine_materials::boundRead();
   if (!b.known)
     return;
@@ -2509,7 +2650,7 @@ void dumpFlat(const Draw &d) {
         std::memcpy(&color, s.data + at + col->Offset, 4);
     }
   }
-  const auto &b = engine_materials::boundRead(); // as read (L4D2: whatever OPENREMIX_PROXY_MATERIALS says)
+  const auto &b = engine_materials::boundRead(); // as read (the x86 games: whatever OPENREMIX_PROXY_MATERIALS says)
   fprintf(g_dumpFlat,
           "f%llu %s [%s] tex0=%p%s%s tex1=%p blend=%d %u/%u op%u sep=%d write=%x alphaTest=%d stencil=%d z=%d prim=%u verts=%u "
           "color(argb)=%08x bounds=%.0f,%.0f-%.0f,%.0f target=%ux%u main=%d",
@@ -2566,7 +2707,7 @@ bool startRemix() {
   g_moduleDir = dll.substr(0, dll.find_last_of(L"\\/"));
   // GMod: OpenRemix runs in process (x64), bin/win64/openremix/remix.dll,
   // its dependencies (SDL3, OpenUSD, DLSS) resolved from that directory.
-  // L4D2: the bridge client beside the proxy (game.h).
+  // L4D2, Half-Life 2 RTX: the bridge client beside the proxy (game.h).
   dll = g_moduleDir + game::kRuntimePath;
   diag::stage("OpenRemix: loading %s", game::kRuntimeLabel);
   if (!LoadLibraryExW(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)) {
@@ -4250,7 +4391,436 @@ void applyInfected(const Draw &d, const l4d2::infected::Params &p, Instance &ins
 } // namespace
 #endif
 
+// --- Fixed-function draws ------------------------------------------------------
+// Dev aid: bin/shaderapi_proxy_ff.request ("[count] [filter]": count, default
+// 64, of the next fixed-function draws whose kind or material matches the
+// filter: 3d, 2d, skinned, rigid, blended, opaque, or a part of the material's
+// name; none: every draw) describes them in bin/ff_probe.txt: the layout,
+// transforms, blending, lighting, fog and texture stage state D3D had, the
+// first vertices decoded and placed, what the conversion made of the draw
+// (fixed_function.h) and what onDraw did with it; and after each frame that
+// had one, the frame's views and their roles.
+struct FixedFunctionProbe {
+  uint32_t left = 0;
+  std::string filter;
+  FILE *out = nullptr;
+  uint64_t frame = ~0ull; // the last frame a draw was described in
+  uint32_t index = 0;     // fixed-function draws so far in this frame
+  uint64_t indexFrame = ~0ull;
+} g_ffProbe; // render thread
+
+void serviceFixedFunctionProbeRequest() {
+  if (!game::kFixedFunction || g_frame % 16)
+    return;
+  const std::wstring request = g_moduleDir + L"\\shaderapi_proxy_ff.request";
+  if (GetFileAttributesW(request.c_str()) == INVALID_FILE_ATTRIBUTES)
+    return;
+  std::string line;
+  if (FILE *in = _wfopen(request.c_str(), L"r")) {
+    char text[256] = {};
+    if (std::fgets(text, sizeof(text), in))
+      line = text;
+    fclose(in);
+  }
+  DeleteFileW(request.c_str());
+  while (!line.empty() && std::isspace(static_cast<unsigned char>(line.back())))
+    line.pop_back();
+  for (char &c : line)
+    c = char(std::tolower(static_cast<unsigned char>(c)));
+  uint32_t count = 64;
+  char *end = nullptr;
+  const unsigned long n = std::strtoul(line.c_str(), &end, 10);
+  if (end != line.c_str()) {
+    count = uint32_t(std::clamp<unsigned long>(n, 1, 100000));
+    line.erase(0, size_t(end - line.c_str()));
+  }
+  while (!line.empty() && std::isspace(static_cast<unsigned char>(line.front())))
+    line.erase(0, 1);
+  if (g_ffProbe.out)
+    fclose(g_ffProbe.out);
+  g_ffProbe = {};
+  g_ffProbe.out = _wfopen((g_moduleDir + L"\\ff_probe.txt").c_str(), L"w");
+  if (!g_ffProbe.out)
+    return;
+  g_ffProbe.left = count;
+  g_ffProbe.filter = line;
+  fprintf(g_ffProbe.out, "== fixed-function probe: %u draws, filter \"%s\", from frame %llu\n"
+                         "   (matrices row-major, D3D's row vectors; D3DRS/D3DTSS values as numbers)\n",
+          count, line.c_str(), static_cast<unsigned long long>(g_frame));
+  fflush(g_ffProbe.out);
+}
+
+void printMatrix(FILE *out, const char *name, const float *m) {
+  fprintf(out, "   %s: [%.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g]\n", name, m[0],
+          m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+}
+
+bool fixedFunctionProbeWants(const Draw &d, const ff::Converted &c) {
+  if (!g_ffProbe.left || !g_ffProbe.out)
+    return false;
+  const std::string &f = g_ffProbe.filter;
+  if (f.empty())
+    return true;
+  if (f == "3d")
+    return !c.flat;
+  if (f == "2d")
+    return c.flat;
+  if (f == "skinned")
+    return c.blend != ff::kBlendNone;
+  if (f == "rigid")
+    return c.blend == ff::kBlendNone && !c.flat;
+  if (f == "blended")
+    return d.blend;
+  if (f == "opaque")
+    return !d.blend;
+  std::string material = engine_materials::nameRead();
+  for (char &ch : material)
+    ch = char(std::tolower(static_cast<unsigned char>(ch)));
+  return material.find(f) != std::string::npos;
+}
+
+void probeFixedFunctionDraw(const Draw &d, const ff::Converted &c, const char *outcome) {
+  FILE *out = g_ffProbe.out;
+  const FixedFunction &f = *d.fixedFunction;
+  const DWORD *rs = f.renderStates;
+  --g_ffProbe.left;
+  g_ffProbe.frame = g_frame;
+  const auto &b = engine_materials::boundRead();
+  const uint64_t viewKey = fnv(c.constants + kRegViewProj * 4, 16 * sizeof(float));
+  const auto view = g_views.find(viewKey);
+  fprintf(out, "f%llu #%u %s [%s] base \"%s\" | outcome: %s%s%s | view %016llX (order %d, %s, %u draws so far)\n",
+          static_cast<unsigned long long>(g_frame), g_ffProbe.index, engine_materials::nameRead(), b.known ? b.shader : "?",
+          engine_materials::currentRead().base.c_str(), outcome, c.skip ? ": " : "", c.skip ? c.skip : "",
+          static_cast<unsigned long long>(viewKey), view != g_views.end() ? int(view->second.order) : -1,
+          c.flat ? "flat" : "perspective", view != g_views.end() ? view->second.draws : 0);
+  fprintf(out, "   layout %s%s: %s\n", f.fvf ? "FVF " : "declaration", f.fvf ? std::to_string(f.fvf).c_str() : "",
+          describeDeclaration(d.elements).c_str());
+  for (int i = 0; i < 4; ++i)
+    if (d.streams[i].buffer)
+      fprintf(out, "   stream %d: %p offset %u stride %u size %u%s\n", i, d.streams[i].buffer, d.streams[i].offset,
+              d.streams[i].stride, d.streams[i].size, d.streams[i].dynamic ? " dynamic" : "");
+  fprintf(out, "   prim type %u base %d min %u verts %u start %u prims %u | ib %p%s%s\n", unsigned(d.type), d.baseVertex,
+          d.minIndex, d.numVertices, d.startIndex, d.primCount, d.indices.buffer, d.indices.is32 ? " 32-bit" : "",
+          d.indices.dynamic ? " dynamic" : "");
+  fprintf(out, "   target %s %p %ux%u | viewport %lu %lu %lu %lu | cull %u z %d write %d func %u | blend %d %u/%u op %u | "
+               "alpha test %d func %u ref %u | color write %X fill %u stencil %d depth bias %d\n",
+          d.mainTarget ? "back buffer" : d.target ? "RT" : "other", d.target, d.targetWidth, d.targetHeight,
+          d.viewport.X, d.viewport.Y, d.viewport.Width, d.viewport.Height, d.cullMode, int(d.zEnable), int(d.zWrite),
+          d.zFunc, int(d.blend), d.srcBlend, d.dstBlend, d.blendOp, int(d.alphaTest), d.alphaFunc, d.alphaRef,
+          d.colorWrite, d.fillMode, int(d.stencil), int(d.depthBias));
+  fprintf(out, "   vertex blend %lu indexed %lu normalize normals %lu | -> %s, D3D matrices %u, bones per vertex %u%s | "
+               "world matrices set since launch %u | shader API bones %d\n",
+          rs[D3DRS_VERTEXBLEND], rs[D3DRS_INDEXEDVERTEXBLENDENABLE], rs[D3DRS_NORMALIZENORMALS],
+          c.blend == ff::kBlendNone            ? "rigid"
+          : c.blend == ff::kBlendIndexedColor  ? "indexed (D3DCOLOR)"
+          : c.blend == ff::kBlendIndexedUByte4 ? "indexed (UBYTE4)"
+                                               : "non-indexed",
+          c.matrices, c.bonesPerVertex, c.tweening ? " (tweening)" : "", f.worldsSet, currentNumBones());
+  printMatrix(out, "world (WORLDMATRIX 0)", f.worlds[0]);
+  printMatrix(out, "view", f.view);
+  printMatrix(out, "projection", f.projection);
+  // The bone matrices the first vertices name (and 1..3 without indexing).
+  uint32_t highest = c.blend == ff::kBlendNone ? 0 : c.blend == ff::kBlendNonIndexed ? c.matrices - 1 : 0;
+  const auto *pos = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
+  const auto *posT = findElement(d.elements, D3DDECLUSAGE_POSITIONT, 0);
+  const auto *bi = findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0);
+  auto vertexAt = [&](const D3DVERTEXELEMENT9 *e, uint32_t v, uint32_t bytes) -> const uint8_t * {
+    if (!e || e->Stream >= 4)
+      return nullptr;
+    const auto &st = d.streams[e->Stream];
+    const uint64_t at = uint64_t(st.offset) + uint64_t(int64_t(d.baseVertex) + d.minIndex + v) * st.stride + e->Offset;
+    return st.data && at + bytes <= st.size ? st.data + at : nullptr;
+  };
+  // The first indexed vertices (the declared range may cover a whole buffer).
+  uint32_t first[3] = {0, 1, 2};
+  for (uint32_t k = 0; k < 3; ++k) {
+    const uint64_t at = uint64_t(d.startIndex + k) * (d.indices.is32 ? 4 : 2);
+    if (d.indices.data && at + (d.indices.is32 ? 4 : 2) <= d.indices.size) {
+      uint32_t value = 0;
+      std::memcpy(&value, d.indices.data + at, d.indices.is32 ? 4 : 2);
+      first[k] = value >= d.minIndex ? value - d.minIndex : 0;
+    }
+  }
+  if (bi && c.blend != ff::kBlendNone && c.blend != ff::kBlendNonIndexed)
+    for (uint32_t v : first)
+      if (const uint8_t *x = vertexAt(bi, v, 4))
+        highest = std::max<uint32_t>(highest, std::max({x[0], x[1], x[2], x[3]}));
+  for (uint32_t i = 1; i <= std::min<uint32_t>(highest, 15); ++i) {
+    char name[24];
+    std::snprintf(name, sizeof(name), "WORLDMATRIX %u", i);
+    printMatrix(out, name, f.worlds[i]);
+  }
+  // Every matrix the draw's vertices weigh, and how many draws before this
+  // one it was last set (0: just before it; a large age: left over from
+  // another model).
+  if (bi && f.worldDraw && c.blend != ff::kBlendNone && c.blend != ff::kBlendNonIndexed) {
+    const auto *bw = findElement(d.elements, D3DDECLUSAGE_BLENDWEIGHT, 0);
+    const int components = bw && bw->Type <= D3DDECLTYPE_FLOAT4 ? bw->Type + 1 : 0;
+    bool used[256] = {};
+    for (uint32_t v = 0; v < d.numVertices; ++v) {
+      const uint8_t *x = vertexAt(bi, v, 4);
+      if (!x)
+        break;
+      float stored[4] = {};
+      if (const uint8_t *w = components ? vertexAt(bw, v, uint32_t(components) * 4) : nullptr)
+        std::memcpy(stored, w, size_t(components) * 4);
+      float last = 1;
+      for (uint32_t k = 0; k < c.matrices; ++k) {
+        const float weight = k + 1 < c.matrices ? stored[k] : last;
+        last -= k + 1 < c.matrices ? stored[k] : 0;
+        if (weight > 1e-4f)
+          used[c.blend == ff::kBlendIndexedColor ? x[(k < 3 ? 2 - k : 3)] : x[k]] = true;
+      }
+    }
+    fprintf(out, "   matrices weighed (index:draws since set):");
+    for (int i = 0; i < 256; ++i)
+      if (used[i])
+        fprintf(out, " %d:%u", i, f.draw - 1 - f.worldDraw[i]);
+    fprintf(out, "\n");
+    // Every vertex on screen as D3D draws it (the weighed world matrices,
+    // VIEW, PROJECTION) and as converted (the bones c58.., then c8..c11).
+    const auto *position = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
+    float worst = 0;
+    uint32_t off = 0, worstVertex = 0, checked = 0;
+    for (uint32_t v = 0; position && v < d.numVertices; ++v) {
+      const uint8_t *x = vertexAt(bi, v, 4), *pp = vertexAt(position, v, 12);
+      if (!x || !pp)
+        break;
+      float p[3], stored[4] = {};
+      std::memcpy(p, pp, 12);
+      if (const uint8_t *w = components ? vertexAt(bw, v, uint32_t(components) * 4) : nullptr)
+        std::memcpy(stored, w, size_t(components) * 4);
+      float d3d[4] = {}, conv[4] = {}, last = 1;
+      for (uint32_t k = 0; k < c.matrices; ++k) {
+        const float weight = k + 1 < c.matrices ? stored[k] : last;
+        last -= k + 1 < c.matrices ? stored[k] : 0;
+        const uint32_t i = c.blend == ff::kBlendIndexedColor ? x[(k < 3 ? 2 - k : 3)] : x[k];
+        const float *m = f.worlds[i];
+        float world[4] = {};
+        for (int col = 0; col < 4; ++col)
+          world[col] = p[0] * m[col] + p[1] * m[4 + col] + p[2] * m[8 + col] + m[12 + col];
+        float eye[4] = {}, clip[4] = {};
+        for (int col = 0; col < 4; ++col)
+          for (int r = 0; r < 4; ++r)
+            eye[col] += world[r] * f.view[r * 4 + col];
+        for (int col = 0; col < 4; ++col)
+          for (int r = 0; r < 4; ++r)
+            clip[col] += eye[r] * f.projection[r * 4 + col];
+        for (int col = 0; col < 4; ++col)
+          d3d[col] += weight * clip[col];
+        const float *rows = c.bones + std::min<uint32_t>(i, c.boneRows - 1) * 12;
+        float placed[4] = {0, 0, 0, 1};
+        for (int r = 0; r < 3; ++r)
+          placed[r] = rows[r * 4] * p[0] + rows[r * 4 + 1] * p[1] + rows[r * 4 + 2] * p[2] + rows[r * 4 + 3];
+        const float *vp = c.constants + kRegViewProj * 4; // register k: column k
+        for (int col = 0; col < 4; ++col)
+          conv[col] += weight * (vp[col * 4] * placed[0] + vp[col * 4 + 1] * placed[1] + vp[col * 4 + 2] * placed[2] +
+                                 vp[col * 4 + 3]);
+      }
+      if (d3d[3] <= 0 || conv[3] <= 0)
+        continue;
+      ++checked;
+      const float dx = (d3d[0] / d3d[3] - conv[0] / conv[3]) * 960, dy = (d3d[1] / d3d[3] - conv[1] / conv[3]) * 540;
+      const float e = std::sqrt(dx * dx + dy * dy);
+      off += e > 1;
+      if (e > worst) {
+        worst = e;
+        worstVertex = v;
+      }
+    }
+    fprintf(out, "   vertices checked %u: off by more than a pixel %u, worst %.1f px (vertex %u)\n", checked, off, worst,
+            worstVertex);
+  }
+  const D3DMATERIAL9 &m = *f.material;
+  fprintf(out, "   lighting %lu ambient %08lX color vertex %lu sources diffuse %lu ambient %lu specular %lu emissive %lu "
+               "| material diffuse %.3g %.3g %.3g %.3g ambient %.3g %.3g %.3g emissive %.3g %.3g %.3g | specular enable %lu\n",
+          rs[D3DRS_LIGHTING], rs[D3DRS_AMBIENT], rs[D3DRS_COLORVERTEX], rs[D3DRS_DIFFUSEMATERIALSOURCE],
+          rs[D3DRS_AMBIENTMATERIALSOURCE], rs[D3DRS_SPECULARMATERIALSOURCE], rs[D3DRS_EMISSIVEMATERIALSOURCE], m.Diffuse.r,
+          m.Diffuse.g, m.Diffuse.b, m.Diffuse.a, m.Ambient.r, m.Ambient.g, m.Ambient.b, m.Emissive.r, m.Emissive.g,
+          m.Emissive.b, rs[D3DRS_SPECULARENABLE]);
+  for (int i = 0; i < 32; ++i)
+    if (f.lightsEnabled >> i & 1) {
+      const D3DLIGHT9 &l = f.lights[i];
+      fprintf(out, "     light %d: type %d diffuse %.3g %.3g %.3g pos %.0f %.0f %.0f dir %.2f %.2f %.2f range %.0f att %.3g %.3g %.3g\n",
+              i, int(l.Type), l.Diffuse.r, l.Diffuse.g, l.Diffuse.b, l.Position.x, l.Position.y, l.Position.z,
+              l.Direction.x, l.Direction.y, l.Direction.z, l.Range, l.Attenuation0, l.Attenuation1, l.Attenuation2);
+    }
+  float fogStart = 0, fogEnd = 0;
+  std::memcpy(&fogStart, &rs[D3DRS_FOGSTART], 4);
+  std::memcpy(&fogEnd, &rs[D3DRS_FOGEND], 4);
+  fprintf(out, "   fog enable %lu table %lu vertex %lu color %08lX start %g end %g range %lu | texture factor %08lX\n",
+          rs[D3DRS_FOGENABLE], rs[D3DRS_FOGTABLEMODE], rs[D3DRS_FOGVERTEXMODE], rs[D3DRS_FOGCOLOR], fogStart, fogEnd,
+          rs[D3DRS_RANGEFOGENABLE], rs[D3DRS_TEXTUREFACTOR]);
+  for (int s = 0; s < 8; ++s) {
+    const DWORD *t = f.stages[s];
+    const uint64_t hash = textureHash(d.stageTextures[s]);
+    fprintf(out, "   stage %d: tex %p %016llX %s | color op %lu %lX %lX %lX alpha op %lu %lX %lX %lX result %lX | "
+                 "texcoord index %lX transform flags %lX | address %lu %lu filter %lu\n",
+            s, d.stageTextures[s], static_cast<unsigned long long>(hash), hash ? bsp::materialName(hash).c_str() : "",
+            t[D3DTSS_COLOROP], t[D3DTSS_COLORARG1], t[D3DTSS_COLORARG2], t[D3DTSS_COLORARG0], t[D3DTSS_ALPHAOP],
+            t[D3DTSS_ALPHAARG1], t[D3DTSS_ALPHAARG2], t[D3DTSS_ALPHAARG0], t[D3DTSS_RESULTARG],
+            t[D3DTSS_TEXCOORDINDEX], t[D3DTSS_TEXTURETRANSFORMFLAGS], d.samplerStates[s][D3DSAMP_ADDRESSU],
+            d.samplerStates[s][D3DSAMP_ADDRESSV], d.samplerStates[s][D3DSAMP_MINFILTER]);
+    if (t[D3DTSS_TEXTURETRANSFORMFLAGS] != D3DTTFF_DISABLE) {
+      char name[24];
+      std::snprintf(name, sizeof(name), "  TEXTURE%d", s);
+      printMatrix(out, name, f.textures[s]);
+    }
+    if (t[D3DTSS_COLOROP] == D3DTOP_DISABLE)
+      break; // and every stage above
+  }
+  fprintf(out, "   converted: base stage %d (texture %s) | uv transform %d (%g %g %g, %g %g %g) projected %d | texgen %d "
+               "(from the position %d) | iris %d | texture factor %d | layout changed %d pretransformed %d | placed under the camera %d\n",
+          c.baseStage, c.textureUsed ? "read" : "not read: untextured", int(c.uvTransform), c.uv[0], c.uv[1], c.uv[3],
+          c.uv[4], c.uv[5], c.uv[7], int(c.projected), int(c.texgen), int(c.generated), int(c.iris),
+          int(c.textureFactor), int(c.elementsChanged), int(c.pretransformed), int(c.placed));
+  // The first vertices: every element, and the position placed by the
+  // conversion (world, then the screen through view x projection).
+  const D3DVERTEXELEMENT9 *place = pos ? pos : posT;
+  for (uint32_t v : first) {
+    fprintf(out, "   vertex %u:", v);
+    for (const D3DVERTEXELEMENT9 *e = d.elements; e->Stream != 0xff; ++e) {
+      static const uint8_t bytes[17] = {4, 8, 12, 16, 4, 4, 4, 8, 4, 4, 8, 4, 8, 4, 4, 4, 8};
+      const uint8_t *x = e->Type < 17 ? vertexAt(e, v, bytes[e->Type]) : nullptr;
+      if (!x)
+        continue;
+      fprintf(out, " u%u.%u=", e->Usage, e->UsageIndex);
+      if (e->Type <= D3DDECLTYPE_FLOAT4) {
+        float val[4] = {};
+        std::memcpy(val, x, (e->Type + 1) * 4);
+        for (int k = 0; k <= e->Type; ++k)
+          fprintf(out, "%s%.4g", k ? "," : "", val[k]);
+      } else if (e->Type == D3DDECLTYPE_SHORT2 || e->Type == D3DDECLTYPE_SHORT4) {
+        int16_t val[4] = {};
+        std::memcpy(val, x, e->Type == D3DDECLTYPE_SHORT2 ? 4 : 8);
+        fprintf(out, "s%d,%d,%d,%d", val[0], val[1], val[2], val[3]);
+      } else {
+        fprintf(out, "b%u,%u,%u,%u", x[0], x[1], x[2], x[3]);
+      }
+    }
+    if (const uint8_t *p = vertexAt(place, v, 12)) {
+      float in[3], world[3] = {}, clip[4] = {};
+      std::memcpy(in, p, 12);
+      const float *rows = c.constants + kRegModel * 4; // bone 0 / the model
+      if (bi && c.blend != ff::kBlendNone && c.blend != ff::kBlendNonIndexed)
+        if (const uint8_t *x = vertexAt(bi, v, 4))
+          rows = c.bones + std::min<uint32_t>(c.blend == ff::kBlendIndexedColor ? x[2] : x[0], c.boneRows - 1) * 12;
+      for (int r = 0; r < 3; ++r)
+        world[r] = rows[r * 4] * in[0] + rows[r * 4 + 1] * in[1] + rows[r * 4 + 2] * in[2] + rows[r * 4 + 3];
+      const float *vp = c.constants + kRegViewProj * 4;
+      for (int k = 0; k < 4; ++k)
+        clip[k] = world[0] * vp[k * 4] + world[1] * vp[k * 4 + 1] + world[2] * vp[k * 4 + 2] + vp[k * 4 + 3];
+      const float w = std::fabs(clip[3]) > 1e-6f ? clip[3] : 1.0f;
+      fprintf(out, " | world (first bone) %.1f %.1f %.1f | screen %.0f %.0f depth %.3f", world[0], world[1], world[2],
+              (clip[0] / w * 0.5f + 0.5f) * g_displayWidth, (0.5f - clip[1] / w * 0.5f) * g_displayHeight, clip[2] / w);
+    }
+    fprintf(out, "\n");
+  }
+  if (!g_ffProbe.left) {
+    fprintf(out, "== done\n");
+    fflush(out);
+  }
+}
+
+// A draw with no vertex shader in a game that draws through the
+// fixed-function pipeline: converted (fixed_function.h), then taken as a
+// shader draw.
+void onFixedFunctionDraw(const Draw &d) {
+  if (!g_ready || !g_shaderApi)
+    return;
+  const FixedFunction &f = *d.fixedFunction;
+  if (g_ffProbe.indexFrame != g_frame) {
+    g_ffProbe.indexFrame = g_frame;
+    g_ffProbe.index = 0;
+  }
+  ++g_ffProbe.index;
+  // The base texture: stage 0's, unless the material's $basetexture is bound
+  // on another stage that reads its texture (a lightmap on stage 0).
+  int baseStage = 0;
+  if (d.stageTextures[0] && d.stageTextures[1] && f.stages[1][D3DTSS_COLOROP] != D3DTOP_DISABLE) {
+    const std::string &base = engine_materials::current().base;
+    const uint64_t wanted = base.empty() ? 0 : maskTextureHash(base, false);
+    if (wanted && textureHash(d.stageTextures[0]) != wanted)
+      for (int s = 1; s < 4 && f.stages[s][D3DTSS_COLOROP] != D3DTOP_DISABLE; ++s)
+        if (d.stageTextures[s] && textureHash(d.stageTextures[s]) == wanted && ff::stageReadsTexture(f, s)) {
+          baseStage = s;
+          break;
+        }
+  }
+  static ff::Converted c; // render thread
+  ff::convert(d, baseStage, c);
+  ++g_ffStats.draws;
+  ++(c.flat ? g_ffStats.flat : c.blend == ff::kBlendNone ? g_ffStats.rigid
+     : c.blend == ff::kBlendNonIndexed                   ? g_ffStats.nonIndexed
+                                                          : g_ffStats.indexed);
+  g_ffStats.indexedColor += c.blend == ff::kBlendIndexedColor;
+  g_ffStats.pretransformed += c.pretransformed;
+  g_ffStats.fvf += f.fvf != 0;
+  g_ffStats.tweening += c.tweening;
+  g_ffStats.fourMatrices += c.matrices > 3 && c.blend != ff::kBlendNone;
+  g_ffStats.uvTransforms += c.uvTransform;
+  g_ffStats.projected += c.projected;
+  g_ffStats.generated += c.generated;
+  g_ffStats.untextured += !c.textureUsed;
+  g_ffStats.otherStage += baseStage != 0;
+  g_ffStats.irises += c.iris;
+  const bool probe = fixedFunctionProbeWants(d, c);
+  if (c.skip) {
+    {
+      std::lock_guard<std::mutex> lock(g_transientSampleLock);
+      ++g_ffSkipped[c.skip];
+    }
+    if (probe)
+      probeFixedFunctionDraw(d, c, "dropped");
+    return;
+  }
+  Draw x = d;
+  x.fixedFunctionConverted = true;
+  x.vsConstants = c.constants;
+  x.vertexProgram = c.program;
+  if (c.elementsChanged)
+    x.elements = c.elements;
+  x.texture0 = c.textureUsed ? d.stageTextures[c.baseStage] : nullptr;
+  x.texture0Target = x.texture0 && d.textureTargets >> c.baseStage & 1;
+  // What onDraw did with it: the counters it moves.
+  const size_t instances = g_instances.size(), ui = g_uiCommands.size();
+  const uint32_t before[] = {g_stats.flat, g_stats.offTarget, g_stats.depthOnly, g_stats.noPosition, g_stats.noData,
+                             g_stats.badRange + g_stats.badPrim + g_stats.nonFinite + g_stats.rejected +
+                                 g_stats.additiveBlack + g_stats.decalNoMesh,
+                             g_ffStats.layers, g_stats.ignored};
+  g_ffDraw = &c;
+  g_ffBlend = c.blend;
+  g_ffMatrices = c.matrices;
+  g_ffUv = c.uvTransform ? c.uv : nullptr;
+  g_ffGenerated = c.generated ? c.generatedRows : nullptr;
+  onDraw(x);
+  g_ffDraw = nullptr;
+  g_ffBlend = ff::kBlendNone;
+  g_ffMatrices = 0;
+  g_ffUv = g_ffGenerated = nullptr;
+  const uint32_t after[] = {g_stats.flat, g_stats.offTarget, g_stats.depthOnly, g_stats.noPosition, g_stats.noData,
+                            g_stats.badRange + g_stats.badPrim + g_stats.nonFinite + g_stats.rejected +
+                                g_stats.additiveBlack + g_stats.decalNoMesh,
+                            g_ffStats.layers, g_stats.ignored};
+  int outcome = 10;
+  if (g_instances.size() > instances)
+    outcome = 0;
+  else if (g_uiCommands.size() > ui)
+    outcome = 1;
+  else
+    for (int k = 0; k < 8; ++k)
+      if (after[k] != before[k]) {
+        outcome = k + 2;
+        break;
+      }
+  ++g_ffStats.outcomes[outcome];
+  if (probe)
+    probeFixedFunctionDraw(x, c, kFfOutcomes[outcome]);
+}
+
 void onDraw(const Draw &d) {
+  if (d.fixedFunction && !d.fixedFunctionConverted)
+    return onFixedFunctionDraw(d);
   // A screen camera's monitor (screenSlot): an opaque surface the runtime
   // traces the camera's view on, however the engine blends the texture.
   if (d.texture0Target && d.mainTarget && (d.blend || d.alphaTest) && screenSlot(d.texture0) >= 0) {
@@ -4482,7 +5052,9 @@ void onDraw(const Draw &d) {
   if (d.blend)
     ++(d.srcBlend == D3DBLEND_ONE && d.dstBlend == D3DBLEND_ONE ? g_stats.additive : g_stats.blended);
   const auto *pos = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
-  const bool skinnedDraw = findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0) != nullptr;
+  // (A fixed-function draw blending without indices has no BLENDINDICES.)
+  const bool skinnedDraw = findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0) != nullptr ||
+                           (g_ffDraw && g_ffDraw->bonesPerVertex);
   // A studio model's decals come right after its own draws (studiorender
   // draws a model, then its decals); a brush entity's after a brush.
   static bool afterStudio = false;
@@ -4503,9 +5075,10 @@ void onDraw(const Draw &d) {
   // A skinned layout drawn with no bones was skinned on the CPU (studiorender's
   // software path: world-space vertices, bone 0 the identity): rigid, as the
   // shader draws it. Its blend indices are stale and name leftover matrices.
+  // A fixed-function draw blends as D3D's render states say (fixed_function.h).
   uint32_t bonesPerVertex = 0;
   if (skinnedDraw) {
-    bonesPerVertex = uint32_t(std::clamp(currentNumBones(), 0, 3));
+    bonesPerVertex = g_ffDraw ? g_ffDraw->bonesPerVertex : uint32_t(std::clamp(currentNumBones(), 0, 3));
     ++g_stats.skinned;
   }
   const auto &ps = d.streams[pos->Stream];
@@ -4518,8 +5091,14 @@ void onDraw(const Draw &d) {
   auto &view = g_views[viewKey];
   if (view.draws++ == 0) {
     view.order = g_viewOrder++;
-    getMatrix(kMatrixView, view.view);
-    getMatrix(kMatrixProjection, view.projection);
+    if (g_ffDraw) { // D3D's transforms (fixed_function.h)
+      std::memcpy(view.view, g_ffDraw->view, sizeof(view.view));
+      std::memcpy(view.projection, g_ffDraw->projection, sizeof(view.projection));
+      view.fixedFunction = true;
+    } else {
+      getMatrix(kMatrixView, view.view);
+      getMatrix(kMatrixProjection, view.projection);
+    }
     view.screenTarget = screenView ? d.target : nullptr;
     // Source builds right-handed D3DX matrices (row vectors, camera looking
     // down -z, projection m[2][3] = -1, depth 0..1). Flipping view-space z
@@ -4618,7 +5197,7 @@ void onDraw(const Draw &d) {
   }
   if (!d.blend && bsp::isStaticProp(d.vsConstants + kRegModel * 4, eye)) {
     // Their ambient cubes still feed the sky light estimate (onPresent).
-    if (findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0))
+    if (findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0) && !d.fixedFunction) // (no ambient cube there)
       view.ambientUp.push_back({d.vsConstants[kRegAmbientUp * 4], d.vsConstants[kRegAmbientUp * 4 + 1],
                                 d.vsConstants[kRegAmbientUp * 4 + 2]});
     ++g_stats.bspPropsDropped;
@@ -4652,6 +5231,15 @@ void onDraw(const Draw &d) {
   const uint64_t geometryKey = fnv(&drawRange, sizeof(drawRange));
   if (!d.blend && !ps.dynamic)
     opaqueDrawn.insert(geometryKey);
+  // Fixed-function materials draw in passes: an opaque one (the base texture
+  // with the lightmap on stage 1), then blended layers over the same
+  // vertices ($detail as a mod2x pass, a self-illumination or environment
+  // pass added). The surface is the first pass's, as the material makes it
+  // (engine_materials); the layers go, unless they are decals.
+  if (g_ffDraw && d.blend && !lifted && !ps.dynamic && opaqueDrawn.count(geometryKey)) {
+    ++g_ffStats.layers;
+    return;
+  }
   if (d.blend && d.dstBlend == D3DBLEND_ONE && (d.srcBlend == D3DBLEND_ONE || d.srcBlend == D3DBLEND_SRCALPHA)) {
     static std::unordered_set<const void *> cookies; // render thread only
     static uint32_t cookieEpoch = ~0u;
@@ -4832,12 +5420,19 @@ void onDraw(const Draw &d) {
   } key = {ps.buffer, d.indices.buffer, d.declaration, ps.version, d.indices.version, ps.offset, ps.stride,
            d.baseVertex, d.minIndex, d.numVertices, d.startIndex, d.primCount, uint32_t(d.type), bonesPerVertex, 0};
   static_assert(sizeof(Key) == 3 * sizeof(void *) + 12 * sizeof(uint32_t), "Key must have no padding: it is hashed as bytes");
-  uint64_t hash = fnv(&key, sizeof(key)) ^ (lifted ? 0xdeca1deca1deca1ull : 0) ^
-                  (unlitColors ? 0xc0105c0105c0105ull : 0) ^ (decalColors ? 0x0decac0105c0105ull : 0) ^
-                  (hueColors ? 0x4e0c0105c0105ull : 0) ^
-                  (lifted && windingSign > 0 ? 0x5197000000000000ull : 0);
-  if (g_screenUv)
-    hash = fnv(g_screenUv, 8 * sizeof(float), hash);
+  // The mesh's name: its buffers' place (or its contents, see contentCache
+  // below) and how it is built.
+  const auto meshName = [&](uint64_t geometryName) {
+    uint64_t h = geometryName ^ (lifted ? 0xdeca1deca1deca1ull : 0) ^ (unlitColors ? 0xc0105c0105c0105ull : 0) ^
+                 (decalColors ? 0x0decac0105c0105ull : 0) ^ (hueColors ? 0x4e0c0105c0105ull : 0) ^
+                 (lifted && windingSign > 0 ? 0x5197000000000000ull : 0);
+    if (g_screenUv)
+      h = fnv(g_screenUv, 8 * sizeof(float), h);
+    if (g_ffUv)
+      h = fnv(g_ffUv, 8 * sizeof(float), h);
+    return h;
+  };
+  uint64_t hash = meshName(fnv(&key, sizeof(key)));
   // A flexed draw (see flexScale) changes every frame although its own
   // buffers are static. `flexContent` names this frame's deltas: the flex
   // mesh's place and version (0: at rest).
@@ -4937,7 +5532,33 @@ void onDraw(const Draw &d) {
     hash = fnv(&flexContent, sizeof(flexContent), hash);
   if (dynamicModel)
     flexContent = g_frame << 1 | 1; // new vertices every frame (g_frame | 1 named two frames alike)
-  const bool transientDraw = (dynamicBuffers && !dynamicModel) || (flex != 0 && !flexTracked);
+  // (Coordinates projected from the camera change with it: per frame.)
+  bool transientDraw = (dynamicBuffers && !dynamicModel) || (flex != 0 && !flexTracked) ||
+                       (g_ffGenerated && !flexTracked);
+  // A fixed-function engine (HL2 RTX) writes world batches, decals and
+  // overlays into dynamic buffers every frame, mostly with the same contents
+  // at another place: named by their contents they are cached like static
+  // draws (no mesh a frame built, sent and its acceleration structure made
+  // anew). A model the CPU deforms keeps its refreshed mesh, refreshed only
+  // when its contents change. OPENREMIX_PROXY_CONTENT_CACHE=0: per frame.
+  static const bool contentCache = game::kFixedFunction && envScale("OPENREMIX_PROXY_CONTENT_CACHE", 1) > 0;
+  if (contentCache && dynamicBuffers && flex == 0 && !g_ffGenerated && particle == kNotParticle) {
+    if (const uint64_t content = contentHash(d)) {
+      if (dynamicModel) {
+        flexContent = content;
+      } else if (transientDraw) {
+        struct Named {
+          uint64_t content, decl;
+          uint32_t stride, type, bonesPerVertex;
+          float lift;
+        } named = {content, uint64_t(uintptr_t(d.declaration)), ps.stride, uint32_t(d.type), bonesPerVertex, lift};
+        static_assert(sizeof(Named) == 4 * sizeof(uint64_t), "hashed as bytes: no padding");
+        hash = meshName(fnv(&named, sizeof(named), 0x636f6e74656e74ull));
+        transientDraw = false;
+        ++g_stats.contentNamed;
+      }
+    }
+  }
   // Eyes of such a model follow its lineage too.
   const bool eyesPerFrame = dynamicBuffers && !dynamicModel;
 
@@ -4964,6 +5585,8 @@ void onDraw(const Draw &d) {
         g_flexMeshes.erase(flexHash);
         return;
       }
+    } else if (dynamicModel) {
+      ++g_stats.contentRefreshSkipped; // rewritten unchanged (contentCache)
     }
     f.lastFrame = g_frame;
     mesh = f.handle;
@@ -5079,7 +5702,7 @@ void onDraw(const Draw &d) {
   // is not it: 16, 16, 16, 1 under UnlitTwoTexture.) A mesh drawn with its own
   // COLOR0 keeps that (the colour stage has two arguments), and so does a
   // draw whose modulation is white.
-  if (d.psConstants && bound.known && !multiply && !hasColors && !decalKind &&
+  if (d.psConstants && !d.fixedFunction && bound.known && !multiply && !hasColors && !decalKind &&
       (nameStarts(bound.shader, "vertexlitgeneric") || nameStarts(bound.shader, "unlitgeneric") ||
        nameStarts(bound.shader, "unlittwotexture") || nameStarts(bound.shader, "wireframe"))) {
     const float *m = d.psConstants + 1 * 4;
@@ -5130,6 +5753,25 @@ void onDraw(const Draw &d) {
         inst.blend.textureAlphaArg1Source = 1;
         inst.blend.textureAlphaArg2Source = 3;
       }
+    }
+  }
+  // A fixed-function stage that takes D3DRS_TEXTUREFACTOR (Source's $color
+  // and $alpha modulation there): the texture factor, as above.
+  if (g_ffDraw && g_ffDraw->textureFactor && g_ffDraw->factor != 0xffffffffu && !multiply && !hasColors && !decalKind) {
+    const uint32_t factor = g_ffDraw->factor | (d.blend ? 0u : 0xff000000u);
+    ++g_ffStats.textureFactor;
+    if (additiveDraw && (!(factor & 0xffffff) || (d.srcBlend == D3DBLEND_SRCALPHA && !(factor >> 24)))) {
+      ++g_stats.modulatedBlack;
+      return;
+    }
+    inst.blend.tFactor = factor;
+    inst.blend.textureColorOperation = 3;
+    inst.blend.textureColorArg1Source = 1;
+    inst.blend.textureColorArg2Source = 3;
+    if (d.blend) {
+      inst.blend.textureAlphaOperation = 3;
+      inst.blend.textureAlphaArg1Source = 1;
+      inst.blend.textureAlphaArg2Source = 3;
     }
   }
   if (unlitColors) {
@@ -5197,7 +5839,7 @@ void onDraw(const Draw &d) {
   if (boneCount > 1) {
     // Bone matrices map the bind pose straight to world space.
     inst.bones.resize(boneCount);
-    std::memcpy(inst.bones.data(), d.vsConstants + kRegModel * 4, boneCount * sizeof(remixapi_Transform));
+    std::memcpy(inst.bones.data(), boneRows(d), boneCount * sizeof(remixapi_Transform));
     static const float identity[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
     std::memcpy(inst.transform, identity, sizeof(inst.transform));
   } else {
@@ -5231,8 +5873,9 @@ void onDraw(const Draw &d) {
   // its size. The eyeball
   // is submitted with that texture and those coordinates: a mesh of its own,
   // refreshed in place as the gaze and the head move (g_flexMeshes).
+  // (Fixed-function eyes: with stage 1's projection only, fixed_function.h.)
   const EyeShader eyeShader =
-      d.blend || !d.texture1 ? kNotEyes
+      d.blend || !d.texture1 || (g_ffDraw && !g_ffDraw->iris) ? kNotEyes
       : bound.known          ? nameStarts(bound.shader, "eyerefract") ? kEyeRefractShader
                                : nameStarts(bound.shader, "eyes")     ? kEyesShader
                                                                       : kNotEyes
@@ -5351,7 +5994,7 @@ void onDraw(const Draw &d) {
   }
   if (inst.stencilRole == kStencilSourceOnly || inst.stencilRole == kStencilInside)
     return; // marks and overlays: no part in lighting estimates
-  if (boneCount) // studio models: their ambient cube samples the surrounding (sky) light
+  if (boneCount && !d.fixedFunction) // studio models: their ambient cube samples the surrounding (sky) light
     view.ambientUp.push_back({d.vsConstants[kRegAmbientUp * 4], d.vsConstants[kRegAmbientUp * 4 + 1],
                               d.vsConstants[kRegAmbientUp * 4 + 2]});
   ++g_stats.accepted;
@@ -5807,6 +6450,14 @@ void onPresent() {
                v.order, v.draws, v.perspective, v.projection[0], v.projection[5], v.projection[14], v.view[12],
                v.view[13], v.view[14], names[int(roles[key])]);
       g_viewSummary += line;
+      if (v.fixedFunction)
+        ++(v.perspective ? g_ffStats.views : g_ffStats.flatViews);
+    }
+    g_ffStats.mainFrames += main->fixedFunction;
+    if (g_ffProbe.out && g_ffProbe.frame == g_frame) {
+      fprintf(g_ffProbe.out, "== f%llu views (order as above):\n%s", static_cast<unsigned long long>(g_frame),
+              g_viewSummary.c_str());
+      fflush(g_ffProbe.out);
     }
 
     // Sky light: the path tracer's environment radiance follows the upward
@@ -6476,6 +7127,7 @@ void onPresent() {
   serviceFlatDumpRequest();
   serviceMaterialProbeRequest();
   serviceShaderProbeRequest();
+  serviceFixedFunctionProbeRequest();
 #ifdef PROXY_GAME_L4D2
   l4d2::infected::servicePresent(g_moduleDir.c_str(), g_frame);
 #endif
@@ -6546,6 +7198,8 @@ void onPresent() {
   // Static meshes keyed by buffer version: a rewritten buffer never matches
   // again, so old entries age out.
   ++g_frame;
+  if (game::kFixedFunction)
+    ff::newFrame();
   for (auto it = g_meshes.begin(); it != g_meshes.end();) {
     if (g_frame - it->second.lastFrame > 600) {
       g_api.DestroyMesh(it->second.handle);
@@ -7058,6 +7712,41 @@ void dumpStatistics(FILE *out) {
 #ifdef PROXY_GAME_L4D2
   l4d2::infected::dumpStatistics(out, g_infectedMaterials.size());
 #endif
+  if (game::kFixedFunction) {
+    // Fixed-function draws (fixed_function.h): kinds, then outcomes.
+    auto take = [&](std::atomic<uint32_t> &n) { return n.exchange(0) / f; };
+    auto &s = g_ffStats;
+    fprintf(out, "   fixed-function draws per frame %.1f: 3D rigid %.1f, skinned indexed %.1f (D3DCOLOR indices %.1f), "
+                 "non-indexed %.1f (tweening drawn rigid %.1f, 4 matrices cut to 3 %.1f); 2D %.1f (pre-transformed "
+                 "%.1f) | layout from SetFVF %.1f\n",
+            take(s.draws), take(s.rigid), take(s.indexed), take(s.indexedColor), take(s.nonIndexed), take(s.tweening),
+            take(s.fourMatrices), take(s.flat), take(s.pretransformed), take(s.fvf));
+    fprintf(out, "     camera: fixed-function views per frame %.2f perspective, %.2f flat; main view from D3D's "
+                 "VIEW/PROJECTION in %.0f%% of frames | texture: transforms baked %.1f, projected (not divided) %.1f, "
+                 "projected from the position %.1f, untextured (stage off) %.1f, base texture on another stage %.1f, "
+                 "texture factor %.1f, irises %.1f\n",
+            take(s.views), take(s.flatViews), 100.0 * s.mainFrames.exchange(0) / f, take(s.uvTransforms),
+            take(s.projected), take(s.generated), take(s.untextured), take(s.otherStage), take(s.textureFactor),
+            take(s.irises));
+    std::string outcomes;
+    for (int k = 0; k < 11; ++k) {
+      char item[64];
+      std::snprintf(item, sizeof(item), "%s%s %.1f", k ? ", " : "", kFfOutcomes[k], take(s.outcomes[k]));
+      outcomes += item;
+    }
+    std::string skipped;
+    {
+      std::lock_guard<std::mutex> lock(g_transientSampleLock);
+      for (const auto &[reason, n] : g_ffSkipped) {
+        char item[160];
+        std::snprintf(item, sizeof(item), "; %s %.1f", reason.c_str(), n / f);
+        skipped += item;
+      }
+      g_ffSkipped.clear();
+    }
+    fprintf(out, "     outcomes per frame: %s | blended pass layers dropped %.1f | dropped by the conversion%s\n",
+            outcomes.c_str(), take(s.layers), skipped.empty() ? ": none" : skipped.c_str());
+  }
   fprintf(out, "   world-list draws: dropped (BSP world) %.1f, kept blended %.1f, kept dynamic %.1f | $translucent "
                "world draws with an opaque texture, drawn opaque %.1f | screen camera draws %.1f (views %zu, "
                "refused for want of a slot %.1f; instances only screen views see %.1f)\n",
@@ -7254,6 +7943,10 @@ void dumpStatistics(FILE *out) {
               cache.queryAttempts ? 100.0 * cache.queryHits / cache.queryAttempts : 0.0,
               static_cast<unsigned long long>(cache.resets), static_cast<unsigned long long>(cache.renderedFrames));
   }
+  if (game::kFixedFunction)
+    fprintf(out, "   dynamic-buffer draws named by their contents per frame %.1f, CPU-deformed models rewritten unchanged "
+                 "(no refresh) %.1f (OPENREMIX_PROXY_CONTENT_CACHE)\n",
+            g_stats.contentNamed.exchange(0) / f, g_stats.contentRefreshSkipped.exchange(0) / f);
   fprintf(out, "   transient: %.0f vertices %.0f indices per frame; by declaration:",
           g_transientVerts.exchange(0) / f, g_transientIndices.exchange(0) / f);
   {

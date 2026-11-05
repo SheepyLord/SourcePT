@@ -263,7 +263,8 @@ bool parseKeyValues(const std::string &text, KeyValues &out) {
   auto plain = [](std::string t) { return !t.empty() && t[0] == '\x01' ? t.substr(1) : t; };
   if (tokens.size() < 2 || tokens[1] != "{")
     return false;
-  out.shader = lower(plain(tokens[0]));
+  // Mapbase's game shaders ("SDK_LightmappedGeneric") as the stock ones.
+  out.shader = lower(game::stockShaderName(plain(tokens[0]).c_str()));
   size_t i = 2;
   // Skips a block whose '{' was consumed.
   auto skip = [&]() {

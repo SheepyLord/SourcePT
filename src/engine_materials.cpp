@@ -2,8 +2,8 @@
 #include "bsp_world.h"
 #include "game.h"
 #include "remix_output.h"
-#ifdef PROXY_GAME_L4D2
-#include "l4d2.h"
+#ifndef PROXY_GAME_GMOD
+#include "x86_module.h"
 #endif
 
 #include <windows.h>
@@ -85,6 +85,22 @@
 //     (true), 10 GetMaterialPage (mov eax,[ecx+4]).
 //   MaterialVarFlags_t (materialsystem's table of the $flags names, by bit):
 //     SDK 2013's, $model at bit 11.
+//
+// Half-Life 2 RTX (x86, materialsystem.dll and shaderapidx9_orig.dll of the
+// Portal RTX engine build, Nov 2026): found and checked as in L4D2, with
+// L4D2's field offsets but SDK 2013's code:
+//   CShaderAPIDx8 (IShaderAPIDX8, ShaderApi030; vtable at +0x22c): 113
+//     Bind(IMaterial *). It compares the pages of two sub-rectangles as L4D2's
+//     does, then flushes the buffered primitives (FlushBufferedPrimitives,
+//     slot 114: call [eax+0x1c8]) before it stores m_pMaterial
+//     ([this+0xde34]), as GMod's: the draws flushed belong to the previous
+//     material, which the hook (after the original) still has.
+//   CMaterial: L4D2's slots and fields; GetShaderName calls PrecacheVars
+//     (slot 63) first, as GMod's.
+//   CMaterialVar: L4D2's slots and fields; the getters ask CMaterialSystem
+//     slot 139 (call [eax+0x22c]) for the thread's call queue.
+//   CMaterialSubRect: its name symbol at +0xc, the page at +4.
+//   MaterialVarFlags_t: SDK 2013's.
 namespace proxy::engine_materials {
 namespace {
 
@@ -107,13 +123,17 @@ constexpr size_t kMaterialCount = 0x32, kMaterialParams = 0x38, kMaterialName = 
 // CMaterialVar: type nibble, ITexture * of a texture var.
 constexpr size_t kVarType = 0x24, kVarTexture = 0x39;
 #else
-// L4D2: as the code checked at install reads them (see above).
+// L4D2, Half-Life 2 RTX: as the code checked at install reads them (see above).
 constexpr unsigned kSlotGetName = 0, kSlotParamCount = 40, kSlotParams = 41, kSlotShaderName = 49;
 constexpr unsigned kVarGetName = 1, kVarGetString = 6, kVarIsDefined = 17, kVarGetInt = 26, kVarGetFloat = 27,
                    kVarGetVec = 29;
 constexpr unsigned kSlotInPage = 7, kSlotPage = 10;
 constexpr unsigned kSlotBind = game::kSlotBind;
+#ifdef PROXY_GAME_L4D2
 constexpr size_t kSubRectPageOffset = 0x4, kSubRectNameOffset = 0x10;
+#else
+constexpr size_t kSubRectPageOffset = 0x4, kSubRectNameOffset = 0xc;
+#endif
 constexpr size_t kMaterialCount = 0x22, kMaterialParams = 0x24, kMaterialName = 0x18, kMaterialShader = 0x14;
 constexpr size_t kVarType = 0x1c, kVarTexture = 0x24;
 #endif
@@ -220,7 +240,7 @@ uintptr_t g_materialVtable = 0, g_varVtable = 0, g_subRectVtable = 0;
 enum Use : unsigned { kUseBound = 1, kUseName = 2, kUseShading = 4, kUseParams = 8, kUseAll = 15 };
 unsigned g_uses = kUseAll;
 std::string g_usesText = "all"; // for the statistics
-#ifdef PROXY_GAME_L4D2
+#ifndef PROXY_GAME_GMOD
 // OPENREMIX_PROXY_MATERIALS: 0 none, 1 all (the default), else a comma list.
 void readUses() {
   static const struct {
@@ -387,8 +407,8 @@ std::string textureNameOfTexture(void *texture) {
 
 void resolve(Entry &e, void *material) {
   e.name = lower(g_materialName(material));
-  const char *shader = g_shaderName(material);
-  e.shaderName = shader ? shader : "";
+  // Mapbase's game shaders as the stock ones (game::kShaderPrefix).
+  e.shaderName = game::stockShaderName(g_shaderName(material));
   e.kind = shaderMode(e.shaderName.c_str());
   {
     // "DecalModulate_dx9", "DecalBaseTimesLightmapAlphaBlendSelfIllum_DX9", ...
@@ -569,16 +589,99 @@ void readPbr(Entry &e, int flags, Shading &out) {
   out.pbr = pbr::convert(in);
 }
 
+#ifndef PROXY_GAME_GMOD
+// The code checked, per game (see above): the same functions, as each
+// compiler built them.
+struct X86Code {
+  const char *bind;           // IShaderAPI::Bind, from its entry
+  const char *bindTail;       // ... and at bindTailOffset (null: none)
+  size_t bindTailOffset;
+  const char *shaderName;     // CMaterial::GetShaderName
+  const char *varDefined;     // CMaterialVar::IsDefined
+  const char *varString;      // CMaterialVar::GetStringValue, up to its jump table's address
+  const char *textureCase;    // ... its texture case
+  const char *subRectName;    // CMaterialSubRect::GetName
+};
 #ifdef PROXY_GAME_L4D2
 // The CMaterialVar getters: whether the calling thread's render context has a
 // call queue (g_pMaterialSystem, slot 137), and while it does the queue
 // thread's twin; then the value (the tail).
-#define L4D2_VAR_GETTER(tail)                                                                                         \
+#define X86_VAR_GETTER(tail)                                                                                          \
   "56 8B F1 8B 0D ? ? ? ? 8B 01 8B 90 24 02 00 00 FF D2 85 C0 74 2E F6 46 1C 80 75 28 8A 46 1D 3C FF 74 21 8B 0D ? ? " \
   "? ? 0F B6 C0 8D 34 80 8B 01 8B 90 24 02 00 00 8D 34 F5 ? ? ? ? FF D2 85 C0 75 D2 " tail
+constexpr X86Code kCode = {
+    // push esi; mov esi,[ebp+8]; push edi; mov edi,ecx; mov ecx,[edi+0x2bd4]
+    // (m_pMaterial); ... InMaterialPage (slot 7) on both; ...; GetMaterialPage
+    // (slot 10) on both; ...; mov [edi+0x2bd4],esi; ...; ret 4
+    "55 8B EC 56 8B 75 08 57 8B F9 8B 8F D4 2B 00 00 85 C9 74 ? 85 F6 74 ? 8B 01 8B 50 1C FF D2 84 C0 74 ? 8B 06 "
+    "8B 50 1C 8B CE FF D2 84 C0 74 ? 8B 8F D4 2B 00 00 8B 01 8B 50 28 53 FF D2 8B D8 8B 06 8B 50 28 8B CE FF D2 "
+    "3B D8 0F 95 C0 5B 84 C0 74 ? 89 B7 D4 2B 00 00 5F 5E 5D C2 04 00",
+    nullptr, 0,
+    // cmp [ecx+0x14],0; je; mov ecx,[ecx+0x14]; mov eax,[ecx]; mov edx,[eax]; jmp edx (IShader::GetName)
+    "83 79 14 00 74 09 8B 49 14 8B 01 8B 10 FF E2",
+    // mov al,[ecx+0x1c]; and al,0xf; xor ecx,ecx; cmp al,6; setne al; ret
+    "8A 41 1C 24 0F 33 C9 3C 06 0F 95 C0 C3",
+    // The twin as above (in ebx); movzx eax, byte [ebx+0x1c]; and eax,0xf;
+    // cmp eax,8; ja; jmp [eax*4+table] (by type)
+    "55 8B EC 83 EC 08 53 8B D9 8B 0D ? ? ? ? 8B 01 8B 90 24 02 00 00 56 57 FF D2 85 C0 74 2F 90 F6 43 1C 80 75 28 8A "
+    "43 1D 3C FF 74 21 8B 0D ? ? ? ? 0F B6 C0 8D 1C 80 8B 01 8B 90 24 02 00 00 8D 1C DD ? ? ? ? FF D2 85 C0 75 D2 0F "
+    "B6 43 1C 83 E0 0F 83 F8 08 0F 87 ? ? ? ? FF 24 85",
+    // cmp [ebx+0x24],-1; jne; ... mov eax,"env_cubemap"; ...; mov ecx,[ebx+0x24]; mov edx,[ecx]; mov eax,[edx]; call eax
+    "83 7B 24 FF 75 0C 5F 5E B8 ? ? ? ? 5B 8B E5 5D C3 8B 4B 24 8B 11 8B 02 FF D0",
+    // add ecx,0x10 (its name symbol); jmp CUtlSymbol::String
+    "83 C1 10 E9",
+};
+#else
+// Half-Life 2 RTX: the getters ask slot 139 (call [eax+0x22c]).
+#define X86_VAR_GETTER(tail)                                                                                          \
+  "56 8B F1 8B 0D ? ? ? ? 8B 01 FF 90 2C 02 00 00 85 C0 74 2C F6 46 1C 80 75 26 8A 46 1D 3C FF 74 1F 8B 0D ? ? ? ? " \
+  "0F B6 C0 8D 04 80 8D 34 C5 ? ? ? ? 8B 01 FF 90 2C 02 00 00 85 C0 75 D4 " tail
+constexpr X86Code kCode = {
+    // push ebx; mov ebx,ecx; push edi; mov edi,[ebp+8]; mov ecx,[ebx+0xde34]
+    // (m_pMaterial); ... InMaterialPage (slot 7) on both; ...; GetMaterialPage
+    // (slot 10) on both; ...; cmp ecx,edi (the same material: nothing to do)
+    "55 8B EC 53 8B D9 57 8B 7D 08 8B 8B 34 DE 00 00 85 C9 74 ? 85 FF 74 ? 8B 01 8B 40 1C FF D0 84 C0 74 ? 8B 07 "
+    "8B CF 8B 40 1C FF D0 84 C0 74 ? 8B 8B 34 DE 00 00 56 8B 01 FF 50 28 8B 17 8B CF 8B F0 FF 52 28 3B F0 5E 0F "
+    "95 C0 EB ? 8B 8B 34 DE 00 00 3B CF 75",
+    // mov eax,[ebx]; mov ecx,ebx; call [eax+0x1c8] (FlushBufferedPrimitives,
+    // slot 114); mov [ebx+0xde34],edi; pop edi; pop ebx; pop ebp; ret 4
+    "8B 03 8B CB FF 90 C8 01 00 00 89 BB 34 DE 00 00 5F 5B 5D C2 04 00", 0x77,
+    // push esi; mov esi,ecx; PrecacheVars(0,0,0,0) (slot 63); mov ecx,[esi+0x14];
+    // pop esi; test ecx,ecx; je; mov eax,[ecx]; jmp [eax] (IShader::GetName)
+    "56 8B F1 6A 00 6A 00 6A 00 8B 06 6A 00 FF 90 FC 00 00 00 8B 4E 14 5E 85 C9 74 04 8B 01 FF 20",
+    // mov cl,[ecx+0x1c]; xor eax,eax; and cl,0xf; cmp cl,6; setne al; ret
+    "8A 49 1C 33 C0 80 E1 0F 80 F9 06 0F 95 C0 C3",
+    // The twin as above (in ebx); movzx eax, byte [ebx+0x1c]; and eax,0xf;
+    // cmp eax,8; ja; jmp [eax*4+table] (by type)
+    "55 8B EC 83 EC 08 53 8B D9 8B 0D ? ? ? ? 56 57 8B 01 FF 90 2C 02 00 00 85 C0 74 2F 8D 49 00 F6 43 1C 80 75 26 8A "
+    "43 1D 3C FF 74 1F 8B 0D ? ? ? ? 0F B6 C0 8D 04 80 8D 1C C5 ? ? ? ? 8B 01 FF 90 2C 02 00 00 85 C0 75 D4 0F B6 43 "
+    "1C 83 E0 0F 83 F8 08 0F 87 ? ? ? ? FF 24 85",
+    // mov ecx,[ebx+0x24]; cmp ecx,-1; jne; ... mov eax,"env_cubemap"; ...;
+    // mov ecx,[ebx+0x24]; mov eax,[ecx]; call [eax]
+    "8B 4B 24 83 F9 FF 75 0F 5F 5E B8 ? ? ? ? 5B 8B E5 5D C3 8B 4B 24 8B 01 FF 10",
+    // add ecx,0xc (its name symbol); jmp CUtlSymbol::String
+    "83 C1 0C E9",
+};
+#endif
 
-bool installL4D2(const void *const *shaderApiVtable) {
-  static l4d2::Module materials, shaderApi;
+// The number of bytes a pattern names (the jump table's address follows
+// GetStringValue's).
+size_t patternBytes(const char *text) {
+  size_t n = 0;
+  for (const char *p = text; *p;) {
+    while (*p == ' ')
+      ++p;
+    if (!*p)
+      break;
+    ++n;
+    while (*p && *p != ' ')
+      ++p;
+  }
+  return n;
+}
+
+bool installX86(const void *const *shaderApiVtable) {
+  static x86::Module materials, shaderApi;
   if (!materials.open("materialsystem.dll")) {
     g_status = "no materialsystem.dll";
     return false;
@@ -589,22 +692,19 @@ bool installL4D2(const void *const *shaderApiVtable) {
     g_detail = "shaderapidx9_orig.dll";
     return false;
   }
-  auto code = [](const l4d2::Module &m, const void *function, const char *bytes) {
-    return m.inCode(function) && l4d2::bytesAt(m, reinterpret_cast<uintptr_t>(function) - m.base, bytes);
+  auto code = [](const x86::Module &m, const void *function, const char *bytes, size_t offset = 0) {
+    return m.inCode(function) && x86::bytesAt(m, reinterpret_cast<uintptr_t>(function) - m.base + offset, bytes);
   };
-  // push esi; mov esi,[ebp+8]; push edi; mov edi,ecx; mov ecx,[edi+0x2bd4]
-  // (m_pMaterial); ... InMaterialPage (slot 7) on both; ...; GetMaterialPage
-  // (slot 10) on both; ...; mov [edi+0x2bd4],esi; ...; ret 4
-  if (!code(shaderApi, shaderApiVtable[kSlotBind],
-            "55 8B EC 56 8B 75 08 57 8B F9 8B 8F D4 2B 00 00 85 C9 74 ? 85 F6 74 ? 8B 01 8B 50 1C FF D2 84 C0 74 ? 8B 06 "
-            "8B 50 1C 8B CE FF D2 84 C0 74 ? 8B 8F D4 2B 00 00 8B 01 8B 50 28 53 FF D2 8B D8 8B 06 8B 50 28 8B CE FF D2 "
-            "3B D8 0F 95 C0 5B 84 C0 74 ? 89 B7 D4 2B 00 00 5F 5E 5D C2 04 00")) {
+  static char bindName[40];
+  std::snprintf(bindName, sizeof(bindName), "IShaderAPI::Bind (slot %u)", kSlotBind);
+  if (!code(shaderApi, shaderApiVtable[kSlotBind], kCode.bind) ||
+      (kCode.bindTail && !code(shaderApi, shaderApiVtable[kSlotBind], kCode.bindTail, kCode.bindTailOffset))) {
     g_status = "code mismatch";
-    g_detail = "IShaderAPI::Bind (slot 76)";
+    g_detail = bindName;
     return false;
   }
-  void **material = l4d2::rttiVtable(materials, ".?AVCMaterial@@");
-  void **var = l4d2::rttiVtable(materials, ".?AVCMaterialVar@@");
+  void **material = x86::rttiVtable(materials, ".?AVCMaterial@@");
+  void **var = x86::rttiVtable(materials, ".?AVCMaterialVar@@");
   if (!material || !var) {
     g_status = "class not found (RTTI)";
     g_detail = material ? "CMaterialVar" : "CMaterial";
@@ -621,25 +721,17 @@ bool installL4D2(const void *const *shaderApiVtable) {
       {material, kSlotGetName, "83 C1 18 E9", "CMaterial::GetName"},
       {material, kSlotParamCount, "0F B6 41 22 C3", "CMaterial::ShaderParamCount"},
       {material, kSlotParams, "8B 41 24 C3", "CMaterial::GetShaderParams"},
-      // cmp [ecx+0x14],0; je; mov ecx,[ecx+0x14]; mov eax,[ecx]; mov edx,[eax]; jmp edx (IShader::GetName)
-      {material, kSlotShaderName, "83 79 14 00 74 09 8B 49 14 8B 01 8B 10 FF E2", "CMaterial::GetShaderName"},
+      {material, kSlotShaderName, kCode.shaderName, "CMaterial::GetShaderName"},
       // push esi; movzx esi, word [ecx+0x1e] (the name symbol); 0xffff: none
       {var, kVarGetName, "56 0F B7 71 1E B8 FF FF 00 00 66 3B F0", "CMaterialVar::GetName"},
-      // mov al,[ecx+0x1c]; and al,0xf; xor ecx,ecx; cmp al,6; setne al; ret
-      {var, kVarIsDefined, "8A 41 1C 24 0F 33 C9 3C 06 0F 95 C0 C3", "CMaterialVar::IsDefined"},
+      {var, kVarIsDefined, kCode.varDefined, "CMaterialVar::IsDefined"},
       // ...; mov eax,[esi+8]; pop esi; ret
-      {var, kVarGetInt, L4D2_VAR_GETTER("8B 46 08 5E C3"), "CMaterialVar::GetIntValueInternal"},
+      {var, kVarGetInt, X86_VAR_GETTER("8B 46 08 5E C3"), "CMaterialVar::GetIntValueInternal"},
       // ...; fld dword [esi+0xc]; pop esi; ret
-      {var, kVarGetFloat, L4D2_VAR_GETTER("D9 46 0C 5E C3"), "CMaterialVar::GetFloatValueInternal"},
+      {var, kVarGetFloat, X86_VAR_GETTER("D9 46 0C 5E C3"), "CMaterialVar::GetFloatValueInternal"},
       // ...; lea eax,[esi+0xc]; pop esi; ret
-      {var, kVarGetVec, L4D2_VAR_GETTER("8D 46 0C 5E C3"), "CMaterialVar::GetVecValueInternal"},
-      // The twin as above (in ebx); movzx eax, byte [ebx+0x1c]; and eax,0xf;
-      // cmp eax,8; ja; jmp [eax*4+table] (by type)
-      {var, kVarGetString,
-       "55 8B EC 83 EC 08 53 8B D9 8B 0D ? ? ? ? 8B 01 8B 90 24 02 00 00 56 57 FF D2 85 C0 74 2F 90 F6 43 1C 80 75 28 8A "
-       "43 1D 3C FF 74 21 8B 0D ? ? ? ? 0F B6 C0 8D 1C 80 8B 01 8B 90 24 02 00 00 8D 1C DD ? ? ? ? FF D2 85 C0 75 D2 0F "
-       "B6 43 1C 83 E0 0F 83 F8 08 0F 87 ? ? ? ? FF 24 85",
-       "CMaterialVar::GetStringValue"},
+      {var, kVarGetVec, X86_VAR_GETTER("8D 46 0C 5E C3"), "CMaterialVar::GetVecValueInternal"},
+      {var, kVarGetString, kCode.varString, "CMaterialVar::GetStringValue"},
   };
   for (const Slot &s : slots)
     if (!materials.holds(s.vtable + s.slot) || !code(materials, s.vtable[s.slot], s.bytes)) {
@@ -653,12 +745,11 @@ bool installL4D2(const void *const *shaderApiVtable) {
   {
     const auto *string = static_cast<const uint8_t *>(var[kVarGetString]);
     uint32_t table;
-    std::memcpy(&table, string + 97, sizeof(table));
+    std::memcpy(&table, string + patternBytes(kCode.varString), sizeof(table));
     const void *const *cases = reinterpret_cast<const void *const *>(uintptr_t(table));
     if (!materials.holds(cases) || !materials.holds(cases + kTypeTexture) ||
         !code(materials, cases[kTypeString], "8B 43 04 5F 5E 5B 8B E5 5D C3") ||
-        !code(materials, cases[kTypeTexture],
-              "83 7B 24 FF 75 0C 5F 5E B8 ? ? ? ? 5B 8B E5 5D C3 8B 4B 24 8B 11 8B 02 FF D0")) {
+        !code(materials, cases[kTypeTexture], kCode.textureCase)) {
       g_status = "code mismatch";
       g_detail = "CMaterialVar::GetStringValue's string and texture cases";
       return false;
@@ -673,10 +764,10 @@ bool installL4D2(const void *const *shaderApiVtable) {
   g_varInt = reinterpret_cast<IntFn>(var[kVarGetInt]);
   g_varFloat = reinterpret_cast<FloatFn>(var[kVarGetFloat]);
   g_varVec = reinterpret_cast<VecFn>(var[kVarGetVec]);
-  // Sub-rectangle materials (optional, as in GMod): add ecx,0x10 (its name
-  // symbol), jmp CUtlSymbol::String; mov al,1; mov eax,[ecx+4] (the page).
-  if (void **subRect = l4d2::rttiVtable(materials, ".?AVCMaterialSubRect@@");
-      subRect && materials.holds(subRect + kSlotPage) && code(materials, subRect[kSlotGetName], "83 C1 10 E9") &&
+  // Sub-rectangle materials (optional, as in GMod): GetName (its name symbol,
+  // CUtlSymbol::String); mov al,1; mov eax,[ecx+4] (the page).
+  if (void **subRect = x86::rttiVtable(materials, ".?AVCMaterialSubRect@@");
+      subRect && materials.holds(subRect + kSlotPage) && code(materials, subRect[kSlotGetName], kCode.subRectName) &&
       code(materials, subRect[kSlotInPage], "B0 01 C3") && code(materials, subRect[kSlotPage], "8B 41 04 C3")) {
     g_subRectName = reinterpret_cast<NameFn>(subRect[kSlotGetName]);
     g_subRectVtable = reinterpret_cast<uintptr_t>(subRect);
@@ -684,7 +775,7 @@ bool installL4D2(const void *const *shaderApiVtable) {
   }
   return true;
 }
-#undef L4D2_VAR_GETTER
+#undef X86_VAR_GETTER
 #endif
 
 } // namespace
@@ -715,7 +806,7 @@ bool install(const void *const *shaderApiVtable) {
   static std::atomic<bool> done{false};
   if (done.exchange(true))
     return g_installed;
-#ifdef PROXY_GAME_L4D2
+#ifndef PROXY_GAME_GMOD
   readUses();
 #endif
   char v[8] = {};
@@ -805,7 +896,7 @@ bool install(const void *const *shaderApiVtable) {
   g_status = g_subRects ? "ok (IShaderAPI::Bind read, sub-rectangle materials through their page)"
                         : "ok (IShaderAPI::Bind read; CMaterialSubRect layout not recognized: decal atlases unread)";
 #else
-  if (!installL4D2(shaderApiVtable))
+  if (!installX86(shaderApiVtable))
     return false;
   g_status = g_subRects ? "ok (IShaderAPI::Bind read, classes by RTTI, sub-rectangle materials through their page)"
                         : "ok (IShaderAPI::Bind read, classes by RTTI; CMaterialSubRect not recognized: decal atlases unread)";

@@ -1,17 +1,21 @@
-// Left 4 Dead 2: the runtime's own UI (remix_ui.h). OpenRemix runs in the
-// bridge's 64-bit host process, its window and SDL input there: F12 on the
-// game window toggles the UI (SetUIState ADVANCED / NONE), and while it is
-// open the game window's input is forwarded to the host
-// (remix_bridge.dll!remixapi_bridge_InjectInputEXT) instead of the game, as
-// l4d2-rtx's imgui.cpp did. Key-ups still reach the game (no stuck keys); raw
-// mouse input (WM_INPUT) does not (it would turn the camera). The engine shows
-// the OS cursor meanwhile (ISurface::SetCursorAlwaysVisible).
+// The x86 games (Left 4 Dead 2, Half-Life 2 RTX): the runtime's own UI
+// (remix_ui.h). OpenRemix runs in the bridge's 64-bit host process, its
+// window and SDL input there: F12 on the game window toggles the UI
+// (SetUIState ADVANCED / NONE), and while it is open the game window's input
+// is forwarded to the host (remix_bridge.dll!remixapi_bridge_InjectInputEXT)
+// instead of the game, as l4d2-rtx's imgui.cpp did. Key-ups still reach the
+// game (no stuck keys); raw mouse input (WM_INPUT) does not (it would turn the
+// camera). The engine shows the OS cursor meanwhile
+// (ISurface::SetCursorAlwaysVisible, game.h).
 // The library loader (remixapi_lib_*) is remix_output's.
 #define REMIX_WINAPI_NO_LIBRARY_LOADER
 #include "remix_ui.h"
 
 #include "game.h"
+#ifdef PROXY_GAME_L4D2
 #include "l4d2.h"
+#endif
+#include "x86_module.h"
 
 #include <atomic>
 #include <cstdio>
@@ -52,12 +56,13 @@ void inject(Input type, uint32_t code, bool down, int32_t x = 0, int32_t y = 0, 
   }
 }
 
-// VGUI_Surface031 slot 49: SetCursorAlwaysVisible(bool) (verified in L4D2's
-// vguimatsurface.dll: stores the flag at +0x29C).
+// ISurface::SetCursorAlwaysVisible(bool) (game.h: L4D2's VGUI_Surface031
+// slot 49, Half-Life 2 RTX's VGUI_Surface030 slot 52).
 void setCursorVisible(bool visible) {
-  static void *surface = proxy::l4d2::createInterface("vguimatsurface.dll", "VGUI_Surface031");
+  static void *surface = proxy::x86::createInterface("vguimatsurface.dll", proxy::game::kSurfaceInterface);
   if (surface)
-    reinterpret_cast<void(PROXY_THISCALL *)(void *, bool)>((*static_cast<void ***>(surface))[49])(surface, visible);
+    reinterpret_cast<void(PROXY_THISCALL *)(void *, bool)>(
+        (*static_cast<void ***>(surface))[proxy::game::kSlotSetCursorAlwaysVisible])(surface, visible);
 }
 
 void setActive(bool active) {
@@ -109,7 +114,9 @@ bool forward(UINT message, WPARAM w, LPARAM l) {
 } // namespace
 
 void install(HWND window, remixapi_Interface *api, WNDPROC) {
+#ifdef PROXY_GAME_L4D2
   proxy::l4d2::setGameWindow(window);
+#endif
   if (g_previous || !window || !api || !api->SetUIState)
     return;
   g_window = window;

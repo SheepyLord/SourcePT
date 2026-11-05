@@ -49,7 +49,16 @@ runtime is reached through the bridge, `remix_bridge.dll` beside the proxy in
     meson setup --cross-file cross/i686-w64-mingw32.txt _build-l4d2
     meson compile -C _build-l4d2
 
-The game follows the cross file (`-Dgame=gmod|l4d2` names it; a mismatch with
-the cross file is an error). What differs between the games is in
-`src/game.h`; the GMod-only engine modules are left out of the L4D2 build
-(`src/gmod_only_stubs.cpp`).
+And for Half-Life 2 RTX (x86, work in progress: the proxy and the bridge as for
+L4D2, no engine-side hooks yet; NVIDIA's engine build draws through D3D9's
+fixed-function pipeline, which the proxy converts, `src/fixed_function.h`;
+NVIDIA's `bin/d3d9.dll` must be moved aside so the shader API gets the
+system's d3d9):
+
+    meson setup --cross-file cross/i686-w64-mingw32.txt -Dgame=hl2rtx _build-hl2rtx
+    meson compile -C _build-hl2rtx
+
+The game follows the cross file (`-Dgame=gmod|l4d2|hl2rtx` names it; x86 is
+L4D2 unless named, a mismatch with the cross file is an error). What differs
+between the games is in `src/game.h`; the GMod-only engine modules are left out
+of the x86 builds (`src/gmod_only_stubs.cpp`).

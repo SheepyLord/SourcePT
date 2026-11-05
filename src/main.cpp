@@ -1,6 +1,6 @@
-// shaderapidx9.dll proxy for Garry's Mod (x64) and Left 4 Dead 2 (x86, see
-// game.h): loads the original as shaderapidx9_orig.dll and hands out
-// forwarding wrappers for its interfaces.
+// shaderapidx9.dll proxy for Garry's Mod (x64), Left 4 Dead 2 and Half-Life 2
+// RTX (x86, see game.h): loads the original as shaderapidx9_orig.dll and
+// hands out forwarding wrappers for its interfaces.
 // Phase 1: pure pass-through with per-slot call statistics.
 #include "diag.h"
 #include "d3d_hooks.h"
@@ -15,6 +15,8 @@
 #ifdef PROXY_GAME_L4D2
 #include "l4d2.h"
 #include "slots_shaderapi_l4d2.h"
+#elif defined(PROXY_GAME_HL2RTX)
+#include "slots_shaderapi_hl2rtx.h"
 #endif
 #include "vb_origins.h"
 #include "vtable_proxy.h"
@@ -84,9 +86,10 @@ uint32_t countSlots(const void *const *vtbl) {
 
 // Appends a switch to tier0's command line before the original is loaded,
 // for the engine to find when it looks it up (ICommandLine::FindParm).
-// ICommandLine slots, the same in GMod x64 and L4D2 x86 (L4D2's engine calls
-// FindParm at vtable +0x28): AppendParm 5 (after CreateCmdLine x2,
-// GetCmdLine, CheckParm, RemoveParm), FindParm 10.
+// ICommandLine slots, the same in GMod x64, L4D2 x86 and Half-Life 2 RTX x86
+// (L4D2's engine calls FindParm at vtable +0x28, Half-Life 2 RTX's shader API
+// too, and its tier0's CheckParm, slot 3): AppendParm 5 (after CreateCmdLine
+// x2, GetCmdLine, CheckParm, RemoveParm), FindParm 10.
 void appendSwitch(const char *name) {
   HMODULE tier0 = GetModuleHandleW(L"tier0.dll");
   auto get = tier0 ? reinterpret_cast<void *(*)()>(GetProcAddress(tier0, "CommandLine_Tier0")) : nullptr;
@@ -115,11 +118,13 @@ void appendSwitch(const char *name) {
 }
 
 void forceSwitches() {
-#ifdef PROXY_GAME_GMOD
+#if defined(PROXY_GAME_GMOD) || defined(PROXY_GAME_HL2RTX)
   // The proxy hooks the original's import of d3d9!Direct3DCreate9. Without
   // -nod3d9ex the shader API asks d3d9.dll for Direct3DCreate9Ex instead (by
   // name, at run time) and creates an IDirect3DDevice9Ex nothing here sees:
-  // the game then runs without the proxy's D3D hooks.
+  // the game then runs without the proxy's D3D hooks. (Half-Life 2 RTX's
+  // shader API is SDK 2013's in this: CShaderDeviceMgrDx8 asks FindParm for
+  // -nod3d9ex, then GetProcAddress(d3d9, "Direct3DCreate9Ex").)
   appendSwitch("-nod3d9ex");
 #else
   // L4D2 (l4d2-rtx's proxy saw the plain device without -nod3d9ex): the proxy
@@ -232,28 +237,30 @@ void PROXY_THISCALL shaderUtilRestoreShaderObjects(proxy::Wrapper *self, CreateI
   proxy::original<Fn>(self, 12)(self->real, factory ? restoreFactory : nullptr, flags);
 }
 
-// IShaderAPI (ShaderApi030) slot 127: void SetLight(int lightNum,
-// const LightDesc_t &desc) (copies 88 bytes into its light array). SDK 2013
-// sets the model lights one at a time; L4D2's IShaderAPIDX8 slot 88 is
-// void SetLights(int nCount, const LightDesc_t *pDesc), an array (game.h).
+// IShaderAPI (ShaderApi030) slot 127 (Half-Life 2 RTX 126): void
+// SetLight(int lightNum, const LightDesc_t &desc) (copies 88 bytes into its
+// light array). SDK 2013 sets the model lights one at a time; L4D2's
+// IShaderAPIDX8 slot 88 is void SetLights(int nCount, const LightDesc_t
+// *pDesc), an array (game.h).
 void PROXY_THISCALL shaderApiSetLight(proxy::Wrapper *self, int index, const void *desc) {
   using Fn = void(PROXY_THISCALL *)(void *, int, const void *);
   proxy::remix::onSetLights(proxy::game::kSetLightsArray ? index : 1, desc);
   proxy::original<Fn>(self, proxy::game::kSlotSetLight)(self->real, index, desc);
 }
 
-// IShaderAPI slot 114 (L4D2 76): void Bind(IMaterial *pMaterial): the
-// material of the draws that follow (GMod: those buffered for the previous one
-// are flushed inside). Hooked only when engine_materials validated the slot.
+// IShaderAPI slot 114 (L4D2 76, Half-Life 2 RTX 113): void Bind(IMaterial
+// *pMaterial): the material of the draws that follow (GMod, Half-Life 2 RTX:
+// those buffered for the previous one are flushed inside). Hooked only when
+// engine_materials validated the slot.
 void PROXY_THISCALL shaderApiBind(proxy::Wrapper *self, void *material) {
   using Fn = void(PROXY_THISCALL *)(void *, void *);
   proxy::original<Fn>(self, proxy::game::kSlotBind)(self->real, material);
   proxy::engine_materials::onBind(material);
 }
 
-// IShaderAPI slot 216 (L4D2 181): void SetPIXMarker(unsigned long color,
-// const char *name) (an empty stub in release builds). Markers
-// "openremix:..." are ours.
+// IShaderAPI slot 216 (L4D2 181, Half-Life 2 RTX 215): void
+// SetPIXMarker(unsigned long color, const char *name) (an empty stub in
+// release builds). Markers "openremix:..." are ours.
 void PROXY_THISCALL shaderApiSetPIXMarker(proxy::Wrapper *self, unsigned long color, const char *name) {
   using Fn = void(PROXY_THISCALL *)(void *, unsigned long, const char *);
   if (proxy::remix::onMarker(name))
@@ -276,7 +283,7 @@ const KnownInterface kKnown[] = {
      }},
     {proxy::game::kShaderApiInterface,
      [](proxy::Kind *k) {
-#ifdef PROXY_GAME_L4D2
+#ifndef PROXY_GAME_GMOD
        k->slotNames.assign(proxy::slots::kShaderApi, proxy::slots::kShaderApi + std::size(proxy::slots::kShaderApi));
 #endif
        proxy::setHook(k, proxy::game::kSlotSetLight, reinterpret_cast<void *>(&shaderApiSetLight));
@@ -769,8 +776,8 @@ void hookFileOpens() {
       reinterpret_cast<void *>(g_createFileW));
 }
 #else
-// L4D2: neither the remembered misses nor the video options' layout (GMod's
-// GameUI build, its search paths); the opens are not counted.
+// L4D2, Half-Life 2 RTX: neither the remembered misses nor the video options'
+// layout (GMod's GameUI build, its search paths); the opens are not counted.
 void hookFileOpens() {}
 #endif
 

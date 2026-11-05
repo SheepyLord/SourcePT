@@ -1,12 +1,13 @@
 // The GMod-only modules' entry points for the builds that do not have them
-// (Left 4 Dead 2): engine_patches, engine_nocull, engine_shadows and
-// engine_lights patch one build of GMod's x64 engine.dll and client.dll. Each
-// is off here, as it is on GMod when it does not validate.
+// (Left 4 Dead 2, Half-Life 2 RTX): engine_patches, engine_nocull,
+// engine_shadows and engine_lights patch one build of GMod's x64 engine.dll
+// and client.dll. Each is off here, as it is on GMod when it does not
+// validate.
 //
 // L4D2 has its own engine side (l4d2.h): engine::install (l4d2_engine.cpp:
 // world lists, overlays, static props, the map, cvars, anti-culling,
-// flashlights) and remix_ui (l4d2_ui.cpp: the runtime's UI in the bridge
-// host, F12).
+// flashlights). Half-Life 2 RTX has none yet (hl2rtx_engine.cpp). Both have
+// remix_ui (bridge_ui.cpp: the runtime's UI in the bridge host, F12).
 #include "engine_lights.h"
 #include "engine_nocull.h"
 #include "engine_patches.h"

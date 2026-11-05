@@ -6,6 +6,7 @@
 #include "sky_faces.h"
 
 #include "bsp_world.h"
+#include "game.h"
 #include "remix_output.h"
 #include "vertex_program.h"
 #include "dxvk_hash.h"
@@ -44,8 +45,14 @@ enum : unsigned {
   kSetRenderTarget = 37,
   kSetViewport = 47,
   kClear = 43,
+  kSetTransform = 44,
+  kMultiplyTransform = 46,
+  kSetMaterial = 49,
+  kSetLight = 51,
+  kLightEnable = 53,
   kSetRenderState = 57,
   kSetTexture = 65,
+  kSetTextureStageState = 67,
   kSetSamplerState = 69,
   kSetScissorRect = 75,
   kDrawPrimitive = 81,
@@ -53,6 +60,7 @@ enum : unsigned {
   kDrawPrimitiveUP = 83,
   kDrawIndexedPrimitiveUP = 84,
   kSetVertexDeclaration = 87,
+  kSetFVF = 89,
   kCreateVertexShader = 91,
   kSetVertexShader = 92,
   kSetVertexShaderConstantF = 94,
@@ -112,6 +120,8 @@ struct Stats {
   std::atomic<uint64_t> usPresent{0}, usLock{0};
   std::atomic<uint32_t> frames{0}, dip{0}, dp{0}, dipUP{0}, dpUP{0}, depthDraws{0}, occlusionQueries{0}, occluderDraws{0}, occluderClears{0}, queriesVisible{0}, queriesHidden{0}, rtChanges{0}, textureBinds{0};
   std::atomic<uint32_t> vsConstCalls{0}, streamSets{0}, partialTextureLocks{0};
+  // Fixed-function state calls (game::kFixedFunction) and the draws without a vertex shader.
+  std::atomic<uint32_t> setTransforms{0}, setFVFs{0}, stageStates{0}, setLights{0}, fixedDraws{0}, fvfDraws{0};
   std::atomic<uint32_t> vertexPrograms{0}; // vertex shaders decoded since launch
   std::atomic<uint64_t> dipPrims{0};
   std::atomic<uint64_t> shadowBytes{0}, shadowCopies{0}, wholeLocks{0}, usShadow{0};
@@ -500,6 +510,124 @@ DWORD g_samplerStates[16][16] = {};         // [sampler][D3DSAMPLERSTATETYPE]
 D3DVIEWPORT9 g_viewport = {};
 RECT g_scissor = {};
 DWORD g_renderStates[256] = {};
+// Fixed-function state (game::kFixedFunction; its hooks are installed only
+// there): transforms, texture stage states, the layout SetFVF set, the
+// material and lights. Render thread.
+namespace ff {
+float g_worlds[256][16];       // D3DTS_WORLDMATRIX(n)
+float g_view[16], g_projection[16];
+float g_textures[8][16];       // D3DTS_TEXTURE0..7
+DWORD g_stages[8][33] = {};    // [stage][D3DTEXTURESTAGESTATETYPE]
+uint32_t g_worldsSet = 1;      // highest WORLDMATRIX index set, + 1
+uint32_t g_worldDraw[256] = {}; // the fixed-function draw count when WORLDMATRIX(n) was last set (probe)
+uint32_t g_ffDraws = 0;        // fixed-function draws captured
+DWORD g_fvf = 0;
+bool g_fvfLayout = false;      // SetFVF came after the last SetVertexDeclaration
+D3DMATERIAL9 g_material = {};
+D3DLIGHT9 g_lights[32] = {};
+uint32_t g_lightsEnabled = 0;
+remix::FixedFunction g_state;  // points at the above
+// SetFVF's layouts as vertex declarations (D3DFVF_* to D3DVERTEXELEMENT9),
+// made once per FVF; their address stands for the declaration.
+std::unordered_map<DWORD, std::vector<D3DVERTEXELEMENT9>> g_fvfElements;
+
+void setIdentity(float *m) {
+  std::fill_n(m, 16, 0.0f);
+  m[0] = m[5] = m[10] = m[15] = 1;
+}
+
+// Row-major 4x4: out = a * b.
+void multiply(const float *a, const float *b, float *out) {
+  for (int r = 0; r < 4; ++r)
+    for (int c = 0; c < 4; ++c) {
+      float v = 0;
+      for (int k = 0; k < 4; ++k)
+        v += a[r * 4 + k] * b[k * 4 + c];
+      out[r * 4 + c] = v;
+    }
+}
+
+// D3D's defaults (a new or reset device).
+void reset() {
+  for (auto &m : g_worlds)
+    setIdentity(m);
+  for (auto &m : g_textures)
+    setIdentity(m);
+  setIdentity(g_view);
+  setIdentity(g_projection);
+  g_worldsSet = 1;
+  for (DWORD s = 0; s < 8; ++s) {
+    DWORD *t = g_stages[s];
+    std::fill_n(t, 33, 0u);
+    t[D3DTSS_COLOROP] = s == 0 ? D3DTOP_MODULATE : D3DTOP_DISABLE;
+    t[D3DTSS_COLORARG1] = D3DTA_TEXTURE;
+    t[D3DTSS_COLORARG2] = D3DTA_CURRENT;
+    t[D3DTSS_ALPHAOP] = s == 0 ? D3DTOP_SELECTARG1 : D3DTOP_DISABLE;
+    t[D3DTSS_ALPHAARG1] = D3DTA_TEXTURE;
+    t[D3DTSS_ALPHAARG2] = D3DTA_CURRENT;
+    t[D3DTSS_TEXCOORDINDEX] = s;
+    t[D3DTSS_TEXTURETRANSFORMFLAGS] = D3DTTFF_DISABLE;
+  }
+  g_fvf = 0;
+  g_fvfLayout = false;
+  g_lightsEnabled = 0;
+  // Render states whose default is not 0 that the conversion reads.
+  g_renderStates[D3DRS_LIGHTING] = TRUE;
+  g_renderStates[D3DRS_TEXTUREFACTOR] = 0xffffffff;
+  g_renderStates[D3DRS_COLORVERTEX] = TRUE;
+  g_renderStates[D3DRS_DIFFUSEMATERIALSOURCE] = D3DMCS_COLOR1;
+  g_renderStates[D3DRS_SPECULARMATERIALSOURCE] = D3DMCS_COLOR2;
+  g_renderStates[D3DRS_FOGVERTEXMODE] = D3DFOG_NONE;
+}
+
+// The vertex declaration D3D makes of an FVF.
+const std::vector<D3DVERTEXELEMENT9> &fvfElements(DWORD fvf) {
+  auto it = g_fvfElements.find(fvf);
+  if (it != g_fvfElements.end())
+    return it->second;
+  std::vector<D3DVERTEXELEMENT9> e;
+  WORD offset = 0;
+  auto add = [&](BYTE type, BYTE usage, BYTE index, WORD bytes) {
+    e.push_back({0, offset, type, D3DDECLMETHOD_DEFAULT, usage, index});
+    offset = WORD(offset + bytes);
+  };
+  const DWORD position = fvf & D3DFVF_POSITION_MASK;
+  if (position == D3DFVF_XYZRHW)
+    add(D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_POSITIONT, 0, 16);
+  else if (position == D3DFVF_XYZW)
+    add(D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_POSITION, 0, 16);
+  else if (position)
+    add(D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 12);
+  // XYZB1..B5: betas after the position, the last of them the blend indices
+  // with D3DFVF_LASTBETA_UBYTE4 / _D3DCOLOR.
+  if (position >= D3DFVF_XYZB1 && position <= D3DFVF_XYZB5) {
+    int betas = int((position - D3DFVF_XYZB1) / 2) + 1;
+    const bool indices = (fvf & (D3DFVF_LASTBETA_UBYTE4 | D3DFVF_LASTBETA_D3DCOLOR)) != 0;
+    const int weights = betas - (indices ? 1 : 0);
+    if (weights > 0)
+      add(BYTE(D3DDECLTYPE_FLOAT1 + std::min(weights, 4) - 1), D3DDECLUSAGE_BLENDWEIGHT, 0, WORD(weights * 4));
+    if (indices)
+      add((fvf & D3DFVF_LASTBETA_D3DCOLOR) ? D3DDECLTYPE_D3DCOLOR : D3DDECLTYPE_UBYTE4, D3DDECLUSAGE_BLENDINDICES, 0, 4);
+  }
+  if (fvf & D3DFVF_NORMAL)
+    add(D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_NORMAL, 0, 12);
+  if (fvf & D3DFVF_PSIZE)
+    add(D3DDECLTYPE_FLOAT1, D3DDECLUSAGE_PSIZE, 0, 4);
+  if (fvf & D3DFVF_DIFFUSE)
+    add(D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR, 0, 4);
+  if (fvf & D3DFVF_SPECULAR)
+    add(D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR, 1, 4);
+  const DWORD texcoords = std::min<DWORD>((fvf & D3DFVF_TEXCOUNT_MASK) >> D3DFVF_TEXCOUNT_SHIFT, 8);
+  for (DWORD i = 0; i < texcoords; ++i) {
+    // D3DFVF_TEXCOORDSIZEn: 0 two floats, 1 three, 2 four, 3 one.
+    static const BYTE sizes[4] = {2, 3, 4, 1};
+    const BYTE n = sizes[(fvf >> (16 + i * 2)) & 3];
+    add(BYTE(D3DDECLTYPE_FLOAT1 + n - 1), D3DDECLUSAGE_TEXCOORD, BYTE(i), WORD(n * 4));
+  }
+  e.push_back(D3DVERTEXELEMENT9{0xff, 0, D3DDECLTYPE_UNUSED, 0, 0, 0}); // D3DDECL_END
+  return g_fvfElements.emplace(fvf, std::move(e)).first->second;
+}
+} // namespace ff
 // Vertex shaders decoded at creation (vsprog): the draws whose shader builds
 // the geometry (particles) are run through it on the CPU. A shader object's
 // address is reused after its release, by a shader created anew.
@@ -724,6 +852,8 @@ HRESULT STDMETHODCALLTYPE reset(IDirect3DDevice9 *dev, D3DPRESENT_PARAMETERS *pp
   const HRESULT hr = g_reset(dev, pp);
   if (SUCCEEDED(hr))
     refreshBackBuffer(dev);
+  if (SUCCEEDED(hr) && game::kFixedFunction)
+    ff::reset(); // Reset returns the device to D3D's defaults
   return hr;
 }
 
@@ -823,6 +953,92 @@ HRESULT STDMETHODCALLTYPE setRenderState(IDirect3DDevice9 *dev, D3DRENDERSTATETY
   return g_setRenderState(dev, state, value);
 }
 
+// --- Fixed-function state (game::kFixedFunction) ---------------------------
+using SetTransformFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, D3DTRANSFORMSTATETYPE, const D3DMATRIX *);
+using SetFVFFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, DWORD);
+using SetTextureStageStateFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, DWORD, D3DTEXTURESTAGESTATETYPE,
+                                                            DWORD);
+using SetMaterialFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, const D3DMATERIAL9 *);
+using SetLightFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, DWORD, const D3DLIGHT9 *);
+using LightEnableFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DDevice9 *, DWORD, BOOL);
+SetTransformFn g_setTransform = nullptr, g_multiplyTransform = nullptr;
+SetFVFFn g_setFVF = nullptr;
+SetTextureStageStateFn g_setTextureStageState = nullptr;
+SetMaterialFn g_setMaterial = nullptr;
+SetLightFn g_setLight = nullptr;
+LightEnableFn g_lightEnable = nullptr;
+
+// The tracked matrix of a transform state (nullptr: not one the proxy keeps).
+float *transformSlot(D3DTRANSFORMSTATETYPE state) {
+  const unsigned s = unsigned(state);
+  if (s == D3DTS_VIEW)
+    return ff::g_view;
+  if (s == D3DTS_PROJECTION)
+    return ff::g_projection;
+  if (s >= D3DTS_TEXTURE0 && s <= D3DTS_TEXTURE7)
+    return ff::g_textures[s - D3DTS_TEXTURE0];
+  if (s >= 256 && s < 512) {
+    ff::g_worldsSet = std::max(ff::g_worldsSet, s - 255);
+    ff::g_worldDraw[s - 256] = ff::g_ffDraws;
+    return ff::g_worlds[s - 256];
+  }
+  return nullptr;
+}
+
+HRESULT STDMETHODCALLTYPE setTransform(IDirect3DDevice9 *dev, D3DTRANSFORMSTATETYPE state, const D3DMATRIX *m) {
+  ++g_stats.setTransforms;
+  if (m)
+    if (float *to = transformSlot(state))
+      std::memcpy(to, m, 64);
+  return g_setTransform(dev, state, m);
+}
+
+// D3D: the state becomes m x state.
+HRESULT STDMETHODCALLTYPE multiplyTransform(IDirect3DDevice9 *dev, D3DTRANSFORMSTATETYPE state, const D3DMATRIX *m) {
+  ++g_stats.setTransforms;
+  if (m)
+    if (float *to = transformSlot(state)) {
+      float product[16];
+      ff::multiply(&m->m[0][0], to, product);
+      std::memcpy(to, product, 64);
+    }
+  return g_multiplyTransform(dev, state, m);
+}
+
+HRESULT STDMETHODCALLTYPE setFVF(IDirect3DDevice9 *dev, DWORD fvf) {
+  ++g_stats.setFVFs;
+  ff::g_fvf = fvf;
+  ff::g_fvfLayout = true;
+  return g_setFVF(dev, fvf);
+}
+
+HRESULT STDMETHODCALLTYPE setTextureStageState(IDirect3DDevice9 *dev, DWORD stage, D3DTEXTURESTAGESTATETYPE type,
+                                               DWORD value) {
+  ++g_stats.stageStates;
+  if (stage < 8 && unsigned(type) < 33)
+    ff::g_stages[stage][type] = value;
+  return g_setTextureStageState(dev, stage, type, value);
+}
+
+HRESULT STDMETHODCALLTYPE setMaterial(IDirect3DDevice9 *dev, const D3DMATERIAL9 *material) {
+  if (material)
+    ff::g_material = *material;
+  return g_setMaterial(dev, material);
+}
+
+HRESULT STDMETHODCALLTYPE setLight(IDirect3DDevice9 *dev, DWORD index, const D3DLIGHT9 *light) {
+  ++g_stats.setLights;
+  if (light && index < 32)
+    ff::g_lights[index] = *light;
+  return g_setLight(dev, index, light);
+}
+
+HRESULT STDMETHODCALLTYPE lightEnable(IDirect3DDevice9 *dev, DWORD index, BOOL enable) {
+  if (index < 32)
+    ff::g_lightsEnabled = (ff::g_lightsEnabled & ~(1u << index)) | (enable ? 1u << index : 0u);
+  return g_lightEnable(dev, index, enable);
+}
+
 HRESULT STDMETHODCALLTYPE setTexture(IDirect3DDevice9 *dev, DWORD stage, IDirect3DBaseTexture9 *texture) {
   ++g_stats.textureBinds;
   if (stage == 0)
@@ -840,6 +1056,7 @@ HRESULT STDMETHODCALLTYPE setTexture(IDirect3DDevice9 *dev, DWORD stage, IDirect
 
 HRESULT STDMETHODCALLTYPE setVertexDeclaration(IDirect3DDevice9 *dev, IDirect3DVertexDeclaration9 *decl) {
   g_decl = decl;
+  ff::g_fvfLayout = false;
   if (decl && !g_declElements.count(decl)) {
     D3DVERTEXELEMENT9 elems[MAXD3DDECLLENGTH + 1];
     UINT n = 0;
@@ -1046,10 +1263,12 @@ void drawOccluders(IDirect3DDevice9 *dev) {
   }
   g_setVertexShader(dev, nullptr); // past the hook: the state block restores the shader, and its tracking would not see that
   dev->SetPixelShader(nullptr);
-  dev->SetFVF(D3DFVF_XYZ);
-  dev->SetTransform(D3DTS_WORLD, &identity);
-  dev->SetTransform(D3DTS_VIEW, &identity);
-  dev->SetTransform(D3DTS_PROJECTION, &projection);
+  // Past the fixed-function hooks where they are installed: the state block
+  // restores the device, and their tracking would not see that.
+  g_setFVF ? g_setFVF(dev, D3DFVF_XYZ) : dev->SetFVF(D3DFVF_XYZ);
+  for (auto [state, matrix] : {std::pair{D3DTS_WORLD, &identity}, std::pair{D3DTS_VIEW, &identity},
+                               std::pair{D3DTS_PROJECTION, &projection}})
+    g_setTransform ? g_setTransform(dev, state, matrix) : dev->SetTransform(state, matrix);
   static const std::pair<D3DRENDERSTATETYPE, DWORD> states[] = {
       {D3DRS_ZENABLE, D3DZB_TRUE}, {D3DRS_ZWRITEENABLE, TRUE}, {D3DRS_ZFUNC, D3DCMP_LESSEQUAL},
       {D3DRS_COLORWRITEENABLE, 0}, {D3DRS_CULLMODE, D3DCULL_NONE}, {D3DRS_ALPHABLENDENABLE, FALSE},
@@ -1135,9 +1354,22 @@ HRESULT STDMETHODCALLTYPE createQuery(IDirect3DDevice9 *dev, D3DQUERYTYPE type, 
 // draw instead (captured into the sky faces, not submitted).
 bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numVertices, UINT startIndex,
                  UINT primCount) {
-  auto decl = g_declElements.find(g_decl);
-  if (decl == g_declElements.end())
-    return false;
+  // No vertex shader, where the game draws that way: its fixed-function state
+  // goes along, and the layout may be SetFVF's.
+  const bool fixedFunction = game::kFixedFunction && !g_vertexShader;
+  const D3DVERTEXELEMENT9 *elements = nullptr;
+  const void *declaration = g_decl;
+  if (fixedFunction && ff::g_fvfLayout) {
+    const auto &e = ff::fvfElements(ff::g_fvf);
+    elements = e.data();
+    declaration = &e;
+    ++g_stats.fvfDraws;
+  } else {
+    auto decl = g_declElements.find(g_decl);
+    if (decl == g_declElements.end())
+      return false;
+    elements = decl->second.data();
+  }
   remix::Draw d;
   d.type = type;
   d.baseVertex = baseVertex;
@@ -1201,8 +1433,26 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
   d.scissor = g_scissor;
   d.scissorTest = g_renderStates[D3DRS_SCISSORTESTENABLE] != 0;
   d.forkCategories = g_renderStates[42]; // unused by D3D9; dxvk-remix fork category tag
-  d.elements = decl->second.data();
-  d.declaration = g_decl;
+  d.elements = elements;
+  d.declaration = declaration;
+  if (fixedFunction) {
+    ++g_stats.fixedDraws;
+    auto &f = ff::g_state;
+    f.worlds = ff::g_worlds;
+    f.view = ff::g_view;
+    f.projection = ff::g_projection;
+    f.textures = ff::g_textures;
+    f.stages = ff::g_stages;
+    f.renderStates = g_renderStates;
+    f.fvf = ff::g_fvfLayout ? ff::g_fvf : 0;
+    f.worldsSet = ff::g_worldsSet;
+    f.worldDraw = ff::g_worldDraw;
+    f.draw = ++ff::g_ffDraws;
+    f.material = &ff::g_material;
+    f.lights = ff::g_lights;
+    f.lightsEnabled = ff::g_lightsEnabled;
+    d.fixedFunction = &f;
+  }
   // The shadow lock stays held while the mesh is built from the shadows.
   std::lock_guard<std::mutex> lock(g_shadowLock);
   for (int i = 0; i < 4; ++i) {
@@ -1222,7 +1472,7 @@ bool captureDraw(D3DPRIMITIVETYPE type, INT baseVertex, UINT minIndex, UINT numV
   if (it != g_shadows.end())
     d.indices = {it->second.data.data(), uint32_t(it->second.data.size()), it->second.is32, g_indices,
                  it->second.version, it->second.dynamic};
-  if (remix::isSkyDraw(d))
+  if (!fixedFunction && remix::isSkyDraw(d)) // the capture replays the draw with its shader's constants
     return true;
   remix::onDraw(d);
   return false;
@@ -1749,6 +1999,15 @@ void hookDevice(IDirect3DDevice9 *device) {
   hookSlot(vt, kSetStreamSource, &setStreamSource, g_setStreamSource);
   hookSlot(vt, kSetIndices, &setIndices, g_setIndices);
   hookSlot(vt, kCreateQuery, &createQuery, g_createQuery);
+  if (game::kFixedFunction) {
+    hookSlot(vt, kSetTransform, &setTransform, g_setTransform);
+    hookSlot(vt, kMultiplyTransform, &multiplyTransform, g_multiplyTransform);
+    hookSlot(vt, kSetFVF, &setFVF, g_setFVF);
+    hookSlot(vt, kSetTextureStageState, &setTextureStageState, g_setTextureStageState);
+    hookSlot(vt, kSetMaterial, &setMaterial, g_setMaterial);
+    hookSlot(vt, kSetLight, &setLight, g_setLight);
+    hookSlot(vt, kLightEnable, &lightEnable, g_lightEnable);
+  }
 }
 
 HRESULT STDMETHODCALLTYPE createDevice(IDirect3D9 *d3d, UINT adapter, D3DDEVTYPE type, HWND focus, DWORD flags,
@@ -1773,6 +2032,8 @@ HRESULT STDMETHODCALLTYPE createDevice(IDirect3D9 *d3d, UINT adapter, D3DDEVTYPE
     g_renderStates[D3DRS_DESTBLENDALPHA] = D3DBLEND_ZERO;
     g_renderStates[D3DRS_BLENDOPALPHA] = D3DBLENDOP_ADD;
     g_renderStates[D3DRS_ALPHAFUNC] = D3DCMP_ALWAYS;
+    if (game::kFixedFunction)
+      ff::reset();
     remix::onDeviceCreated(*out);
   }
   return hr;
@@ -1891,6 +2152,13 @@ void dumpStatistics(FILE *out) {
   fprintf(out, "   RT changes %.1f, SetTexture %.1f, SetStreamSource %.1f, SetVSConstF %.1f\n",
           g_stats.rtChanges.exchange(0) / f, g_stats.textureBinds.exchange(0) / f, g_stats.streamSets.exchange(0) / f,
           g_stats.vsConstCalls.exchange(0) / f);
+  if (game::kFixedFunction)
+    fprintf(out, "   fixed function: DIP without a vertex shader %.1f (layout from SetFVF %.1f) | SetTransform %.1f, "
+                 "SetFVF %.1f, SetTextureStageState %.1f, SetLight %.1f per frame; world matrices set since launch %u; "
+                 "lights enabled now %08X\n",
+            g_stats.fixedDraws.exchange(0) / f, g_stats.fvfDraws.exchange(0) / f, g_stats.setTransforms.exchange(0) / f,
+            g_stats.setFVFs.exchange(0) / f, g_stats.stageStates.exchange(0) / f, g_stats.setLights.exchange(0) / f,
+            ff::g_worldsSet, ff::g_lightsEnabled);
   {
     std::lock_guard<std::mutex> lock(g_vertexProgramLock);
     size_t runnable = 0, expanding = 0;
