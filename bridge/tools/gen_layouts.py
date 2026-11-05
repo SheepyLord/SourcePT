@@ -37,6 +37,7 @@ ARRAYS = {
     ('remixapi_HostPassEXT', 'vertexBindings'): 'vertexBindingCount',
     ('remixapi_HostPassEXT', 'attributes'): 'attributeCount',
     ('remixapi_HostPassEXT', 'indices'): 'indexCount',
+    ('remixapi_HostPassListFlagsEXT', 'flags'): 'flagCount',
 }
 # Raw bytes; checked before the char* -> CSTR rule (an IES profile is not
 # NUL-terminated).

@@ -1,7 +1,7 @@
 // Left 4 Dead 2: the survivors' flashlights as Remix lights (l4d2-rtx
 // main_module.cpp iterate_entities, remix_api.cpp flashlight_frame, the
 // game_settings defaults). Source's own projected flashlight is off
-// (r_flashlightrender 0, l4d2_engine's cvars).
+// (r_flashlightrender 0, x86_engine's cvars).
 //
 // Each lit flashlight is two sphere lights with light shaping at the eye,
 // moved by an offset along the view axes: a wide outer cone and a narrow
@@ -84,25 +84,8 @@ uint64_t fnv(const void *data, size_t n, uint64_t h = 0xcbf29ce484222325ull) {
   return h;
 }
 
-// RecvTable {props, count, decoder, name}; RecvProp (0x3C bytes) {name,
-// .., data table +0x28, offset +0x2C, ..}. Depth first, base classes first.
-int findProp(const uint8_t *table, const char *name, int base, int depth) {
-  if (!table || depth > 16)
-    return -1;
-  const uint8_t *props = read<const uint8_t *>(table, 0);
-  const int count = read<int>(table, 4);
-  for (int i = 0; i < count && i < 4096; ++i) {
-    const uint8_t *prop = props + size_t(i) * 0x3C;
-    const char *propName = read<const char *>(prop, 0);
-    const int offset = read<int>(prop, 0x2C);
-    if (propName && std::strcmp(propName, name) == 0)
-      return base + offset;
-    if (const uint8_t *child = read<const uint8_t *>(prop, 0x28))
-      if (const int found = findProp(child, name, base + offset, depth + 1); found >= 0)
-        return found;
-  }
-  return -1;
-}
+// The receive tables' offsets (pe_module.h).
+int findProp(const uint8_t *table, const char *name, int, int) { return x86::findNetProp(table, name); }
 
 bool finite3(const float *v) { return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]); }
 

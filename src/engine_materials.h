@@ -52,10 +52,11 @@ float fresnelShare(float minimum, float maximum, float exponent);
 // Validates the engine's material classes and IShaderAPI::Bind (the real
 // shader API's vtable). False: nothing is read, every draw is Lit.
 //
-// Left 4 Dead 2, Half-Life 2 RTX: the lookup is installed and read at every
-// Bind (statistics, dev dumps), and its answers reach the rest of the proxy
-// as OPENREMIX_PROXY_MATERIALS says: 0 none, every query below answers "not
-// known"; 1 all (the default); or a comma list of the queries' groups:
+// Left 4 Dead 2, Half-Life 2 RTX, Portal 2: the lookup is installed and read
+// at every Bind (statistics, dev dumps), and its answers reach the rest of
+// the proxy as OPENREMIX_PROXY_MATERIALS says: 0 none, every query below
+// answers "not known"; 1 all (the default); or a comma list of the queries'
+// groups:
 //   bound    bound(), currentIsLitOpaque()          (decals, shaders by name)
 //   name     currentName()                          (particle paths, host passes)
 //   shading  current(), remix::onMaterialBound      (unlit, self-illum, PBR)

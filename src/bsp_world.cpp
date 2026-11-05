@@ -15,6 +15,7 @@
 #include <remix/remix_native_ext.h>
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <array>
@@ -29,6 +30,8 @@ namespace proxy::bsp {
 namespace {
 
 // --- BSP (version 21, Left 4 Dead 2 lump order) -----------------------------
+// Portal 2's maps are L4D2's format (v21, sprp v9 placements of 72 bytes, the
+// same lump versions, HDR lighting only) with the standard lump_t order.
 enum Lump {
   kEntities = 0,
   kPlanes = 1,
@@ -136,13 +139,17 @@ public:
   std::vector<uint8_t> data;
   bool open(const std::wstring &path) {
     FILE *f = _wfopen(path.c_str(), L"rb");
-    if (!f)
+    if (!f) {
+      error = "cannot open the map file";
       return false;
+    }
     _fseeki64(f, 0, SEEK_END);
     data.resize(size_t(_ftelli64(f)));
     _fseeki64(f, 0, SEEK_SET);
     const bool ok = fread(data.data(), 1, data.size(), f) == data.size();
     fclose(f);
+    if (!ok)
+      error = "cannot read the map file";
     return ok && parse();
   }
   // A map read through the file system (e.g. from a workshop addon).
@@ -152,15 +159,19 @@ public:
   }
   bool parse() {
     int32_t version = 0;
-    if (data.size() < 1036 || std::memcmp(data.data(), "VBSP", 4) != 0)
+    if (data.size() < 1036 || std::memcmp(data.data(), "VBSP", 4) != 0) {
+      error = "not a VBSP file";
       return false;
+    }
     std::memcpy(&version, data.data() + 4, 4);
-    if (version < 19 || version > 21)
+    if (version < 19 || version > 21) {
+      error = "BSP version not 19 to 21";
       return false;
+    }
     // lump_t is {fileofs, filelen, version, fourCC} up to v20 (GMod maps).
     // Left 4 Dead 2's v21 puts the version first; other v21 maps (TF2, CS:GO
-    // era) keep the standard order. As NikNaks: a first field of at most 8
-    // in lump 0 (planes) is a version, not a file offset.
+    // era, Portal 2's) keep the standard order. As NikNaks: a first field of
+    // at most 8 in lump 0 (planes) is a version, not a file offset.
     int32_t first;
     std::memcpy(&first, data.data() + 8, 4);
     versionFirst = version == 21 && first >= 0 && first <= 8;
@@ -178,6 +189,7 @@ public:
     return true;
   }
   bool versionFirst = false;
+  const char *error = "not read"; // why parse failed
   std::vector<std::vector<uint8_t>> unpacked; // decoded compressed lumps, by index
   std::vector<int> compressed;                // their indices
   // A lump's place in the file (as stored: compressed or not).
@@ -877,6 +889,8 @@ struct World {
   uint32_t lodEntities = 0, lodFaces = 0, lodLeft = 0;
 } g_world;
 bool g_active = false;
+// Why the BSP world is inactive, for the statistics (a literal).
+std::atomic<const char *> g_inactiveReason{"no map loaded yet"};
 
 // The static props' placements for providesProp(), which other threads call
 // (l4d2-rtx's model hook on the game thread while the render thread may be
@@ -3101,6 +3115,7 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap) {
   g_active = false;
   g_detailMaterial = kDefaultDetailMaterial;
   if (mapName.empty()) {
+    g_inactiveReason = "no map";
     sendPartition(nullptr);
     return false;
   }
@@ -3110,18 +3125,23 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap) {
   const std::string file = "maps/" + lower(mapName) + ".bsp";
   const std::wstring path = fs::locate(file);
   std::vector<uint8_t> bytes;
-  if (path.empty() ? !(fs::read(file, bytes) && bsp.open(std::move(bytes))) : !bsp.open(path)) {
+  const bool found = !path.empty() || fs::read(file, bytes);
+  if (!found || !(path.empty() ? bsp.open(std::move(bytes)) : bsp.open(path))) {
+    g_inactiveReason = found ? bsp.error : "map file not found in the search paths";
     sendPartition(nullptr);
     return false;
   }
   sendPartition(&bsp);
   parseDetailMaterial(bsp); // with the BSP world or without it
-  if (!enabled)
+  if (!enabled) {
+    g_inactiveReason = "off (OPENREMIX_PROXY_BSP_WORLD=0)";
     return false;
+  }
   const auto [pak, pakBytes] = bsp.lump<uint8_t>(kPakfile);
   fs::setPakfile(pak ? std::vector<uint8_t>(pak, pak + pakBytes) : std::vector<uint8_t>());
   g_world.map = lower(mapName);
   g_active = build(bsp);
+  g_inactiveReason = g_active ? "" : "the map's lumps are missing or of other versions";
   if (g_active && !g_world.props.empty()) {
     auto index = std::make_shared<PropIndex>();
     index->cells = g_world.propCells;
@@ -3699,7 +3719,7 @@ void dumpStatistics(FILE *out) {
     fprintf(out, "   visibility partition: %u nodes, %u leaves, %u clusters -> %d\n", g_partition.nodes,
             g_partition.leaves, g_partition.clusters, g_partition.result);
   if (!g_active) {
-    fprintf(out, "   BSP world: inactive\n");
+    fprintf(out, "   BSP world: inactive (%s)\n", g_inactiveReason.load());
     return;
   }
   uint32_t resolved = 0, meshes = 0;

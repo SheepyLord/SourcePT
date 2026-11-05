@@ -1,10 +1,11 @@
 project('gmodrtx', ['cpp', 'c'], version: '0.1.0',
         default_options: ['cpp_std=c++17', 'warning_level=2', 'buildtype=release', 'b_ndebug=if-release'])
 
-# One tree, four games, chosen at configure time (-Dgame=, default by the
+# One tree, six games, chosen at configure time (-Dgame=, default by the
 # cross file): Garry's Mod x64 or Team Fortress 2 x64
-# (cross/x86_64-w64-mingw32.txt, -Dgame=tf2), Left 4 Dead 2 x86 or Half-Life 2
-# RTX x86 (cross/i686-w64-mingw32.txt, -Dgame=hl2rtx). src/game.h holds what
+# (cross/x86_64-w64-mingw32.txt, -Dgame=tf2), Left 4 Dead 2 x86, Half-Life 2
+# RTX x86 (-Dgame=hl2rtx), Entropy: Zero 2 x86 (-Dgame=ez2) or Portal 2 x86
+# (-Dgame=portal2) (cross/i686-w64-mingw32.txt). src/game.h holds what
 # differs.
 game = get_option('game')
 cpu = host_machine.cpu_family()
@@ -25,6 +26,9 @@ if game == 'hl2rtx' and cpu != 'x86'
 endif
 if game == 'ez2' and cpu != 'x86'
   error('the Entropy: Zero 2 proxy is a 32-bit DLL: configure with cross/i686-w64-mingw32.txt')
+endif
+if game == 'portal2' and cpu != 'x86'
+  error('the Portal 2 proxy is a 32-bit DLL: configure with cross/i686-w64-mingw32.txt')
 endif
 
 remix_inc = get_option('openremix_include')
@@ -86,10 +90,17 @@ else
     link_args += '-Wl,--enable-stdcall-fixup'
   endif
   if game == 'l4d2'
-    # L4D2's own engine side (src/l4d2.h).
+    # The x86 engine side (src/x86_engine.h) and L4D2's own (src/l4d2.h).
     cpp_args += '-DPROXY_GAME_L4D2'
-    sources += ['src/l4d2_engine.cpp', 'src/l4d2_cull.cpp', 'src/l4d2_lights.cpp', 'src/l4d2_infected.cpp']
+    sources += ['src/x86_engine.cpp', 'src/x86_cull.cpp', 'src/l4d2_lights.cpp', 'src/l4d2_infected.cpp']
     def_file = 'shaderapidx9_l4d2.def'
+  elif game == 'portal2'
+    # Portal 2: the x86 engine side with Portal 2's patterns (src/x86_engine.h)
+    # and GMod's projected textures (src/engine_lights.h: env_projectedtexture),
+    # the portals as ray portals (src/portal2.h).
+    cpp_args += '-DPROXY_GAME_PORTAL2'
+    sources += ['src/x86_engine.cpp', 'src/x86_cull.cpp', 'src/engine_lights.cpp', 'src/portal2_portals.cpp']
+    def_file = 'shaderapidx9_portal2.def'
   elif game == 'hl2rtx'
     # Half-Life 2 RTX: no engine side yet (src/hl2rtx_engine.cpp).
     cpp_args += '-DPROXY_GAME_HL2RTX'

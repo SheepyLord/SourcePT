@@ -213,8 +213,8 @@ void addEach(const std::wstring &directory) {
 // for what the proxy's index lacks: workshop addons (steamapps/workshop/.gma,
 // LZMA legacy archives), mounted games, downloads. Slots: Read 0, Open 2,
 // Close 3, Seek 4, Tell 5 (Size's two overloads are not relied on).
-// L4D2, Half-Life 2 RTX, TF2: not asked (its slots are not verified there);
-// the index is all.
+// L4D2, Half-Life 2 RTX, TF2, Portal 2: not asked (its slots are not verified
+// there); the index is all.
 void *engineFileSystem() {
   if (!game::kGMod)
     return nullptr;
@@ -325,6 +325,14 @@ void index() {
   addLoose(L"hl2");
   addLoose(L"platform");
   addLoose(L"tf\\download");
+#elif defined(PROXY_GAME_PORTAL2)
+  // portal2/gameinfo.txt has the mod alone ("|gameinfo_path|."); the engine
+  // mounts update and the DLC folders before it (the highest first, as L4D2
+  // does), platform after it. Each directory loose, then its pak01_dir.vpk.
+  for (const wchar_t *dir : {L"update", L"portal2_dlc2", L"portal2_dlc1", L"portal2", L"platform"}) {
+    addLoose(dir);
+    addVpk(std::wstring(dir) + L"\\pak01_dir.vpk");
+  }
 #elif defined(PROXY_GAME_HL2RTX)
   // hl2rtx/gameinfo.txt SearchPaths (game paths, in order): hl2rtx/custom/*,
   // the mod, Half-Life 2's packages, Mapbase's (mapbase_hl2/*, its shared

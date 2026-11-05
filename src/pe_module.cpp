@@ -188,6 +188,35 @@ bool writeJump(void *at, const void *target, size_t n) {
   return writeCode(at, code, n);
 }
 
+namespace {
+template <typename T> T readAt(const void *p, int offset) {
+  T value;
+  std::memcpy(&value, static_cast<const uint8_t *>(p) + offset, sizeof(T));
+  return value;
+}
+int findNetProp(const uint8_t *table, const char *name, int base, int depth) {
+  if (!table || depth > 16)
+    return -1;
+  const uint8_t *props = readAt<const uint8_t *>(table, 0);
+  const int count = readAt<int>(table, 4);
+  for (int i = 0; i < count && i < 4096; ++i) {
+    const uint8_t *prop = props + size_t(i) * 0x3C;
+    const char *propName = readAt<const char *>(prop, 0);
+    const int offset = readAt<int>(prop, 0x2C);
+    if (propName && std::strcmp(propName, name) == 0)
+      return base + offset;
+    if (const uint8_t *child = readAt<const uint8_t *>(prop, 0x28))
+      if (const int found = findNetProp(child, name, base + offset, depth + 1); found >= 0)
+        return found;
+  }
+  return -1;
+}
+} // namespace
+
+int findNetProp(const void *recvTable, const char *name) {
+  return findNetProp(static_cast<const uint8_t *>(recvTable), name, 0, 0);
+}
+
 bool envFlag(const char *name, bool fallback) {
   char full[96], v[8] = {};
   std::snprintf(full, sizeof(full), "OPENREMIX_PROXY_%s", name);

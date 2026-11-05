@@ -8,13 +8,14 @@
 // (meson option `game`): PROXY_GAME_GMOD, Garry's Mod x64 (bin/win64),
 // PROXY_GAME_TF2, Team Fortress 2 x64 (bin/x64), PROXY_GAME_L4D2, Left 4 Dead
 // 2 (x86), PROXY_GAME_HL2RTX, Half-Life 2 RTX (x86, a Mapbase mod on NVIDIA's
-// Portal RTX engine build), or PROXY_GAME_EZ2, Entropy : Zero 2 (x86, a
-// Mapbase mod on Source 2013). What differs between them is named here; the
-// rest of the proxy reads these instead of literals.
+// Portal RTX engine build), PROXY_GAME_EZ2, Entropy : Zero 2 (x86, a Mapbase
+// mod on Source 2013), or PROXY_GAME_PORTAL2, Portal 2 (x86, Valve's portal2
+// engine branch, L4D2's close relative). What differs between them is named
+// here; the rest of the proxy reads these instead of literals.
 #if defined(PROXY_GAME_GMOD) + defined(PROXY_GAME_TF2) + defined(PROXY_GAME_L4D2) + defined(PROXY_GAME_HL2RTX) + \
-        defined(PROXY_GAME_EZ2) !=                                                                                  \
+        defined(PROXY_GAME_EZ2) + defined(PROXY_GAME_PORTAL2) !=                                                    \
     1
-#error "define one of PROXY_GAME_GMOD, PROXY_GAME_TF2, PROXY_GAME_L4D2, PROXY_GAME_HL2RTX, PROXY_GAME_EZ2 (meson option game)"
+#error "define one of PROXY_GAME_GMOD, PROXY_GAME_TF2, PROXY_GAME_L4D2, PROXY_GAME_HL2RTX, PROXY_GAME_EZ2, PROXY_GAME_PORTAL2 (meson option game)"
 #endif
 #if defined(PROXY_GAME_GMOD) && !defined(_WIN64)
 #error "the Garry's Mod proxy is a 64-bit DLL"
@@ -30,6 +31,15 @@
 #endif
 #if defined(PROXY_GAME_EZ2) && defined(_WIN64)
 #error "the Entropy : Zero 2 proxy is a 32-bit DLL"
+#endif
+#if defined(PROXY_GAME_PORTAL2) && defined(_WIN64)
+#error "the Portal 2 proxy is a 32-bit DLL"
+#endif
+
+// The x86 engine side (x86_engine.h): Left 4 Dead 2's engine hooks, which
+// Portal 2 shares with its own patterns.
+#if defined(PROXY_GAME_L4D2) || defined(PROXY_GAME_PORTAL2)
+#define PROXY_X86_ENGINE 1
 #endif
 
 // The engine's C++ methods (MSVC ABI), as the proxy hooks and calls them: a
@@ -210,6 +220,69 @@ constexpr char kRuntimeLabel[] = "remix_bridge.dll";
 constexpr wchar_t kRuntimeModule[] = L"remix_bridge.dll";
 constexpr char kRuntimeName[] = "remix_bridge.dll";
 
+#elif defined(PROXY_GAME_PORTAL2)
+
+constexpr bool kGMod = false;
+
+// Portal 2 (Steam app 620, shaderapidx9.dll of Jun 2026): L4D2's engine
+// branch, its interface versions.
+constexpr char kShaderApiInterface[] = "ShaderApi029";
+constexpr char kHardwareConfigInterface[] = "MaterialSystemHardwareConfig013";
+// The tracker is wrapped but not hooked (as in L4D2).
+constexpr bool kHookVBAllocTracker = false;
+// Shader-based: vs20/vs30 shaders only (no vs11, SupportsDX8 0).
+constexpr bool kFixedFunction = false;
+
+// IShaderAPIDX8 (ShaderApi029, 280 slots): see slots_shaderapi_portal2.h.
+// L4D2's order with slots inserted at 14, 41, 55, 61, 98, 148, 181, 190 (and
+// two of L4D2's fog setters gone): each slot below checked in its code.
+// void SetLights(int nCount, const LightDesc_t *pDesc): an array (count
+// clamped to 4, copies count * 0x58 bytes; L4D2's 88).
+constexpr unsigned kSlotSetLight = 92;
+constexpr bool kSetLightsArray = true;
+// void Bind(IMaterial *) (engine_materials, which checks its code;
+// CMatRenderContext::Bind calls [vtable+0x140]).
+constexpr unsigned kSlotBind = 80;
+// void SetPIXMarker(unsigned long color, const char *name): an empty stub
+// (ret 8, folded with BeginPIXEvent, 184); IMatRenderContext slot 137 jumps
+// to [g_pShaderAPI vtable+0x2e8].
+constexpr unsigned kSlotSetPIXMarker = 186;
+// void GetMatrix(MaterialMatrixMode_t, float *dst) (copies its stack's top
+// matrix); int GetCurrentNumBones() const (what SetNumBoneWeights, 91, stores).
+constexpr unsigned kSlotGetMatrix = 42;
+constexpr unsigned kSlotGetCurrentNumBones = 9;
+// GetSceneFogMode 2 and GetSceneFogColor 3 return what SceneFogMode (142) and
+// SceneFogColor3ub (141) store; GetFogDistances 183 what FogStart (138),
+// FogEnd (139) and SetFogZ (140) store.
+constexpr unsigned kSlotGetSceneFogMode = 2, kSlotGetSceneFogColor = 3, kSlotGetFogDistances = 183;
+constexpr bool kSceneFogSlots = true;
+
+// Portal 2's shaders keep L4D2's registers (their constant tables: cFlexScale
+// c13, c4 cModelViewProj, c8 cViewProj, c21..c26 the ambient cube, c50/51 the
+// iris projection, c58 cModel).
+constexpr unsigned kRegFlexScale = 13;
+constexpr char kShaderPrefix[] = "";
+
+// The cursor (bridge_ui): Portal 2's ISurface has no SetCursorAlwaysVisible
+// (VGUI_Surface031 slot 49, L4D2's, is an empty ret 8), and its own cursor
+// state would not hold: the surface, like the client's mouse look, goes
+// through the input stack (inputsystem.dll InputStackSystemVersion001,
+// CInputStackSystem). The topmost enabled context's cursor (visible, icon)
+// and mouse capture apply; the client turns the camera and recentres the
+// cursor only while its context is the topmost (client.dll CInput, both mouse
+// paths). Slots (IAppSystem has 8 here): 8 InputContextHandle_t
+// PushInputContext() (a context on top, enabled, the arrow visible, no
+// capture), 10 void EnableInputContext(context, bool), 15 bool
+// IsTopmostEnabledContext(context).
+constexpr char kInputStackInterface[] = "InputStackSystemVersion001";
+constexpr unsigned kSlotPushInputContext = 8, kSlotEnableInputContext = 10, kSlotIsTopmostEnabledContext = 15;
+
+// The runtime: the bridge, as in L4D2.
+constexpr wchar_t kRuntimePath[] = L"\\remix_bridge.dll";
+constexpr char kRuntimeLabel[] = "remix_bridge.dll";
+constexpr wchar_t kRuntimeModule[] = L"remix_bridge.dll";
+constexpr char kRuntimeName[] = "remix_bridge.dll";
+
 #elif defined(PROXY_GAME_HL2RTX)
 
 constexpr bool kGMod = false;
@@ -306,6 +379,38 @@ constexpr char kRuntimeLabel[] = "remix_bridge.dll";
 constexpr wchar_t kRuntimeModule[] = L"remix_bridge.dll";
 constexpr char kRuntimeName[] = "remix_bridge.dll";
 
+#endif
+
+// IShaderDeviceMgr::SetMode and IShaderUtil::RestoreShaderObjects (main.cpp):
+// 12 after IAppSystem's Connect .. Shutdown and the seven slots before them;
+// Portal 2's IAppSystem has three more (GetDependencies, GetTier and Reconnect
+// at 5..7): 15 there (each checked in its code).
+#ifdef PROXY_GAME_PORTAL2
+constexpr unsigned kSlotDeviceMgrSetMode = 15, kSlotRestoreShaderObjects = 15;
+#else
+constexpr unsigned kSlotDeviceMgrSetMode = 12, kSlotRestoreShaderObjects = 12;
+#endif
+
+// tier0.dll's ICommandLine accessor (main.cpp appendSwitch): exported as
+// "CommandLine_Tier0", in Portal 2 as "CommandLine" (the same CCommandLine
+// slots there).
+#ifdef PROXY_GAME_PORTAL2
+constexpr char kCommandLineExport[] = "CommandLine";
+#else
+constexpr char kCommandLineExport[] = "CommandLine_Tier0";
+#endif
+
+// Whether the engine may draw its flashlight passes (every lit surface again,
+// additive, the projected texture's cookie as texture 0) while engine_lights
+// path traces the projected textures: remix_output then drops what looks like
+// one. GMod: its world pass is not the iterator engine_lights suppresses.
+// Portal 2: never, r_flashlightrender is forced 0 (x86_engine.cpp), so none of
+// its additive draws is taken for one. L4D2 and Half-Life 2 RTX have no
+// projected textures (engine_lights::current() is null).
+#ifdef PROXY_GAME_GMOD
+constexpr bool kEngineFlashlightPasses = true;
+#else
+constexpr bool kEngineFlashlightPasses = false;
 #endif
 
 // A shader name without kShaderPrefix (matched in any case), for comparisons

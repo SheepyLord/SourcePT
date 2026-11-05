@@ -14,6 +14,9 @@
 #ifdef PROXY_GAME_L4D2
 #include "l4d2.h"
 #endif
+#ifdef PROXY_GAME_PORTAL2
+#include "portal2.h"
+#endif
 #include "particles.h"
 #include "shader_tables.h"
 #include "texture_categories.h"
@@ -88,7 +91,7 @@ float g_modulationSample[4] = {}; // the last tinted draw's modulation colour (g
 
 struct Stats {
   std::atomic<uint32_t> draws{0}, accepted{0}, offTarget{0}, noPosition{0}, noData{0}, skinned{0}, badPrim{0},
-      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, bspBrushEntitiesDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, contentNamed{0}, contentRefreshSkipped{0}, projectedCopies{0}, lightCookies{0}, lightCookieFrameMax{0}, shatteredSolid{0}, shatteredEdges{0}, shatteredTinted{0}, shatteredTextures{0}, opaqueTranslucent{0}, screenDraws{0}, screenInstances{0}, screenViewsFull{0}, flashlightLitPasses{0}, cameraCulledModels{0};
+      badRange{0}, cacheHits{0}, created{0}, transient{0}, evicted{0}, submitted{0}, frames{0}, nonFinite{0}, rejected{0}, flat{0}, uiDraws{0}, uiNoTexture{0}, depthOnly{0}, additive{0}, blended{0}, duplicate{0}, skyFrames{0}, lights{0}, playerBody{0}, textures{0}, textureSkipped{0}, ignored{0}, bspDropped{0}, bspKeptBlended{0}, bspKeptDynamic{0}, bspPropsDropped{0}, bspOverlaysDropped{0}, bspBrushEntitiesDropped{0}, skyViewDemoted{0}, flashlightPasses{0}, worldViewCameras{0}, uiStencil{0}, additiveBlack{0}, haloSources{0}, haloGroups{0}, maskGroups{0}, maskSources{0}, maskOverlays{0}, maskUi{0}, maskCuts{0}, emissiveNotItsTexture{0}, rigidModels{0}, contentNamed{0}, contentRefreshSkipped{0}, projectedCopies{0}, lightCookies{0}, lightCookieFrameMax{0}, shatteredSolid{0}, shatteredEdges{0}, shatteredTinted{0}, shatteredTextures{0}, tracedEnergy{0}, energyLit{0}, energyTriangles{0}, energyMeshes{0}, opaqueTranslucent{0}, screenDraws{0}, screenInstances{0}, screenViewsFull{0}, flashlightLitPasses{0}, cameraCulledModels{0};
   std::atomic<uint32_t> setLightKept[4] = {};
   // Unlit and self-illuminated draws (engine_materials): by kind, and why some stayed lit.
   std::atomic<uint32_t> luaLitDraws{0}; // unlit Lua meshes lit as surfaces (onDraw)
@@ -1674,6 +1677,26 @@ std::unordered_map<uint64_t, uint32_t> g_keptWorldTextures;
 int g_overlays = 0;
 // Categories l4d2-rtx applies to the draws that follow (onMarker "body").
 uint32_t g_markerCategories = 0;
+// Portal 2 (portal2.h): depth of the engine's portal views' DrawWorldLists
+// (onMarker "portal_view"; their world is the BSP's: every draw in there is
+// dropped), and the placements of this frame's portal views (their view
+// matrices as the shader API had them at the marker, not made left-handed):
+// a view drawn from one of them is a portal view (View::portal).
+int g_portalWorldLists = 0;
+std::vector<std::array<float, 16>> g_portalViews;
+struct PortalViewStats {
+  std::atomic<uint64_t> views{0}, notBackBuffer{0}, worldDropped{0}, surfacesDropped{0}, surfaceMarks{0},
+      surfaceOverlays{0}, instances{0}, bodies{0}, mainBodies{0}, frames{0}, viewsDrawn{0}, worldViewsInPortals{0};
+  // The engine's rims replayed as host passes (portal2::engineRims): recorded,
+  // refused by hostpass (dropped), left out as drawn in a portal view.
+  std::atomic<uint64_t> engineRims{0}, engineRimsRefused{0}, engineRimsInViews{0};
+  std::atomic<uint64_t> skipped[4] = {}; // raster only, blended in world space, stencil, placed already
+  // Portal surfaces told by their shader alone (not under models/portals/),
+  // and the last one's material.
+  std::atomic<uint64_t> byShader{0};
+  std::mutex byShaderMutex;
+  std::string byShaderName;
+} g_portalViewStats;
 
 // --- Lights ------------------------------------------------------------------
 // LightDesc_t (public/mathlib/lightdesc.h), 88 bytes.
@@ -1814,6 +1837,7 @@ struct Instance {
   uint64_t view;
   bool skinned = false;     // a skinned model's draw (bones may still be dropped: single-bone models are rigid)
   bool modelLayer = false;  // a layer the proxy adds to a model (an eye's iris): of the model whatever its transform
+  bool playerModel = false; // drawn with the player's own materials (Portal 2: Chell, the gun in her hands)
   bool deforming = false;   // its mesh is refreshed in place every frame (g_flexMeshes): never the static world
   uint64_t builtFrame = ~0ull; // a deforming mesh's last refresh (diagnostics)
   uint32_t primitives = 0, firstIndex = 0; // the draw's primitive count and first index (a screen view's dedupe)
@@ -1945,6 +1969,10 @@ struct View {
   // Drawn into a screen camera's render-target texture (screenSlot): the
   // entities that camera sees, which the main view may not draw.
   const void *screenTarget = nullptr;
+  // Portal 2: one of the engine's portal views (g_portalViews): what it draws
+  // besides its world (dropped) are scene instances (role Portal), never a
+  // camera; the stencil it is drawn through is not emulated.
+  bool portal = false;
 };
 // Source's client-side particle manager (CParticleMgr: the emitters of FX_
 // effects, env_smokestack, Lua's ParticleEmitter, ...) transforms its
@@ -3496,7 +3524,8 @@ bool viewMatrices(float view[16], float projection[16]) {
 }
 
 bool isSkyDraw(const Draw &d) {
-  return g_ready && g_worldLists > 0 && d.mainTarget && !d.blend && d.streams[0].dynamic && d.colorWrite;
+  return g_ready && g_worldLists > 0 && g_portalWorldLists == 0 && d.mainTarget && !d.blend && d.streams[0].dynamic &&
+         d.colorWrite;
 }
 
 // --- Sky dome ----------------------------------------------------------------
@@ -4650,7 +4679,8 @@ bool submitParticles(const Draw &d, ParticleKind kind, uint64_t viewKey, const f
     inst.offTarget = !d.mainTarget;
     inst.primitives = d.primCount;
     inst.firstIndex = d.startIndex;
-    const bool marks = stencilRole(d, inst); // sets the depth state of stencil draws
+    // (sets the depth state of stencil draws; a portal view's are not emulated)
+    const bool marks = g_views[viewKey].portal || stencilRole(d, inst);
     inst.depthTest = d.depthTest && inst.depthTest;
     inst.depthWrite = d.zWrite && !d.blend;
     if (!marks) {
@@ -5633,6 +5663,12 @@ void onDraw(const Draw &d) {
   ++g_stats.draws;
   if (!g_ready || !g_shaderApi)
     return;
+  // Inside a portal view's world lists (Portal 2): the BSP's world stands in
+  // for everything drawn there (brushes, displacements, decals, the 2D sky).
+  if (g_portalWorldLists > 0) {
+    ++g_portalViewStats.worldDropped;
+    return;
+  }
   // ShatteredGlass (a broken func_breakable_surf): each piece binds a shape
   // mask as $basetexture (the BreakableSurface proxy's models/brokenglass/
   // glassbroken_*: white, the shape in alpha, on TEXCOORD0) and the glass
@@ -5744,6 +5780,69 @@ void onDraw(const Draw &d) {
     ++g_stats.depthOnly; // depth prepass / shadow depth
     return;
   }
+  // The engine's portal surfaces (Portal 2, models/portals/...: the stencil
+  // hole, the render-target mesh, the static overlays) where the portals are
+  // ray portals (portal2.h): an opaque one is no instance (it would cover the
+  // ray portal's mesh); one that marks the stencil only marks it (what the
+  // engine draws through the hole afterwards stays masked to it); blended ones
+  // (rims, ghosts) are dropped while the proxy has the runtime draw its own
+  // (portal2::ownRims), else raster overlays.
+#ifdef PROXY_GAME_PORTAL2
+  // By its path, or by its shader (PortalRefract, PortalStaticOverlay: some
+  // portal draws' materials are not under models/portals/).
+  const bool portalShader = material.known && (nameStarts(material.shader, "portalrefract") ||
+                                               nameStarts(material.shader, "portalstaticoverlay"));
+  const bool portalSurface =
+      portal2::enabled() && (portal2::isPortalMaterial(engine_materials::currentName()) || portalShader);
+  if (portalSurface && !portal2::isPortalMaterial(engine_materials::currentName())) {
+    ++g_portalViewStats.byShader;
+    std::lock_guard<std::mutex> lock(g_portalViewStats.byShaderMutex);
+    g_portalViewStats.byShaderName = engine_materials::currentName() ? engine_materials::currentName() : "(none)";
+  }
+  // The ghosts (PortalStaticOverlay, $ghostoverlay: portals seen through
+  // walls) are never replayed: the proxy has the runtime draw them (with
+  // their depth test, GREATER; as plain overlays their corner marks showed
+  // beside every portal).
+  if (portalSurface && d.blend && portal2::ownRims() && portal2::engineRims() && !d.target &&
+      !(material.known && nameStarts(material.shader, "portalstaticoverlay"))) {
+    // The engine's own rims and static (PortalRefract $Stage 2): replayed on
+    // the path-traced frame with its shaders, whatever the host-pass setting,
+    // when asked for (portal2::engineRims; off by default). Those of
+    // the portal views are left out: drawn from a portal's virtual camera
+    // through a stencil the replay does not have, they would land unclipped.
+    // The portal views are not always told by their marker (not drawn into
+    // the back buffer then), so a rim is taken only from the main view: the
+    // frame's last world view so far (portal views add none), stored
+    // left-handed.
+    float view[16], projection[16];
+    getMatrix(kMatrixView, view);
+    getMatrix(kMatrixProjection, projection);
+    bool inPortalView = false;
+    for (const auto &placement : g_portalViews)
+      inPortalView |= samePlacement(view, placement.data());
+    if (projection[11] < 0)
+      for (int r = 0; r < 4; ++r)
+        view[r * 4 + 2] = -view[r * 4 + 2];
+    inPortalView |= g_worldViews.empty() || !samePlacement(view, g_worldViews.back().view);
+    if (inPortalView) {
+      ++g_portalViewStats.engineRimsInViews;
+    } else {
+      // Coplanar with the wall the portal is on: tested against the runtime's
+      // depth pushed back a little (portal2::engineRimDepthScale).
+      if (hostpass::recordAlways(d, projection, portal2::engineRimDepthScale())) {
+        ++g_portalViewStats.engineRims;
+        return;
+      }
+      ++g_portalViewStats.engineRimsRefused;
+    }
+  }
+  if (portalSurface && ((!d.blend && !d.stencil) || (d.blend && portal2::ownRims()))) {
+    ++g_portalViewStats.surfacesDropped;
+    return;
+  }
+#else
+  constexpr bool portalSurface = false;
+#endif
   uint32_t categories = remixCategories(d.forkCategories) | g_markerCategories;
   // rtx.conf texture categories, by the base texture's dxvk hash.
   const uint64_t baseTextureHash = textureHash(d.texture0);
@@ -5878,9 +5977,12 @@ void onDraw(const Draw &d) {
   if (!lifted)
     afterStudio = skinnedDraw;
   // Particles (see submitParticles). A shader that builds its geometry reads
-  // POSITION as it likes (a curve parameter, any type).
+  // POSITION as it likes (a curve parameter, any type). Not the portal
+  // surfaces (PortalRefract expands its quad too): the stencil hole only marks
+  // the stencil (below), as a particle it was drawn, its texture over the
+  // portal.
   const ParticleKind particle =
-      pos && pos->Stream < 4
+      pos && pos->Stream < 4 && !portalSurface
           ? particleKind(d, bound, skinnedDraw, d.streams[pos->Stream].dynamic || d.indices.dynamic,
                          multiply && !decalHow)
           : kNotParticle;
@@ -5914,6 +6016,9 @@ void onDraw(const Draw &d) {
     } else {
       getMatrix(kMatrixView, view.view);
       getMatrix(kMatrixProjection, view.projection);
+      for (const auto &placement : g_portalViews)
+        view.portal |= samePlacement(view.view, placement.data());
+      g_portalViewStats.viewsDrawn += view.portal;
     }
     view.screenTarget = screenView ? d.target : nullptr;
     // Source builds right-handed D3DX matrices (row vectors, camera looking
@@ -6071,6 +6176,7 @@ void onDraw(const Draw &d) {
   // texture there, the same buffers and range as an opaque draw earlier in
   // the frame (effects are drawn once). Additive is ONE/ONE, or
   // SRCALPHA/ONE for translucent materials (decals).
+  // Not where the engine draws none (game::kEngineFlashlightPasses: Portal 2).
   struct {
     const void *vertices, *indexBuffer;
     uint32_t offset, startIndex, primCount, minIndex;
@@ -6096,7 +6202,8 @@ void onDraw(const Draw &d) {
     ++g_ffStats.layers;
     return;
   }
-  if (d.blend && d.dstBlend == D3DBLEND_ONE && (d.srcBlend == D3DBLEND_ONE || d.srcBlend == D3DBLEND_SRCALPHA)) {
+  if (game::kEngineFlashlightPasses && d.blend && d.dstBlend == D3DBLEND_ONE &&
+      (d.srcBlend == D3DBLEND_ONE || d.srcBlend == D3DBLEND_SRCALPHA)) {
     static std::unordered_set<const void *> cookies; // render thread only
     static uint32_t cookieEpoch = ~0u;
     if (cookieEpoch != g_skyEpoch) { // a new map: texture pointers are reused
@@ -6424,7 +6531,17 @@ void onDraw(const Draw &d) {
   // anew). A model the CPU deforms keeps its refreshed mesh, refreshed only
   // when its contents change. OPENREMIX_PROXY_CONTENT_CACHE=0: per frame.
   static const bool contentCache = game::kFixedFunction && envScale("OPENREMIX_PROXY_CONTENT_CACHE", 1) > 0;
-  if (contentCache && dynamicBuffers && flex == 0 && !g_ffGenerated && particle == kNotParticle) {
+  // So is Portal 2's light bridge (SolidEnergy, below), rewritten every frame
+  // with the same contents: one mesh while it stands, one instance, so its
+  // light stays in the light tree (refit, not rebuilt) and its estimate is
+  // made once (a new mesh only while it extends).
+#ifdef PROXY_GAME_PORTAL2
+  const bool energyDraw = portal2::enabled() && additiveDraw && bound.known && nameStarts(bound.shader, "solidenergy") &&
+                          _stricmp(engine_materials::currentName(), "effects/projected_wall") == 0;
+#else
+  constexpr bool energyDraw = false;
+#endif
+  if ((contentCache || energyDraw) && dynamicBuffers && flex == 0 && !g_ffGenerated && particle == kNotParticle) {
     if (const uint64_t content = contentHash(d)) {
       if (dynamicModel) {
         flexContent = content;
@@ -6438,6 +6555,7 @@ void onDraw(const Draw &d) {
         hash = meshName(fnv(&named, sizeof(named), 0x636f6e74656e74ull));
         transientDraw = false;
         ++g_stats.contentNamed;
+        g_stats.energyMeshes += energyDraw && !g_meshes.count(hash);
       }
     }
   }
@@ -6551,6 +6669,12 @@ void onDraw(const Draw &d) {
 
   Instance inst;
   inst.mesh = mesh;
+#ifdef PROXY_GAME_PORTAL2
+  if (portal2::enabled())
+    if (const char *name = engine_materials::currentName())
+      inst.playerModel = _strnicmp(name, "models/player/chell", 19) == 0 ||
+                         _strnicmp(name, "models/weapons/w_models/portalgun/", 34) == 0;
+#endif
   // Ropes and cables (keyframe_rope, move_rope: the Cable shader) sample their
   // $bumpmap on sampler 0 and their $basetexture on sampler 1: texture 0 is
   // cable/cablenormalmap, which as albedo painted every rope in the normal
@@ -6851,7 +6975,9 @@ void onDraw(const Draw &d) {
       ++g_stats.eyeRefracts;
     }
   }
-  if (!stencilRole(d, inst))
+  // A portal view's draws pass the stencil of its portal's hole: not emulated
+  // (the view's instances are the scene's, see View::portal).
+  if (!view.portal && !stencilRole(d, inst))
     return;
 #if defined(PROXY_GAME_EZ2)
   if (g_glowHalo) {
@@ -6876,6 +7002,18 @@ void onDraw(const Draw &d) {
     inst.stencilRole = kStencilSource;
   }
 #endif
+  if (portalSurface) {
+    if (d.blend) {
+      inst.rasterOnly = true;
+      ++g_portalViewStats.surfaceOverlays;
+    } else if (inst.stencilRole == kStencilSource || inst.stencilRole == kStencilSourceOnly) {
+      inst.stencilRole = kStencilSourceOnly;
+      ++g_portalViewStats.surfaceMarks;
+    } else {
+      ++g_portalViewStats.surfacesDropped;
+      return;
+    }
+  }
   // D3DFILL_WIREFRAME (the Wireframe shader; any material with $wireframe):
   // the edges of its triangles, unlit, in its colour (texture x modulation x
   // vertex colour, as the draw's), with the draw's depth state. Not traced: a
@@ -6890,6 +7028,41 @@ void onDraw(const Draw &d) {
                          REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_SINGLE_OFFSET);
     ++g_stats.wireframeDraws;
   }
+#ifdef PROXY_GAME_PORTAL2
+  // Portal 2's light bridges (SolidEnergy, effects/projected_wall): additive,
+  // which as a raster overlay over the frame rays through ray portals and
+  // reflections never met. Traced instead, seen by the camera too: the
+  // runtime evaluates the shader (remixapi_MaterialSolidEnergyEXT), a sheet
+  // adding its glow over what is behind (source alpha over, its coverage the
+  // material's). Its texture stages' alpha is the factor's 2/255: candidate
+  // rays take it, and light rays pass it (the game's bridge casts no shadow).
+  // Other SolidEnergy materials (excursion funnels) stay raster overlays.
+  // OPENREMIX_PROXY_SOLID_ENERGY=0: the engine's overlay for the bridge too.
+  if (portal2::enabled() && additiveDraw && !inst.rasterOnly && !inst.offTarget && bound.known &&
+      nameStarts(bound.shader, "solidenergy") && d.psConstants)
+    if (const remixapi_MaterialHandle energy =
+            portal2::solidEnergyMaterial(g_api, engine_materials::currentName(), d.psConstants[6 * 4 + 3])) {
+      inst.material = energy;
+      inst.blend = {};
+      inst.blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
+      inst.blend.alphaTestCompareOp = 7; // always (no alpha test)
+      inst.blend.alphaBlendEnabled = 1;
+      inst.blend.srcColorBlendFactor = inst.blend.srcAlphaBlendFactor = 6; // SRC_ALPHA
+      inst.blend.dstColorBlendFactor = inst.blend.dstAlphaBlendFactor = 7; // ONE_MINUS_SRC_ALPHA
+      inst.blend.writeMask = 15;
+      inst.blend.textureColorOperation = inst.blend.textureAlphaOperation = 1; // select arg 1
+      inst.blend.textureColorArg1Source = inst.blend.textureAlphaArg1Source = 3; // texture factor
+      inst.blend.tFactor = 0x02ffffffu;
+      inst.replacementHash = 0;
+      inst.singleSided = false; // $nocull
+      inst.cameraCullBack = false;
+      ++g_stats.tracedEnergy;
+      if (portal2::solidEnergyLight() > 0) {
+        ++g_stats.energyLit;
+        g_stats.energyTriangles += d.primCount;
+      }
+    }
+#endif
   g_instances.push_back(inst);
   // Eyes (Source's Eyes shader; not EyeRefract): the draw above is the eyeball
   // with its sclera texture, sampler 0. The iris and pupil are a second
@@ -7272,9 +7445,10 @@ void onPresent() {
   // the main rotation are: the same camera with other depth planes (world),
   // the 3D skybox (same field of view, sky-space position) or the view model
   // (another field of view). Other views (monitors, reflections) are skipped.
+  // (A portal view, Portal 2's, is never the main view: View::portal.)
   std::unordered_map<int, uint32_t> fovDraws;
   for (auto &[key, v] : g_views)
-    if (v.perspective && !v.cameraSpace)
+    if (v.perspective && !v.cameraSpace && !v.portal)
       fovDraws[int(std::lround(v.projection[5] * 1000))] += v.draws;
   int worldFov = 0;
   uint32_t best = 0;
@@ -7286,7 +7460,7 @@ void onPresent() {
   const View *main = nullptr;
   uint64_t mainKey = 0;
   for (auto &[key, v] : g_views) {
-    if (v.perspective && !v.cameraSpace && int(std::lround(v.projection[5] * 1000)) == worldFov &&
+    if (v.perspective && !v.cameraSpace && !v.portal && int(std::lround(v.projection[5] * 1000)) == worldFov &&
         (!main || v.draws > main->draws)) {
       main = &v;
       mainKey = key;
@@ -7319,7 +7493,7 @@ void onPresent() {
     worldFov = int(std::lround(chosen->projection[5] * 1000));
     main = nullptr;
     for (auto &[key, v] : g_views)
-      if (v.perspective && int(std::lround(v.projection[5] * 1000)) == worldFov &&
+      if (v.perspective && !v.portal && int(std::lround(v.projection[5] * 1000)) == worldFov &&
           samePlacement(v.view, chosen->view) && (!main || v.draws > main->draws)) {
         main = &v;
         mainKey = key;
@@ -7350,7 +7524,7 @@ void onPresent() {
     float mainEye[3];
     eyeOf(*main, mainEye);
     for (auto &[key, v] : g_views) {
-      if (&v == main || !v.perspective || int(std::lround(v.projection[5] * 1000)) != worldFov ||
+      if (&v == main || !v.perspective || v.portal || int(std::lround(v.projection[5] * 1000)) != worldFov ||
           !sameRotation(v.view, main->view))
         continue;
       float eye[3], distance2 = 0;
@@ -7372,7 +7546,10 @@ void onPresent() {
     // The 3D skybox keeps its own camera: the runtime draws SKY instances with
     // the sky camera behind the world (raster layer 0, path-traced
     // background), as Source does.
-    enum class Role { Skip, Main, Sky, ViewModel, Screen };
+    // Portal 2's portal views (View::portal) add what only they show, as Screen
+    // views do, without a camera of their own (the runtime's ray portals see
+    // through the portals).
+    enum class Role { Skip, Main, Sky, ViewModel, Screen, Portal };
     std::unordered_map<uint64_t, Role> roles;
     const View *viewModel = nullptr, *sky = nullptr;
     for (auto &[key, v] : g_views) {
@@ -7386,6 +7563,11 @@ void onPresent() {
           role = Role::Screen;
       } else if (key == mainKey) {
         role = Role::Main;
+      } else if (v.portal) {
+        // Never a view of the main camera's rotation (the sky or view model
+        // below): a portal pair that keeps the rotation (opposite walls) would
+        // have made one of those.
+        role = samePlacement(v.view, main->view) ? Role::Main : Role::Portal;
       } else if (v.perspective && samePlacement(v.view, main->view) &&
                  int(std::lround(v.projection[5] * 1000)) == worldFov) {
         role = Role::Main; // drawn with the main camera
@@ -7403,7 +7585,7 @@ void onPresent() {
     g_viewSummary.clear();
     for (auto &[key, v] : g_views) {
       char line[160];
-      static const char *const names[] = {"skip", "main", "sky", "viewmodel", "screen"};
+      static const char *const names[] = {"skip", "main", "sky", "viewmodel", "screen", "portal"};
       snprintf(line, sizeof(line), "    view order %u draws %u persp %d P0 %.3f P5 %.3f P14 %.3f T %.0f %.0f %.0f -> %s\n",
                v.order, v.draws, v.perspective, v.projection[0], v.projection[5], v.projection[14], v.view[12],
                v.view[13], v.view[14], names[int(roles[key])]);
@@ -7622,6 +7804,37 @@ void onPresent() {
     for (const auto &inst : g_instances)
       if (roles[inst.view] == Role::Main && !inst.offTarget)
         placed.insert(placement(inst));
+    float mainEye[3]; // where the main camera stands (a portal view's player model)
+    for (int i = 0; i < 3; ++i)
+      mainEye[i] = -(main->view[12] * main->view[i * 4] + main->view[13] * main->view[i * 4 + 1] +
+                     main->view[14] * main->view[i * 4 + 2]);
+    g_portalViewStats.frames += !g_portalViews.empty();
+    // Whether a model's root (a skinned one's first bone, a rigid one's
+    // transform: the gun in its hands) is within portalBodyRadius of the main
+    // camera's eye.
+    static const float bodyRadius = envScale("OPENREMIX_PROXY_PORTAL_BODY_RADIUS", 80.0f);
+    auto nearEye = [&](const Instance &inst) {
+      float d2 = 0;
+      for (int r = 0; r < 3; ++r) {
+        const float d = (inst.bones.empty() ? inst.transform[r][3] : inst.bones[0].matrix[r][3]) - mainEye[r];
+        d2 += d * d;
+      }
+      return d2 < bodyRadius * bodyRadius;
+    };
+    // The player's parts skinned on the CPU (Chell's eyes and their irises:
+    // world-space vertices, no transform) have no place of their own: they
+    // go with the rest of the player's model, near the eye if a placed part
+    // is.
+    static const float worldSpace[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
+    auto worldSpaced = [&](const Instance &inst) {
+      return inst.bones.empty() && std::memcmp(inst.transform, worldSpace, sizeof(worldSpace)) == 0;
+    };
+    bool playerNear = false;
+    for (const auto &inst : g_instances)
+      playerNear |= inst.playerModel && !worldSpaced(inst) && nearEye(inst);
+    auto playerBody = [&](const Instance &inst) {
+      return inst.playerModel && (worldSpaced(inst) ? playerNear : nearEye(inst));
+    };
     for (auto &inst : g_instances) {
       const Role role = roles[inst.view];
       if (role == Role::Skip || (inst.offTarget && role != Role::Screen))
@@ -7647,6 +7860,34 @@ void onPresent() {
           continue;
         }
         ++g_stats.screenInstances;
+      }
+      // A portal view's instances (Portal 2): what the main view and the
+      // other views did not place already, by the screen views' rules. The
+      // player's own model (Portal 2 draws it in portal views only, and it
+      // is where the main camera stands) is reflection-only: the main camera
+      // does not see it, the rays through a portal and bounces do. Told by
+      // place: a model near the main camera's eye (nearEye). So is it in the
+      // main view, where Portal 2 draws it too while the player stands in a
+      // portal (clipped at the portal's plane: its other half shows out of the
+      // partner), told by its materials as well (Chell's, her gun's: not
+      // Wheatley or a cube carried as close).
+      bool portalBody = false;
+      if (role == Role::Portal) {
+        static const float worldSpace[3][4] = {{1, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}};
+        const bool modelLayer = inst.modelLayer || inst.skinned || !inst.bones.empty() ||
+                                std::memcmp(inst.transform, worldSpace, sizeof(worldSpace)) != 0;
+        const int reason = inst.rasterOnly ? 0 : inst.blend.alphaBlendEnabled && !modelLayer ? 1
+                         : inst.stencilGroup >= 0 ? 2 : !placed.insert(placement(inst)).second ? 3 : -1;
+        if (reason >= 0) {
+          ++g_portalViewStats.skipped[reason];
+          continue;
+        }
+        portalBody = ((!inst.bones.empty() || modelLayer) && nearEye(inst)) || playerBody(inst);
+        ++g_portalViewStats.instances;
+        g_portalViewStats.bodies += portalBody;
+      } else if (role == Role::Main && playerBody(inst)) {
+        portalBody = true;
+        ++g_portalViewStats.mainBodies;
       }
       if ((role == Role::ViewModel && &g_views[inst.view] != viewModel) ||
           (role == Role::Sky && (&g_views[inst.view] != sky || skyTraced)))
@@ -7796,7 +8037,9 @@ void onPresent() {
         float position[3];
         for (int r = 0; r < 3; ++r)
           position[r] = inst.bones.empty() ? inst.transform[r][3] : inst.bones[0].matrix[r][3];
-        const uint64_t group = fnv(&inst.mesh, sizeof(inst.mesh), uint64_t(role) + 1);
+        // (A portal view's instance is the main view's when it comes into
+        // view there: one identity.)
+        const uint64_t group = fnv(&inst.mesh, sizeof(inst.mesh), uint64_t(role == Role::Portal ? Role::Main : role) + 1);
         identity.instanceId = trackedId(group, position);
         identity.classification = REMIXAPI_INSTANCE_DYNAMIC_EXT;
       }
@@ -7812,7 +8055,7 @@ void onPresent() {
       // screen's rays and bounces do (the runtime's camera rays of a screen
       // include reflection-only instances; its paint, an eye's iris, coats
       // only reflection-only receivers).
-      if (role == Role::Screen)
+      if (role == Role::Screen || portalBody)
         info.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_BODY;
       if (role == Role::ViewModel && rasterViewModel)
         info.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL;
@@ -7902,6 +8145,18 @@ void onPresent() {
       Timer bspTimer(g_usBsp, &g_totalUs[3]);
       bsp::submit(materialForHash);
     }
+#ifdef PROXY_GAME_PORTAL2
+    {
+      // The ray portals' meshes (sampled on the main thread) and effects; the
+      // main view's eye (the frame's last world view) fades the ghosts.
+      float eye[3];
+      const float *view = g_worldViews.empty() ? nullptr : g_worldViews.back().view;
+      if (view)
+        for (int i = 0; i < 3; ++i)
+          eye[i] = -(view[12] * view[i * 4] + view[13] * view[i * 4 + 1] + view[14] * view[i * 4 + 2]);
+      portal2::submit(g_api, view ? eye : nullptr);
+    }
+#endif
   }
   {
     std::lock_guard<std::mutex> lock(g_lightLock);
@@ -8165,6 +8420,7 @@ void onPresent() {
   g_views.clear();
   g_cameraSpace.valid = false;
   g_worldViews.clear();
+  g_portalViews.clear();
   g_viewOrder = 0;
 
   for (auto mesh : g_transient)
@@ -8930,6 +9186,32 @@ void dumpStatistics(FILE *out) {
           g_stats.bspKeptDynamic.exchange(0) / f, g_stats.opaqueTranslucent.exchange(0) / f,
           g_stats.screenDraws.exchange(0) / f, g_screenViews.size(), g_stats.screenViewsFull.exchange(0) / f,
           g_stats.screenInstances.exchange(0) / f);
+#ifdef PROXY_GAME_PORTAL2
+  {
+    // The engine's portal views (portal2.h), per frame.
+    auto &p = g_portalViewStats;
+    fprintf(out,
+            "   portal views: marked %.2f (not into the back buffer %.2f), drawn %.2f, frames with any %.0f%%, world views "
+            "inside them (3D sky) %.2f | draws in their world lists dropped %.1f | portal surfaces dropped %.1f, "
+            "stencil marks %.1f, raster overlays %.1f | told by their shader alone %.1f (last %s)\n",
+            p.views.exchange(0) / f, p.notBackBuffer.exchange(0) / f, p.viewsDrawn.exchange(0) / f,
+            100.0 * double(p.frames.exchange(0)) / f, p.worldViewsInPortals.exchange(0) / f,
+            p.worldDropped.exchange(0) / f, p.surfacesDropped.exchange(0) / f,
+            p.surfaceMarks.exchange(0) / f, p.surfaceOverlays.exchange(0) / f, p.byShader.exchange(0) / f,
+            [&] {
+              std::lock_guard<std::mutex> lock(p.byShaderMutex);
+              return p.byShaderName.empty() ? std::string("-") : p.byShaderName;
+            }().c_str());
+    fprintf(out,
+            "   engine portal rims (host passes, always): replayed %.1f, refused %.1f, in portal views (left out) %.1f\n",
+            p.engineRims.exchange(0) / f, p.engineRimsRefused.exchange(0) / f, p.engineRimsInViews.exchange(0) / f);
+    fprintf(out,
+            "   portal-view instances: kept %.1f (the player's own, reflection-only %.1f; in the main view %.1f) | left "
+            "out: raster only %.1f, blended in world space %.1f, stencil %.1f, placed already %.1f\n",
+            p.instances.exchange(0) / f, p.bodies.exchange(0) / f, p.mainBodies.exchange(0) / f, p.skipped[0].exchange(0) / f,
+            p.skipped[1].exchange(0) / f, p.skipped[2].exchange(0) / f, p.skipped[3].exchange(0) / f);
+  }
+#endif
   fprintf(out, "   last screen draw (%s): c48 %g %g %g %g c49 %g %g %g %g | u %g..%g v %g..%g -> u %g..%g v %g..%g (built "
                "meshes only)\n",
           g_screenMaterial.c_str(), g_screenUvRows[0], g_screenUvRows[1], g_screenUvRows[2], g_screenUvRows[3],
@@ -9452,6 +9734,19 @@ void dumpStatistics(FILE *out) {
           g_stats.haloGroups.exchange(0) / f, g_stats.haloSources.exchange(0) / f, g_stats.maskGroups.exchange(0) / f,
           g_stats.maskSources.exchange(0) / f, g_stats.maskOverlays.exchange(0) / f, g_stats.maskUi.exchange(0) / f,
           g_stats.maskCuts.exchange(0) / f);
+  if (const double energy = g_stats.tracedEnergy.exchange(0) / f; energy > 0)
+    fprintf(out, "   light bridges (SolidEnergy, effects/projected_wall) traced with the runtime's SolidEnergy "
+                 "(OPENREMIX_PROXY_SOLID_ENERGY): %.1f per frame | lights (OPENREMIX_PROXY_SOLID_ENERGY_LIGHT %.2f): "
+                 "%.1f instances, %.1f triangles per frame | meshes made %.2f per frame (named by their contents: "
+                 "0 while the bridges stand)\n",
+            energy,
+#ifdef PROXY_GAME_PORTAL2
+            portal2::solidEnergyLight(),
+#else
+            0.0,
+#endif
+            g_stats.energyLit.exchange(0) / f, g_stats.energyTriangles.exchange(0) / f,
+            g_stats.energyMeshes.exchange(0) / f);
   if (const double culled = g_stats.cameraCulledModels.exchange(0) / f; culled > 0)
     fprintf(out, "   engine-drawn models with back faces hidden from the camera "
                  "(OPENREMIX_PROXY_CULL_BACKFACES_MODELS): %.1f per frame\n", culled);
@@ -9642,7 +9937,11 @@ bool onMarker(const char *text) {
       counter = 0;
   };
   if (const char *v = argument("world_lists")) {
-    if (g_worldLists == 0 && std::atoi(v) && g_shaderApi && g_worldViews.size() < 16 && d3d::backBufferBound()) {
+    // (A world view after a portal view in the frame is one drawn through a
+    // portal, Portal 2's 3D skybox seen through it: never the main camera.)
+    if (g_worldLists == 0 && std::atoi(v) && g_shaderApi && !g_portalViews.empty() && d3d::backBufferBound()) {
+      ++g_portalViewStats.worldViewsInPortals;
+    } else if (g_worldLists == 0 && std::atoi(v) && g_shaderApi && g_worldViews.size() < 16 && d3d::backBufferBound()) {
       WorldView w;
       getMatrix(kMatrixView, w.view);
       getMatrix(kMatrixProjection, w.projection);
@@ -9681,6 +9980,26 @@ bool onMarker(const char *text) {
   }
   else if (const char *v = argument("overlays"))
     depth(g_overlays, v);
+  else if (const char *v = argument("portal_view")) {
+    // Portal 2: a portal view's DrawWorldLists (x86_engine): its placement,
+    // when drawn into the back buffer (stencil portals; its draws are dropped
+    // while inside, see onDraw).
+    if (g_portalWorldLists == 0 && std::atoi(v) && g_shaderApi) {
+      if (d3d::backBufferBound() && g_portalViews.size() < 32) {
+        std::array<float, 16> view;
+        getMatrix(kMatrixView, view.data());
+        g_portalViews.push_back(view);
+        ++g_portalViewStats.views;
+      } else {
+        ++g_portalViewStats.notBackBuffer;
+      }
+    }
+    depth(g_portalWorldLists, v);
+  }
+#ifdef PROXY_GAME_PORTAL2
+  else if (const char *v = argument("portals"))
+    portal2::activate(uint32_t(std::strtoul(v, nullptr, 10)));
+#endif
   else if (const char *v = argument("body"))
     g_markerCategories = std::atoi(v) ? REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_MODEL |
                                             REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_BODY
@@ -9690,6 +10009,9 @@ bool onMarker(const char *text) {
   else if (const char *v = argument("map")) {
     if (g_ready) {
       resetSky(); // the previous map's dome; this map's sky draws follow
+#ifdef PROXY_GAME_PORTAL2
+      portal2::reset(g_api);
+#endif
       proxy::bsp::load(g_api, v);
     }
   } else

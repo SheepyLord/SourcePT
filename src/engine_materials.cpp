@@ -121,6 +121,20 @@
 //     table holds RVAs.
 //   CMaterialSubRect: its name symbol at +0x14, the page at +8 (as GMod).
 //   MaterialVarFlags_t: SDK 2013's ($model bit 11, checked in its table).
+//
+// Portal 2 (x86, materialsystem.dll and shaderapidx9_orig.dll of Jun 2026):
+// L4D2's code and fields, found and checked as there, with these changes:
+//   CShaderAPIDx8 (IShaderAPIDX8, ShaderApi029; vtable at +0x248): 80
+//     Bind(IMaterial *) (CMatRenderContext::Bind calls [edx+0x140]), L4D2's
+//     code with m_pMaterial at [this+0x2c00] (no buffered meshes either).
+//   CMaterial, CMaterialSubRect: L4D2's slots, fields and code.
+//   CMaterialVar: one slot more at 1 (a second texture getter beside
+//     GetTextureValue, 0), so GetName 2, GetStringValue 7, IsDefined 18,
+//     GetIntValueInternal 27, GetFloatValueInternal 28, GetVecValueInternal
+//     30; L4D2's fields. GetName looks its symbol up under a lock (other code,
+//     the symbol at +0x1e still); the getters ask CMaterialSystem slot 162
+//     (call [eax+0x288]) for the thread's call queue.
+//   MaterialVarFlags_t: L4D2's ($model at bit 11; bit 9 $pseudotranslucent).
 namespace proxy::engine_materials {
 namespace {
 
@@ -143,11 +157,16 @@ constexpr size_t kMaterialCount = 0x32, kMaterialParams = 0x38, kMaterialName = 
 // CMaterialVar: type nibble, ITexture * of a texture var.
 constexpr size_t kVarType = 0x24, kVarTexture = 0x39;
 #else
-// L4D2, Half-Life 2 RTX, TF2: as the code checked at install reads them (see
-// above).
+// L4D2, Half-Life 2 RTX, TF2, Portal 2: as the code checked at install reads
+// them (see above).
 constexpr unsigned kSlotGetName = 0, kSlotParamCount = 40, kSlotParams = 41, kSlotShaderName = 49;
+#ifdef PROXY_GAME_PORTAL2
+constexpr unsigned kVarGetName = 2, kVarGetString = 7, kVarIsDefined = 18, kVarGetInt = 27, kVarGetFloat = 28,
+                   kVarGetVec = 30;
+#else
 constexpr unsigned kVarGetName = 1, kVarGetString = 6, kVarIsDefined = 17, kVarGetInt = 26, kVarGetFloat = 27,
                    kVarGetVec = 29;
+#endif
 constexpr unsigned kSlotInPage = 7, kSlotPage = 10;
 constexpr unsigned kSlotBind = game::kSlotBind;
 #ifdef PROXY_GAME_TF2
@@ -155,7 +174,7 @@ constexpr size_t kSubRectPageOffset = 0x8, kSubRectNameOffset = 0x14;
 constexpr size_t kMaterialCount = 0x2a, kMaterialParams = 0x50, kMaterialName = 0x20, kMaterialShader = 0x18;
 constexpr size_t kVarType = 0x24, kVarTexture = 0x30;
 #else
-#ifdef PROXY_GAME_L4D2
+#if defined(PROXY_GAME_L4D2) || defined(PROXY_GAME_PORTAL2)
 constexpr size_t kSubRectPageOffset = 0x4, kSubRectNameOffset = 0x10;
 #else
 constexpr size_t kSubRectPageOffset = 0x4, kSubRectNameOffset = 0xc;
@@ -673,6 +692,50 @@ constexpr Code kCode = {
     // cmp eax,8; ja; jmp [eax*4+table] (by type)
     "55 8B EC 83 EC 08 53 8B D9 8B 0D ? ? ? ? 8B 01 8B 90 24 02 00 00 56 57 FF D2 85 C0 74 2F 90 F6 43 1C 80 75 28 8A "
     "43 1D 3C FF 74 21 8B 0D ? ? ? ? 0F B6 C0 8D 1C 80 8B 01 8B 90 24 02 00 00 8D 1C DD ? ? ? ? FF D2 85 C0 75 D2 0F "
+    "B6 43 1C 83 E0 0F 83 F8 08 0F 87 ? ? ? ? FF 24 85",
+    // mov eax,[ebx+4]; ...; ret
+    "8B 43 04 5F 5E 5B 8B E5 5D C3",
+    // cmp [ebx+0x24],-1; jne; ... mov eax,"env_cubemap"; ...; mov ecx,[ebx+0x24]; mov edx,[ecx]; mov eax,[edx]; call eax
+    "83 7B 24 FF 75 0C 5F 5E B8 ? ? ? ? 5B 8B E5 5D C3 8B 4B 24 8B 11 8B 02 FF D0",
+    // add ecx,0x10 (its name symbol); jmp CUtlSymbol::String
+    "83 C1 10 E9",
+    // mov eax,[ecx+4] (the page)
+    "8B 41 04 C3",
+};
+#elif defined(PROXY_GAME_PORTAL2)
+// Portal 2: L4D2's code; the getters ask slot 162 (call [eax+0x288]).
+#define VAR_GETTER(tail)                                                                                              \
+  "56 8B F1 8B 0D ? ? ? ? 8B 01 8B 90 88 02 00 00 FF D2 85 C0 74 2E F6 46 1C 80 75 28 8A 46 1D 3C FF 74 21 8B 0D ? ? " \
+  "? ? 0F B6 C0 8D 34 80 8B 01 8B 90 88 02 00 00 8D 34 F5 ? ? ? ? FF D2 85 C0 75 D2 " tail
+constexpr Code kCode = {
+    // L4D2's Bind with m_pMaterial at [edi+0x2c00]: ... InMaterialPage
+    // (slot 7) on both; ...; GetMaterialPage (slot 10) on both; ...; mov
+    // [edi+0x2c00],esi; ...; ret 4
+    "55 8B EC 56 8B 75 08 57 8B F9 8B 8F 00 2C 00 00 85 C9 74 ? 85 F6 74 ? 8B 01 8B 50 1C FF D2 84 C0 74 ? 8B 06 "
+    "8B 50 1C 8B CE FF D2 84 C0 74 ? 8B 8F 00 2C 00 00 8B 01 8B 50 28 53 FF D2 8B D8 8B 06 8B 50 28 8B CE FF D2 "
+    "3B D8 0F 95 C0 5B 84 C0 74 ? 89 B7 00 2C 00 00 5F 5E 5D C2 04 00",
+    nullptr, 0,
+    // add ecx,0x18 (the name symbol); jmp CUtlSymbol::String
+    "83 C1 18 E9",
+    "0F B6 41 22 C3",
+    "8B 41 24 C3",
+    // cmp [ecx+0x14],0; je; mov ecx,[ecx+0x14]; mov eax,[ecx]; mov edx,[eax]; jmp edx (IShader::GetName)
+    "83 79 14 00 74 09 8B 49 14 8B 01 8B 10 FF E2",
+    // push ebp; mov ebp,esp; push ecx; movzx eax, word [ecx+0x1e] (the name
+    // symbol); mov ecx,0xffff; push esi; cmp ax,cx (0xffff: none)
+    "55 8B EC 51 0F B7 41 1E B9 FF FF 00 00 56 66 3B C1",
+    // mov al,[ecx+0x1c]; and al,0xf; xor ecx,ecx; cmp al,6; setne al; ret
+    "8A 41 1C 24 0F 33 C9 3C 06 0F 95 C0 C3",
+    // ...; mov eax,[esi+8]; pop esi; ret
+    VAR_GETTER("8B 46 08 5E C3"),
+    // ...; fld dword [esi+0xc]; pop esi; ret
+    VAR_GETTER("D9 46 0C 5E C3"),
+    // ...; lea eax,[esi+0xc]; pop esi; ret
+    VAR_GETTER("8D 46 0C 5E C3"),
+    // The twin as above (in ebx); movzx eax, byte [ebx+0x1c]; and eax,0xf;
+    // cmp eax,8; ja; jmp [eax*4+table] (by type)
+    "55 8B EC 83 EC 08 53 8B D9 8B 0D ? ? ? ? 8B 01 8B 90 88 02 00 00 56 57 FF D2 85 C0 74 2F 90 F6 43 1C 80 75 28 8A "
+    "43 1D 3C FF 74 21 8B 0D ? ? ? ? 0F B6 C0 8D 1C 80 8B 01 8B 90 88 02 00 00 8D 1C DD ? ? ? ? FF D2 85 C0 75 D2 0F "
     "B6 43 1C 83 E0 0F 83 F8 08 0F 87 ? ? ? ? FF 24 85",
     // mov eax,[ebx+4]; ...; ret
     "8B 43 04 5F 5E 5B 8B E5 5D C3",
