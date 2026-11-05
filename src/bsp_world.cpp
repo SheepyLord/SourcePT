@@ -1323,7 +1323,8 @@ bool loadPropModel(const std::string &path, int skin, PropModel &out) {
     g_world.propParts -= uint32_t(out.parts.size());
     out.parts.clear();
   }
-  return !out.parts.empty();
+  // Fully decoded additive-only models stay with the engine and do not occlude the bake.
+  return complete && (!out.parts.empty() || (out.additiveEngineParts != 0 && !out.missingBakeOccluders));
 }
 
 uint64_t propCell(const float origin[3]) {
