@@ -1,7 +1,9 @@
 > This project uses AI-generated code
 
-# SourcePT 
-> proper logo someday
+<p align="left">
+  <img src="https://github.com/user-attachments/assets/4dc256a6-8795-4c1b-885c-addf341d66eb" width="150" />
+</p>
+
 
 This is currently a proxy `shaderapidx9.dll` for a few Source Engine games that wraps the
 Source shader API (and later D3D9) to submit the game's rendering to
@@ -41,3 +43,6 @@ This is primarily built on Linux, Windows support is largely untested.
 
 Deploy: rename `bin/win64/shaderapidx9.dll` to `shaderapidx9_orig.dll` and copy
 `_build/shaderapidx9.dll` in its place.
+
+## Credits
+* Jane for helping me make the logo.
