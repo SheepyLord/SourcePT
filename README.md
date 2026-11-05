@@ -46,3 +46,4 @@ Deploy: rename `bin/win64/shaderapidx9.dll` to `shaderapidx9_orig.dll` and copy
 
 ## Credits
 * Jane for helping me make the logo.
+* Xenthio for ToPBR, Foward+, and general guidance
