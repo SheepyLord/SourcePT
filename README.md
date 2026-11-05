@@ -17,9 +17,10 @@ RTX Remix mods from the old version of the project will be supported, and also a
 Multiplayer works out of the box since everything lives in the wrapper.
 
 ### Games the wrapper works with
-* Garry's Mod
+* Garry's Mod **(CI only builds for this one)**
 * Left 4 Dead 2
 * Half-Life 2 RTX
+* Portal with RTX
 
 ## Installation
 - Ensure you're on the `main` branch of Garry's Mod on Steam (not `x86-64`)
