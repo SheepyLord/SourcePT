@@ -1,11 +1,11 @@
-// The 32-bit games' module helpers (x86_module.h).
-#include "x86_module.h"
+// The module helpers (pe_module.h).
+#include "pe_module.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
-namespace proxy::x86 {
+namespace proxy::pe {
 
 bool Module::open(const char *module) {
   const auto m = reinterpret_cast<uintptr_t>(GetModuleHandleA(module));
@@ -14,8 +14,9 @@ bool Module::open(const char *module) {
   const auto *dos = reinterpret_cast<const IMAGE_DOS_HEADER *>(m);
   if (dos->e_magic != IMAGE_DOS_SIGNATURE)
     return false;
-  const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS32 *>(m + dos->e_lfanew);
-  if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR32_MAGIC)
+  // The proxy's own format: PE32 (x86) or PE32+ (x64).
+  const auto *nt = reinterpret_cast<const IMAGE_NT_HEADERS *>(m + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR_MAGIC)
     return false;
   const auto *section = IMAGE_FIRST_SECTION(nt);
   for (unsigned i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section)
@@ -107,24 +108,42 @@ bool bytesAt(const Module &module, uintptr_t rva, const char *text) {
 }
 
 void **rttiVtable(const Module &module, const char *typeName) {
-  // TypeDescriptor: {vtable, spare, name[]}; CompleteObjectLocator: {signature
-  // 0, offset, cdOffset, TypeDescriptor *, ClassHierarchyDescriptor *}; the
-  // vtable's entry -1 points at the locator.
+  // TypeDescriptor: {vtable, spare (two pointers), name[]};
+  // CompleteObjectLocator: {signature, offset, cdOffset, TypeDescriptor,
+  // ClassHierarchyDescriptor[, itself]}, 32-bit fields: in PE32 addresses
+  // (signature 0), in PE32+ RVAs (signature 1, with the locator's own RVA).
+  // The vtable's entry -1 points at the locator.
+#ifdef _WIN64
+  constexpr uint32_t kSignature = 1;
+  constexpr size_t kLocatorBytes = 24;
+#else
+  constexpr uint32_t kSignature = 0;
+  constexpr size_t kLocatorBytes = 20;
+#endif
   const size_t length = std::strlen(typeName) + 1;
   const uint8_t *image = module.at<uint8_t>(0);
   for (uintptr_t at = module.codeEnd; at + length <= module.size; ++at) {
     if (image[at] != uint8_t(typeName[0]) || std::memcmp(image + at, typeName, length) != 0)
       continue;
-    const uint32_t descriptor = uint32_t(module.base + at - 8);
-    for (uintptr_t col = 0; col + 20 <= module.size; col += 4) {
+    const uintptr_t descriptorRva = at - 2 * sizeof(void *);
+#ifdef _WIN64
+    const uint32_t descriptor = uint32_t(descriptorRva);
+#else
+    const uint32_t descriptor = uint32_t(module.base + descriptorRva);
+#endif
+    for (uintptr_t col = 0; col + kLocatorBytes <= module.size; col += 4) {
       const auto *locator = reinterpret_cast<const uint32_t *>(image + col);
-      if (locator[3] != descriptor || locator[0] != 0 || locator[1] != 0)
+      if (locator[3] != descriptor || locator[0] != kSignature || locator[1] != 0)
         continue;
-      const uint32_t colAddress = uint32_t(module.base + col);
-      for (uintptr_t slot = 0; slot + 8 <= module.size; slot += 4) {
-        const auto *entry = reinterpret_cast<const uint32_t *>(image + slot);
-        if (entry[0] == colAddress && module.inCode(reinterpret_cast<void *>(uintptr_t(entry[1]))))
-          return reinterpret_cast<void **>(module.base + slot + 4);
+#ifdef _WIN64
+      if (locator[5] != col)
+        continue;
+#endif
+      const uintptr_t colAddress = module.base + col;
+      for (uintptr_t slot = 0; slot + 2 * sizeof(void *) <= module.size; slot += sizeof(void *)) {
+        const auto *entry = reinterpret_cast<const uintptr_t *>(image + slot);
+        if (entry[0] == colAddress && module.inCode(reinterpret_cast<void *>(entry[1])))
+          return reinterpret_cast<void **>(module.base + slot + sizeof(void *));
       }
     }
     return nullptr;
@@ -183,4 +202,4 @@ float envFloat(const char *name, float fallback) {
   return GetEnvironmentVariableA(full, v, sizeof(v)) ? float(std::atof(v)) : fallback;
 }
 
-} // namespace proxy::x86
+} // namespace proxy::pe

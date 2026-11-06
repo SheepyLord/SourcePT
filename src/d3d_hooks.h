@@ -15,8 +15,9 @@ namespace proxy::d3d {
 // (nullptr when the module does not import it).
 void *patchModuleImport(HMODULE module, const char *dll, const char *name, void *hook);
 
-// Hooks `module`'s import of d3d9!Direct3DCreate9. Call once, before the
-// shader API creates its device.
+// Hooks `module`'s import of d3d9!Direct3DCreate9, or when it has none its
+// GetProcAddress import (which then answers "Direct3DCreate9" with the hook).
+// Call once, before the shader API creates its device.
 bool install(HMODULE module);
 
 // Whether render target 0 is the back buffer (render thread): the views the

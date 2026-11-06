@@ -6,15 +6,18 @@
 
 // The game the proxy is built for, chosen when the build is configured
 // (meson option `game`): PROXY_GAME_GMOD, Garry's Mod x64 (bin/win64),
-// PROXY_GAME_L4D2, Left 4 Dead 2 (x86), or PROXY_GAME_HL2RTX, Half-Life 2 RTX
-// (x86, a Mapbase mod on NVIDIA's Portal RTX engine build). What differs
-// between them is named here; the rest of the proxy reads these instead of
-// literals.
-#if defined(PROXY_GAME_GMOD) + defined(PROXY_GAME_L4D2) + defined(PROXY_GAME_HL2RTX) != 1
-#error "define one of PROXY_GAME_GMOD, PROXY_GAME_L4D2, PROXY_GAME_HL2RTX (meson option game)"
+// PROXY_GAME_TF2, Team Fortress 2 x64 (bin/x64), PROXY_GAME_L4D2, Left 4 Dead
+// 2 (x86), or PROXY_GAME_HL2RTX, Half-Life 2 RTX (x86, a Mapbase mod on
+// NVIDIA's Portal RTX engine build). What differs between them is named here;
+// the rest of the proxy reads these instead of literals.
+#if defined(PROXY_GAME_GMOD) + defined(PROXY_GAME_TF2) + defined(PROXY_GAME_L4D2) + defined(PROXY_GAME_HL2RTX) != 1
+#error "define one of PROXY_GAME_GMOD, PROXY_GAME_TF2, PROXY_GAME_L4D2, PROXY_GAME_HL2RTX (meson option game)"
 #endif
 #if defined(PROXY_GAME_GMOD) && !defined(_WIN64)
 #error "the Garry's Mod proxy is a 64-bit DLL"
+#endif
+#if defined(PROXY_GAME_TF2) && !defined(_WIN64)
+#error "the Team Fortress 2 proxy is a 64-bit DLL (tf_win64.exe)"
 #endif
 #if defined(PROXY_GAME_L4D2) && defined(_WIN64)
 #error "the Left 4 Dead 2 proxy is a 32-bit DLL"
@@ -75,9 +78,83 @@ constexpr unsigned kRegFlexScale = 3;
 // Shader names as the materials report them (the stock ones).
 constexpr char kShaderPrefix[] = "";
 
+// The engine hooks (engine_hooks.cpp): markers reach the shader API through
+// the thread's render context, IMaterialSystem::GetRenderContext (98, no
+// AddRef), then IMatRenderContext::SetPIXMarker (140, jumps to IShaderAPI
+// slot 216).
+constexpr char kMaterialSystemInterface[] = "VMaterialSystem080";
+constexpr unsigned kSlotGetRenderContext = 98, kSlotContextSetPIXMarker = 140;
+constexpr bool kRenderContextAddRef = false;
+
+// ISurface (vguimatsurface.dll) SetCursorAlwaysVisible(bool), remix_ui.cpp:
+// VGUI_Surface030 slot 52 (stores the flag at +0x3c8, read by slot 53
+// IsCursorVisible).
+constexpr char kSurfaceInterface[] = "VGUI_Surface030";
+constexpr unsigned kSlotSetCursorAlwaysVisible = 52;
+
 // The runtime: OpenRemix in process, bin/win64/openremix/remix.dll (its
 // dependencies, SDL3, OpenUSD, DLSS, resolved from that directory).
 constexpr wchar_t kRuntimePath[] = L"\\openremix\\remix.dll"; // after the proxy's directory
+constexpr char kRuntimeLabel[] = "openremix\\remix.dll";
+constexpr wchar_t kRuntimeModule[] = L"remix.dll";
+constexpr char kRuntimeName[] = "remix.dll";
+
+#elif defined(PROXY_GAME_TF2)
+
+constexpr bool kGMod = false;
+
+// Team Fortress 2 x64 (tf_win64.exe, bin/x64; Steam app 440): Valve's SDK
+// 2013 multiplayer engine, the 64-bit build of 2024 on. Its shader API has
+// GMod's x64 interfaces (ShaderApi030, the same slot order through 253), and
+// it loads d3d9.dll itself: d3d_hooks hooks its GetProcAddress.
+constexpr char kShaderApiInterface[] = "ShaderApi030";
+constexpr char kHardwareConfigInterface[] = "MaterialSystemHardwareConfig012";
+// The tracker is wrapped but not hooked (as in L4D2: no Lua meshes).
+constexpr bool kHookVBAllocTracker = false;
+constexpr bool kFixedFunction = false;
+
+// IShaderAPIDX8 (ShaderApi030, shaderapidx9.dll of Nov 2026): see
+// slots_shaderapi_tf2.h. Each slot below read in its code against GMod's.
+// void SetLight(int lightNum, const LightDesc_t &desc), one at a time
+// (copies 0x58 bytes into its light array).
+constexpr unsigned kSlotSetLight = 127;
+constexpr bool kSetLightsArray = false;
+// void Bind(IMaterial *) (engine_materials, which checks its code).
+constexpr unsigned kSlotBind = 114;
+// void SetPIXMarker(unsigned long color, const char *name) (a stub).
+constexpr unsigned kSlotSetPIXMarker = 216;
+// void GetMatrix(MaterialMatrixMode_t, float *dst) (copies its stack's top
+// matrix); int GetCurrentNumBones() const.
+constexpr unsigned kSlotGetMatrix = 12;
+constexpr unsigned kSlotGetCurrentNumBones = 34;
+// GetSceneFogMode 4, GetSceneFogColor 5, GetFogDistances 213, as in GMod.
+constexpr unsigned kSlotGetSceneFogMode = 4, kSlotGetSceneFogColor = 5, kSlotGetFogDistances = 213;
+constexpr bool kSceneFogSlots = true;
+
+// TF2's vertex shaders (their constant tables: c3 cFlexScale, c8 cViewProj,
+// c58 cModel), as GMod's.
+constexpr unsigned kRegFlexScale = 3;
+constexpr char kShaderPrefix[] = "";
+
+// The engine hooks (engine_hooks.cpp), as GMod's but for TF2's material
+// system: VMaterialSystem082 (080 hands out the same object), whose
+// GetRenderContext is slot 98 (the thread-local context at +0x2478, else the
+// hardware one at +0x2480, returned with a reference: AddRef, its slot 0;
+// Release is slot 1) and IMatRenderContext::SetPIXMarker slot 142 (jmp
+// [rax+0x6c0]: IShaderAPI slot 216; the queued context's 142 queues the
+// string). (Slot 94 only looks like it: add rcx,0x3a0; jmp to a function that
+// fills an array the caller passes.)
+constexpr char kMaterialSystemInterface[] = "VMaterialSystem082";
+constexpr unsigned kSlotGetRenderContext = 98, kSlotContextSetPIXMarker = 142;
+constexpr bool kRenderContextAddRef = true;
+
+// ISurface SetCursorAlwaysVisible(bool): VGUI_Surface030 slot 52 (stores the
+// flag at +0x3a0).
+constexpr char kSurfaceInterface[] = "VGUI_Surface030";
+constexpr unsigned kSlotSetCursorAlwaysVisible = 52;
+
+// The runtime: OpenRemix in process, as in GMod: bin/x64/openremix/remix.dll.
+constexpr wchar_t kRuntimePath[] = L"\\openremix\\remix.dll";
 constexpr char kRuntimeLabel[] = "openremix\\remix.dll";
 constexpr wchar_t kRuntimeModule[] = L"remix.dll";
 constexpr char kRuntimeName[] = "remix.dll";

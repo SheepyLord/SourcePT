@@ -3,7 +3,7 @@
 #include "game.h"
 #include "remix_output.h"
 #ifndef PROXY_GAME_GMOD
-#include "x86_module.h"
+#include "pe_module.h"
 #endif
 
 #include <windows.h>
@@ -101,6 +101,26 @@
 //     slot 139 (call [eax+0x22c]) for the thread's call queue.
 //   CMaterialSubRect: its name symbol at +0xc, the page at +4.
 //   MaterialVarFlags_t: SDK 2013's.
+//
+// Team Fortress 2 (x64, bin/x64 materialsystem.dll and shaderapidx9_orig.dll
+// of Nov 2026): found and checked as in L4D2 (the classes by their x64 RTTI),
+// GMod's slots with a layout of its own:
+//   CShaderAPIDx8 (ShaderApi030, its IShaderAPIDX8 subobject at +0x388): 114
+//     Bind(IMaterial *), as GMod's: compares the pages of two sub-rectangles,
+//     then flushes (slot 115: call [rax+0x398]) before it stores m_pMaterial
+//     ([this+0x2df0]).
+//   CMaterial: 0 GetName (add rcx,0x20: its name symbol), 40 ShaderParamCount
+//     (movzx eax, byte [rcx+0x2a]), 41 GetShaderParams (mov rax,[rcx+0x50]),
+//     49 GetShaderName (PrecacheVars, slot 63, first; the shader at
+//     [rcx+0x18]).
+//   CMaterialVar: GMod's slots; name symbol +0x26, type the low nibble of
+//     +0x24 (as GMod), string +8, int +0x10, float = vector +0x14, ITexture
+//     (texture vars) +0x30. The getters ask CMaterialSystem slot 148 (call
+//     [rax+0x4a0]) for the thread's call queue and while there is one forward
+//     to a twin in a static array (index byte +0x25). GetStringValue's jump
+//     table holds RVAs.
+//   CMaterialSubRect: its name symbol at +0x14, the page at +8 (as GMod).
+//   MaterialVarFlags_t: SDK 2013's ($model bit 11, checked in its table).
 namespace proxy::engine_materials {
 namespace {
 
@@ -123,12 +143,18 @@ constexpr size_t kMaterialCount = 0x32, kMaterialParams = 0x38, kMaterialName = 
 // CMaterialVar: type nibble, ITexture * of a texture var.
 constexpr size_t kVarType = 0x24, kVarTexture = 0x39;
 #else
-// L4D2, Half-Life 2 RTX: as the code checked at install reads them (see above).
+// L4D2, Half-Life 2 RTX, TF2: as the code checked at install reads them (see
+// above).
 constexpr unsigned kSlotGetName = 0, kSlotParamCount = 40, kSlotParams = 41, kSlotShaderName = 49;
 constexpr unsigned kVarGetName = 1, kVarGetString = 6, kVarIsDefined = 17, kVarGetInt = 26, kVarGetFloat = 27,
                    kVarGetVec = 29;
 constexpr unsigned kSlotInPage = 7, kSlotPage = 10;
 constexpr unsigned kSlotBind = game::kSlotBind;
+#ifdef PROXY_GAME_TF2
+constexpr size_t kSubRectPageOffset = 0x8, kSubRectNameOffset = 0x14;
+constexpr size_t kMaterialCount = 0x2a, kMaterialParams = 0x50, kMaterialName = 0x20, kMaterialShader = 0x18;
+constexpr size_t kVarType = 0x24, kVarTexture = 0x30;
+#else
 #ifdef PROXY_GAME_L4D2
 constexpr size_t kSubRectPageOffset = 0x4, kSubRectNameOffset = 0x10;
 #else
@@ -136,6 +162,7 @@ constexpr size_t kSubRectPageOffset = 0x4, kSubRectNameOffset = 0xc;
 #endif
 constexpr size_t kMaterialCount = 0x22, kMaterialParams = 0x24, kMaterialName = 0x18, kMaterialShader = 0x14;
 constexpr size_t kVarType = 0x1c, kVarTexture = 0x24;
+#endif
 #endif
 // MaterialVarType_t: float 0, string 1, vector 2, texture 3, int 4, fourcc 5, undefined 6, matrix 7, material 8.
 constexpr uint8_t kTypeFloat = 0, kTypeString = 1, kTypeVector = 2, kTypeTexture = 3, kTypeInt = 4, kTypeUndefined = 6;
@@ -592,24 +619,33 @@ void readPbr(Entry &e, int flags, Shading &out) {
 #ifndef PROXY_GAME_GMOD
 // The code checked, per game (see above): the same functions, as each
 // compiler built them.
-struct X86Code {
+struct Code {
   const char *bind;           // IShaderAPI::Bind, from its entry
   const char *bindTail;       // ... and at bindTailOffset (null: none)
   size_t bindTailOffset;
+  const char *materialName;   // CMaterial::GetName
+  const char *paramCount;     // CMaterial::ShaderParamCount
+  const char *params;         // CMaterial::GetShaderParams
   const char *shaderName;     // CMaterial::GetShaderName
+  const char *varName;        // CMaterialVar::GetName
   const char *varDefined;     // CMaterialVar::IsDefined
-  const char *varString;      // CMaterialVar::GetStringValue, up to its jump table's address
+  const char *varInt;         // CMaterialVar::GetIntValueInternal
+  const char *varFloat;       // CMaterialVar::GetFloatValueInternal
+  const char *varVec;         // CMaterialVar::GetVecValueInternal
+  const char *varString;      // CMaterialVar::GetStringValue, up to its jump table's address (x64: RVA)
+  const char *stringCase;     // ... its string case
   const char *textureCase;    // ... its texture case
   const char *subRectName;    // CMaterialSubRect::GetName
+  const char *subRectPage;    // CMaterialSubRect::GetMaterialPage
 };
 #ifdef PROXY_GAME_L4D2
 // The CMaterialVar getters: whether the calling thread's render context has a
 // call queue (g_pMaterialSystem, slot 137), and while it does the queue
 // thread's twin; then the value (the tail).
-#define X86_VAR_GETTER(tail)                                                                                          \
+#define VAR_GETTER(tail)                                                                                              \
   "56 8B F1 8B 0D ? ? ? ? 8B 01 8B 90 24 02 00 00 FF D2 85 C0 74 2E F6 46 1C 80 75 28 8A 46 1D 3C FF 74 21 8B 0D ? ? " \
   "? ? 0F B6 C0 8D 34 80 8B 01 8B 90 24 02 00 00 8D 34 F5 ? ? ? ? FF D2 85 C0 75 D2 " tail
-constexpr X86Code kCode = {
+constexpr Code kCode = {
     // push esi; mov esi,[ebp+8]; push edi; mov edi,ecx; mov ecx,[edi+0x2bd4]
     // (m_pMaterial); ... InMaterialPage (slot 7) on both; ...; GetMaterialPage
     // (slot 10) on both; ...; mov [edi+0x2bd4],esi; ...; ret 4
@@ -617,26 +653,42 @@ constexpr X86Code kCode = {
     "8B 50 1C 8B CE FF D2 84 C0 74 ? 8B 8F D4 2B 00 00 8B 01 8B 50 28 53 FF D2 8B D8 8B 06 8B 50 28 8B CE FF D2 "
     "3B D8 0F 95 C0 5B 84 C0 74 ? 89 B7 D4 2B 00 00 5F 5E 5D C2 04 00",
     nullptr, 0,
+    // add ecx,0x18 (the name symbol); jmp CUtlSymbol::String
+    "83 C1 18 E9",
+    "0F B6 41 22 C3",
+    "8B 41 24 C3",
     // cmp [ecx+0x14],0; je; mov ecx,[ecx+0x14]; mov eax,[ecx]; mov edx,[eax]; jmp edx (IShader::GetName)
     "83 79 14 00 74 09 8B 49 14 8B 01 8B 10 FF E2",
+    // push esi; movzx esi, word [ecx+0x1e] (the name symbol); 0xffff: none
+    "56 0F B7 71 1E B8 FF FF 00 00 66 3B F0",
     // mov al,[ecx+0x1c]; and al,0xf; xor ecx,ecx; cmp al,6; setne al; ret
     "8A 41 1C 24 0F 33 C9 3C 06 0F 95 C0 C3",
+    // ...; mov eax,[esi+8]; pop esi; ret
+    VAR_GETTER("8B 46 08 5E C3"),
+    // ...; fld dword [esi+0xc]; pop esi; ret
+    VAR_GETTER("D9 46 0C 5E C3"),
+    // ...; lea eax,[esi+0xc]; pop esi; ret
+    VAR_GETTER("8D 46 0C 5E C3"),
     // The twin as above (in ebx); movzx eax, byte [ebx+0x1c]; and eax,0xf;
     // cmp eax,8; ja; jmp [eax*4+table] (by type)
     "55 8B EC 83 EC 08 53 8B D9 8B 0D ? ? ? ? 8B 01 8B 90 24 02 00 00 56 57 FF D2 85 C0 74 2F 90 F6 43 1C 80 75 28 8A "
     "43 1D 3C FF 74 21 8B 0D ? ? ? ? 0F B6 C0 8D 1C 80 8B 01 8B 90 24 02 00 00 8D 1C DD ? ? ? ? FF D2 85 C0 75 D2 0F "
     "B6 43 1C 83 E0 0F 83 F8 08 0F 87 ? ? ? ? FF 24 85",
+    // mov eax,[ebx+4]; ...; ret
+    "8B 43 04 5F 5E 5B 8B E5 5D C3",
     // cmp [ebx+0x24],-1; jne; ... mov eax,"env_cubemap"; ...; mov ecx,[ebx+0x24]; mov edx,[ecx]; mov eax,[edx]; call eax
     "83 7B 24 FF 75 0C 5F 5E B8 ? ? ? ? 5B 8B E5 5D C3 8B 4B 24 8B 11 8B 02 FF D0",
     // add ecx,0x10 (its name symbol); jmp CUtlSymbol::String
     "83 C1 10 E9",
+    // mov eax,[ecx+4] (the page)
+    "8B 41 04 C3",
 };
-#else
+#elif defined(PROXY_GAME_HL2RTX)
 // Half-Life 2 RTX: the getters ask slot 139 (call [eax+0x22c]).
-#define X86_VAR_GETTER(tail)                                                                                          \
+#define VAR_GETTER(tail)                                                                                              \
   "56 8B F1 8B 0D ? ? ? ? 8B 01 FF 90 2C 02 00 00 85 C0 74 2C F6 46 1C 80 75 26 8A 46 1D 3C FF 74 1F 8B 0D ? ? ? ? " \
   "0F B6 C0 8D 04 80 8D 34 C5 ? ? ? ? 8B 01 FF 90 2C 02 00 00 85 C0 75 D4 " tail
-constexpr X86Code kCode = {
+constexpr Code kCode = {
     // push ebx; mov ebx,ecx; push edi; mov edi,[ebp+8]; mov ecx,[ebx+0xde34]
     // (m_pMaterial); ... InMaterialPage (slot 7) on both; ...; GetMaterialPage
     // (slot 10) on both; ...; cmp ecx,edi (the same material: nothing to do)
@@ -646,21 +698,90 @@ constexpr X86Code kCode = {
     // mov eax,[ebx]; mov ecx,ebx; call [eax+0x1c8] (FlushBufferedPrimitives,
     // slot 114); mov [ebx+0xde34],edi; pop edi; pop ebx; pop ebp; ret 4
     "8B 03 8B CB FF 90 C8 01 00 00 89 BB 34 DE 00 00 5F 5B 5D C2 04 00", 0x77,
+    // add ecx,0x18 (the name symbol); jmp CUtlSymbol::String
+    "83 C1 18 E9",
+    "0F B6 41 22 C3",
+    "8B 41 24 C3",
     // push esi; mov esi,ecx; PrecacheVars(0,0,0,0) (slot 63); mov ecx,[esi+0x14];
     // pop esi; test ecx,ecx; je; mov eax,[ecx]; jmp [eax] (IShader::GetName)
     "56 8B F1 6A 00 6A 00 6A 00 8B 06 6A 00 FF 90 FC 00 00 00 8B 4E 14 5E 85 C9 74 04 8B 01 FF 20",
+    // push esi; movzx esi, word [ecx+0x1e] (the name symbol); 0xffff: none
+    "56 0F B7 71 1E B8 FF FF 00 00 66 3B F0",
     // mov cl,[ecx+0x1c]; xor eax,eax; and cl,0xf; cmp cl,6; setne al; ret
     "8A 49 1C 33 C0 80 E1 0F 80 F9 06 0F 95 C0 C3",
+    // ...; mov eax,[esi+8]; pop esi; ret
+    VAR_GETTER("8B 46 08 5E C3"),
+    // ...; fld dword [esi+0xc]; pop esi; ret
+    VAR_GETTER("D9 46 0C 5E C3"),
+    // ...; lea eax,[esi+0xc]; pop esi; ret
+    VAR_GETTER("8D 46 0C 5E C3"),
     // The twin as above (in ebx); movzx eax, byte [ebx+0x1c]; and eax,0xf;
     // cmp eax,8; ja; jmp [eax*4+table] (by type)
     "55 8B EC 83 EC 08 53 8B D9 8B 0D ? ? ? ? 56 57 8B 01 FF 90 2C 02 00 00 85 C0 74 2F 8D 49 00 F6 43 1C 80 75 26 8A "
     "43 1D 3C FF 74 1F 8B 0D ? ? ? ? 0F B6 C0 8D 04 80 8D 1C C5 ? ? ? ? 8B 01 FF 90 2C 02 00 00 85 C0 75 D4 0F B6 43 "
     "1C 83 E0 0F 83 F8 08 0F 87 ? ? ? ? FF 24 85",
+    // mov eax,[ebx+4]; ...; ret
+    "8B 43 04 5F 5E 5B 8B E5 5D C3",
     // mov ecx,[ebx+0x24]; cmp ecx,-1; jne; ... mov eax,"env_cubemap"; ...;
     // mov ecx,[ebx+0x24]; mov eax,[ecx]; call [eax]
     "8B 4B 24 83 F9 FF 75 0F 5F 5E B8 ? ? ? ? 5B 8B E5 5D C3 8B 4B 24 8B 01 FF 10",
     // add ecx,0xc (its name symbol); jmp CUtlSymbol::String
     "83 C1 0C E9",
+    // mov eax,[ecx+4] (the page)
+    "8B 41 04 C3",
+};
+#else
+// TF2 (x64): the getters ask g_pMaterialSystem's slot 148 (call [rax+0x4a0])
+// for the thread's call queue; while there is one, a var that is not fake
+// (byte [+0x24] >= 0) and belongs to the material system ([+0x38]) forwards
+// to its queue-thread twin, in a 64-byte array indexed by byte [+0x25]; then
+// the value (the tail, after its je to the same tail).
+#define VAR_GETTER(tail)                                                                                              \
+  "40 53 48 83 EC 20 48 8B D9 48 8B 0D ? ? ? ? 48 8B 01 FF 90 A0 04 00 00 48 85 C0 74 ? 48 89 7C 24 30 48 8D 3D ? ? " \
+  "? ? 66 0F 1F 44 00 00 80 7B 24 00 7C 2D 48 8B 05 ? ? ? ? 48 39 43 38 75 20 0F B6 5B 25 48 8B 0D ? ? ? ? 48 C1 E3 " \
+  "06 48 03 DF 48 8B 01 FF 90 A0 04 00 00 48 85 C0 75 CD " tail
+constexpr Code kCode = {
+    // mov rsi,rcx; mov rdi,rdx; mov rcx,[rcx+0x2df0] (m_pMaterial); ...
+    // InMaterialPage (slot 7) on both
+    "48 89 74 24 10 57 48 83 EC 20 48 8B F1 48 8B FA 48 8B 89 F0 2D 00 00 48 85 C9 74 ? 48 85 D2 74 ? 48 8B 01 FF "
+    "50 38",
+    // mov rax,[rsi]; mov rcx,rsi; call [rax+0x398] (FlushBufferedPrimitives,
+    // slot 115); mov [rsi+0x2df0],rdi
+    "48 8B 06 48 8B CE FF 90 98 03 00 00 48 89 BE F0 2D 00 00", 0x8d,
+    // add rcx,0x20 (the name symbol); jmp CUtlSymbol::String
+    "48 83 C1 20 E9",
+    "0F B6 41 2A C3",
+    "48 8B 41 50 C3",
+    // PrecacheVars (slot 63; returns at once on a precached material); mov
+    // rcx,[rbx+0x18]; ... jmp [rax] (IShader::GetName)
+    "40 53 48 83 EC 30 48 8B 01 45 33 C9 45 33 C0 C7 44 24 20 00 00 00 00 33 D2 48 8B D9 FF 90 F8 01 00 00 48 8B 4B "
+    "18 48 85 C9 74 0B 48 8B 01 48 83 C4 30 5B 48 FF 20",
+    // movzx ebx, word [rcx+0x26] (the name symbol); 0xffff: none
+    "40 53 48 83 EC 20 0F B7 59 26 B8 FF FF 00 00 66 3B D8",
+    // movzx eax, byte [rcx+0x24]; and al,0xf; cmp al,6; setne al; ret
+    "0F B6 41 24 24 0F 3C 06 0F 95 C0 C3",
+    // ...; mov eax,[rbx+0x10]; ...; ret
+    VAR_GETTER("8B 43 10 48 8B 7C 24 30 48 83 C4 20 5B C3"),
+    // ...; movss xmm0,[rbx+0x14]; ...; ret
+    VAR_GETTER("F3 0F 10 43 14 48 8B 7C 24 30 48 83 C4 20 5B C3"),
+    // ...; lea rax,[rbx+0x14]; ...; ret
+    VAR_GETTER("48 8B 7C 24 30 48 8D 43 14 48 83 C4 20 5B C3"),
+    // The twin as above (in rbx); movzx eax, byte [rbx+0x24]; and eax,0xf;
+    // cmp eax,8; ja; lea rdx,[image base]; mov ecx,[rdx+rax*4+table] (by
+    // type); add rcx,rdx; jmp rcx
+    "40 53 57 48 83 EC 28 48 8B D9 48 8B 0D ? ? ? ? 48 8B 01 FF 90 A0 04 00 00 48 85 C0 74 3A 48 8D 3D ? ? ? ? 80 7B "
+    "24 00 7C 2D 48 8B 05 ? ? ? ? 48 39 43 38 75 20 0F B6 5B 25 48 8B 0D ? ? ? ? 48 C1 E3 06 48 03 DF 48 8B 01 FF 90 "
+    "A0 04 00 00 48 85 C0 75 CD 0F B6 43 24 83 E0 0F 48 89 6C 24 40 48 89 74 24 48 83 F8 08 0F 87 ? ? ? ? 48 8D 15 ? "
+    "? ? ? 48 98 8B 8C 82",
+    // mov rax,[rbx+8]; ...; ret
+    "48 8B 43 08 48 8B 74 24 48 48 8B 6C 24 40 48 83 C4 28 5F 5B C3",
+    // mov rcx,[rbx+0x30]; cmp rcx,-1; jne; lea rax,"env_cubemap"; ...; ret;
+    // mov rax,[rcx]; call [rax] (ITexture::GetName)
+    "48 8B 4B 30 48 83 F9 FF 75 18 48 8D 05 ? ? ? ? 48 8B 74 24 48 48 8B 6C 24 40 48 83 C4 28 5F 5B C3 48 8B 01 FF 10",
+    // add rcx,0x14 (its name symbol); jmp CUtlSymbol::String
+    "48 83 C1 14 E9",
+    // mov rax,[rcx+8] (the page)
+    "48 8B 41 08 C3",
 };
 #endif
 
@@ -680,8 +801,10 @@ size_t patternBytes(const char *text) {
   return n;
 }
 
-bool installX86(const void *const *shaderApiVtable) {
-  static x86::Module materials, shaderApi;
+// L4D2, Half-Life 2 RTX, TF2: the classes by their RTTI, each function used
+// checked against kCode.
+bool installFound(const void *const *shaderApiVtable) {
+  static pe::Module materials, shaderApi;
   if (!materials.open("materialsystem.dll")) {
     g_status = "no materialsystem.dll";
     return false;
@@ -692,8 +815,8 @@ bool installX86(const void *const *shaderApiVtable) {
     g_detail = "shaderapidx9_orig.dll";
     return false;
   }
-  auto code = [](const x86::Module &m, const void *function, const char *bytes, size_t offset = 0) {
-    return m.inCode(function) && x86::bytesAt(m, reinterpret_cast<uintptr_t>(function) - m.base + offset, bytes);
+  auto code = [](const pe::Module &m, const void *function, const char *bytes, size_t offset = 0) {
+    return m.inCode(function) && pe::bytesAt(m, reinterpret_cast<uintptr_t>(function) - m.base + offset, bytes);
   };
   static char bindName[40];
   std::snprintf(bindName, sizeof(bindName), "IShaderAPI::Bind (slot %u)", kSlotBind);
@@ -703,8 +826,8 @@ bool installX86(const void *const *shaderApiVtable) {
     g_detail = bindName;
     return false;
   }
-  void **material = x86::rttiVtable(materials, ".?AVCMaterial@@");
-  void **var = x86::rttiVtable(materials, ".?AVCMaterialVar@@");
+  void **material = pe::rttiVtable(materials, ".?AVCMaterial@@");
+  void **var = pe::rttiVtable(materials, ".?AVCMaterialVar@@");
   if (!material || !var) {
     g_status = "class not found (RTTI)";
     g_detail = material ? "CMaterialVar" : "CMaterial";
@@ -717,20 +840,15 @@ bool installX86(const void *const *shaderApiVtable) {
     const char *name;
   };
   const Slot slots[] = {
-      // add ecx,0x18 (the name symbol); jmp CUtlSymbol::String
-      {material, kSlotGetName, "83 C1 18 E9", "CMaterial::GetName"},
-      {material, kSlotParamCount, "0F B6 41 22 C3", "CMaterial::ShaderParamCount"},
-      {material, kSlotParams, "8B 41 24 C3", "CMaterial::GetShaderParams"},
+      {material, kSlotGetName, kCode.materialName, "CMaterial::GetName"},
+      {material, kSlotParamCount, kCode.paramCount, "CMaterial::ShaderParamCount"},
+      {material, kSlotParams, kCode.params, "CMaterial::GetShaderParams"},
       {material, kSlotShaderName, kCode.shaderName, "CMaterial::GetShaderName"},
-      // push esi; movzx esi, word [ecx+0x1e] (the name symbol); 0xffff: none
-      {var, kVarGetName, "56 0F B7 71 1E B8 FF FF 00 00 66 3B F0", "CMaterialVar::GetName"},
+      {var, kVarGetName, kCode.varName, "CMaterialVar::GetName"},
       {var, kVarIsDefined, kCode.varDefined, "CMaterialVar::IsDefined"},
-      // ...; mov eax,[esi+8]; pop esi; ret
-      {var, kVarGetInt, X86_VAR_GETTER("8B 46 08 5E C3"), "CMaterialVar::GetIntValueInternal"},
-      // ...; fld dword [esi+0xc]; pop esi; ret
-      {var, kVarGetFloat, X86_VAR_GETTER("D9 46 0C 5E C3"), "CMaterialVar::GetFloatValueInternal"},
-      // ...; lea eax,[esi+0xc]; pop esi; ret
-      {var, kVarGetVec, X86_VAR_GETTER("8D 46 0C 5E C3"), "CMaterialVar::GetVecValueInternal"},
+      {var, kVarGetInt, kCode.varInt, "CMaterialVar::GetIntValueInternal"},
+      {var, kVarGetFloat, kCode.varFloat, "CMaterialVar::GetFloatValueInternal"},
+      {var, kVarGetVec, kCode.varVec, "CMaterialVar::GetVecValueInternal"},
       {var, kVarGetString, kCode.varString, "CMaterialVar::GetStringValue"},
   };
   for (const Slot &s : slots)
@@ -739,17 +857,25 @@ bool installX86(const void *const *shaderApiVtable) {
       g_detail = s.name;
       return false;
     }
-  // GetStringValue's jump table (its address in the jmp above): the string
-  // case returns [ebx+4]; the texture case returns "env_cubemap" for the
-  // ITexture -1 at [ebx+0x24], else formats that texture's name (its slot 0).
+  // GetStringValue's jump table (its address in the jump above; x64: an RVA,
+  // its entries RVAs too): the string case returns the var's string; the
+  // texture case returns "env_cubemap" for the ITexture -1 at kVarTexture,
+  // else formats that texture's name (its slot 0).
   {
     const auto *string = static_cast<const uint8_t *>(var[kVarGetString]);
     uint32_t table;
     std::memcpy(&table, string + patternBytes(kCode.varString), sizeof(table));
+#ifdef _WIN64
+    const auto *entries = materials.at<const uint32_t>(table);
+    auto at = [&](unsigned type) -> const void * { return materials.at<const uint8_t>(entries[type]); };
+    const bool inside = materials.has(table, (kTypeTexture + 1) * sizeof(uint32_t));
+#else
     const void *const *cases = reinterpret_cast<const void *const *>(uintptr_t(table));
-    if (!materials.holds(cases) || !materials.holds(cases + kTypeTexture) ||
-        !code(materials, cases[kTypeString], "8B 43 04 5F 5E 5B 8B E5 5D C3") ||
-        !code(materials, cases[kTypeTexture], kCode.textureCase)) {
+    auto at = [&](unsigned type) { return cases[type]; };
+    const bool inside = materials.holds(cases) && materials.holds(cases + kTypeTexture);
+#endif
+    if (!inside || !code(materials, at(kTypeString), kCode.stringCase) ||
+        !code(materials, at(kTypeTexture), kCode.textureCase)) {
       g_status = "code mismatch";
       g_detail = "CMaterialVar::GetStringValue's string and texture cases";
       return false;
@@ -765,17 +891,17 @@ bool installX86(const void *const *shaderApiVtable) {
   g_varFloat = reinterpret_cast<FloatFn>(var[kVarGetFloat]);
   g_varVec = reinterpret_cast<VecFn>(var[kVarGetVec]);
   // Sub-rectangle materials (optional, as in GMod): GetName (its name symbol,
-  // CUtlSymbol::String); mov al,1; mov eax,[ecx+4] (the page).
-  if (void **subRect = x86::rttiVtable(materials, ".?AVCMaterialSubRect@@");
+  // CUtlSymbol::String); mov al,1; the page.
+  if (void **subRect = pe::rttiVtable(materials, ".?AVCMaterialSubRect@@");
       subRect && materials.holds(subRect + kSlotPage) && code(materials, subRect[kSlotGetName], kCode.subRectName) &&
-      code(materials, subRect[kSlotInPage], "B0 01 C3") && code(materials, subRect[kSlotPage], "8B 41 04 C3")) {
+      code(materials, subRect[kSlotInPage], "B0 01 C3") && code(materials, subRect[kSlotPage], kCode.subRectPage)) {
     g_subRectName = reinterpret_cast<NameFn>(subRect[kSlotGetName]);
     g_subRectVtable = reinterpret_cast<uintptr_t>(subRect);
     g_subRects = true;
   }
   return true;
 }
-#undef X86_VAR_GETTER
+#undef VAR_GETTER
 #endif
 
 } // namespace
@@ -896,7 +1022,7 @@ bool install(const void *const *shaderApiVtable) {
   g_status = g_subRects ? "ok (IShaderAPI::Bind read, sub-rectangle materials through their page)"
                         : "ok (IShaderAPI::Bind read; CMaterialSubRect layout not recognized: decal atlases unread)";
 #else
-  if (!installX86(shaderApiVtable))
+  if (!installFound(shaderApiVtable))
     return false;
   g_status = g_subRects ? "ok (IShaderAPI::Bind read, classes by RTTI, sub-rectangle materials through their page)"
                         : "ok (IShaderAPI::Bind read, classes by RTTI; CMaterialSubRect not recognized: decal atlases unread)";
