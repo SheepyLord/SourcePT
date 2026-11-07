@@ -30,6 +30,7 @@ bool install() { return false; }
 void dumpStatistics(FILE *) {}
 } // namespace proxy::engine_shadows
 
+#if !defined(PROXY_GAME_EZ2)
 namespace proxy::engine_lights {
 bool install() { return false; }
 void sample() {}
@@ -40,3 +41,5 @@ std::shared_ptr<const Snapshot> current() { return nullptr; }
 void report(uint32_t, uint32_t, uint32_t) {}
 void dumpStatistics(FILE *) {}
 } // namespace proxy::engine_lights
+#endif
+

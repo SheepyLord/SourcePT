@@ -18,6 +18,7 @@ ULONGLONG g_start = 0;
 std::atomic<int> g_reports{0};
 std::atomic<bool> g_reporting{false}, g_dumped{false};
 LPTOP_LEVEL_EXCEPTION_FILTER g_previousFilter = nullptr;
+PVOID g_vectoredHandler = nullptr;
 
 using MiniDumpWriteDumpFn = BOOL(WINAPI *)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION,
                                            PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
@@ -311,7 +312,7 @@ void install(HMODULE self) {
   _snwprintf(path, MAX_PATH, L"%ls\\shaderapi_proxy_crash.dmp", g_dir);
   DeleteFileW(path); // a previous run's
   header(self);
-  AddVectoredExceptionHandler(1, &vectored);
+  g_vectoredHandler = AddVectoredExceptionHandler(1, &vectored);
   g_previousFilter = SetUnhandledExceptionFilter(&unhandled);
 }
 
@@ -326,6 +327,17 @@ void reinstall() {
   const auto previous = SetUnhandledExceptionFilter(&unhandled);
   if (previous != &unhandled)
     g_previousFilter = previous;
+}
+
+void uninstall() {
+  if (g_vectoredHandler) {
+    RemoveVectoredExceptionHandler(g_vectoredHandler);
+    g_vectoredHandler = nullptr;
+  }
+  if (g_previousFilter) {
+    SetUnhandledExceptionFilter(g_previousFilter);
+    g_previousFilter = nullptr;
+  }
 }
 
 void stage(const char *fmt, ...) {

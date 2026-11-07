@@ -35,6 +35,12 @@ bool targetTexture(const void *texture, uint32_t &width, uint32_t &height, uint3
 // A shader object's D3D9 bytecode (nullptr: not seen at creation).
 std::shared_ptr<const std::vector<uint32_t>> shaderCode(const void *shader);
 
+// A volume texture's contents as the engine last wrote them (B8G8R8A8), for
+// a default-pool volume that cannot be locked (Entropy : Zero 2 only). The
+// version counts the writes (0: none seen).
+uint32_t volumeVersion(const void *texture);
+bool volumeCopy(const void *texture, uint32_t &width, uint32_t &height, uint32_t &depth, std::vector<uint8_t> &pixels);
+
 // Writes per-interval draw statistics and resets the interval counters.
 void dumpStatistics(FILE *out);
 

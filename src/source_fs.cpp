@@ -185,7 +185,7 @@ void addVpk(const std::wstring &dirFile) {
     g_paths.push_back({{}, std::move(vpk)});
 }
 
-#ifdef PROXY_GAME_HL2RTX
+#if defined(PROXY_GAME_HL2RTX) || defined(PROXY_GAME_EZ2)
 // A "directory/*" search path: its subdirectories loose and its packages
 // (<name>_dir.vpk), in alphabetical order as the engine mounts them.
 void addEach(const std::wstring &directory) {
@@ -311,7 +311,7 @@ void index() {
     addLoose(dir);
     addVpk(std::wstring(dir) + L"\\pak01_dir.vpk");
   }
-#else
+#elif defined(PROXY_GAME_HL2RTX)
   // hl2rtx/gameinfo.txt SearchPaths (game paths, in order): hl2rtx/custom/*,
   // the mod, Half-Life 2's packages, Mapbase's (mapbase_hl2/*, its shared
   // content), then hl2 and platform loose.
@@ -322,6 +322,30 @@ void index() {
   addVpk(L"platform\\platform_misc_dir.vpk");
   addEach(L"hl2rtx\\mapbase\\mapbase_hl2");
   addVpk(L"hl2rtx\\mapbase\\mapbase_shared\\shared_content_v7_0_dir.vpk");
+  addLoose(L"hl2");
+  addLoose(L"platform");
+#elif defined(PROXY_GAME_EZ2)
+  // Entropy : Zero 2 search paths (entropyzero2/gameinfo.txt)
+  addEach(L"entropyzero2\\custom");
+  addEach(L"ep2\\custom");
+  addEach(L"episodic\\custom");
+  addEach(L"hl2\\custom");
+  // Workshop addons (|gameinfo_path|../../../workshop/content/1583720/*).
+  addEach(L"..\\..\\workshop\\content\\1583720");
+  addEach(L"entropyzero2\\ez2");
+  addLoose(L"entropyzero2");
+  addEach(L"mapbase\\episodic");
+  addEach(L"mapbase\\hl2");
+  addEach(L"mapbase\\css_weapons_in_hl2\\content");
+  addLoose(L"mapbase\\css_weapons_in_hl2");
+  addVpk(L"mapbase\\shared\\shared_content_v7_0_dir.vpk");
+  addVpk(L"ep2\\ep2_pak_dir.vpk");
+  addVpk(L"episodic\\ep1_pak_dir.vpk");
+  for (const wchar_t *vpk : {L"hl2_pak", L"hl2_textures", L"hl2_sound_vo_english", L"hl2_sound_misc", L"hl2_misc"})
+    addVpk(std::wstring(L"hl2\\") + vpk + L"_dir.vpk");
+  addVpk(L"platform\\platform_misc_dir.vpk");
+  addLoose(L"ep2");
+  addLoose(L"episodic");
   addLoose(L"hl2");
   addLoose(L"platform");
 #endif

@@ -6,12 +6,13 @@
 
 // The game the proxy is built for, chosen when the build is configured
 // (meson option `game`): PROXY_GAME_GMOD, Garry's Mod x64 (bin/win64),
-// PROXY_GAME_L4D2, Left 4 Dead 2 (x86), or PROXY_GAME_HL2RTX, Half-Life 2 RTX
-// (x86, a Mapbase mod on NVIDIA's Portal RTX engine build). What differs
+// PROXY_GAME_L4D2, Left 4 Dead 2 (x86), PROXY_GAME_HL2RTX, Half-Life 2 RTX
+// (x86, a Mapbase mod on NVIDIA's Portal RTX engine build), or PROXY_GAME_EZ2,
+// Entropy : Zero 2 (x86, a Mapbase mod on Source 2013). What differs
 // between them is named here; the rest of the proxy reads these instead of
 // literals.
-#if defined(PROXY_GAME_GMOD) + defined(PROXY_GAME_L4D2) + defined(PROXY_GAME_HL2RTX) != 1
-#error "define one of PROXY_GAME_GMOD, PROXY_GAME_L4D2, PROXY_GAME_HL2RTX (meson option game)"
+#if defined(PROXY_GAME_GMOD) + defined(PROXY_GAME_L4D2) + defined(PROXY_GAME_HL2RTX) + defined(PROXY_GAME_EZ2) != 1
+#error "define one of PROXY_GAME_GMOD, PROXY_GAME_L4D2, PROXY_GAME_HL2RTX, PROXY_GAME_EZ2 (meson option game)"
 #endif
 #if defined(PROXY_GAME_GMOD) && !defined(_WIN64)
 #error "the Garry's Mod proxy is a 64-bit DLL"
@@ -21,6 +22,9 @@
 #endif
 #if defined(PROXY_GAME_HL2RTX) && defined(_WIN64)
 #error "the Half-Life 2 RTX proxy is a 32-bit DLL"
+#endif
+#if defined(PROXY_GAME_EZ2) && defined(_WIN64)
+#error "the Entropy : Zero 2 proxy is a 32-bit DLL"
 #endif
 
 // The engine's C++ methods (MSVC ABI), as the proxy hooks and calls them: a
@@ -127,7 +131,7 @@ constexpr char kRuntimeLabel[] = "remix_bridge.dll";
 constexpr wchar_t kRuntimeModule[] = L"remix_bridge.dll";
 constexpr char kRuntimeName[] = "remix_bridge.dll";
 
-#else // PROXY_GAME_HL2RTX
+#elif defined(PROXY_GAME_HL2RTX)
 
 constexpr bool kGMod = false;
 
@@ -180,6 +184,44 @@ constexpr char kSurfaceInterface[] = "VGUI_Surface030";
 constexpr unsigned kSlotSetCursorAlwaysVisible = 52;
 
 // The runtime: the bridge, as in L4D2.
+constexpr wchar_t kRuntimePath[] = L"\\remix_bridge.dll";
+constexpr char kRuntimeLabel[] = "remix_bridge.dll";
+constexpr wchar_t kRuntimeModule[] = L"remix_bridge.dll";
+constexpr char kRuntimeName[] = "remix_bridge.dll";
+
+#elif defined(PROXY_GAME_EZ2)
+
+constexpr bool kGMod = false;
+
+// Entropy : Zero 2 (Steam app 1583720): Source SDK 2013 Singleplayer with Mapbase
+// client, server, and game shaders (game_shader_dx9).
+constexpr char kShaderApiInterface[] = "ShaderApi030";
+constexpr char kHardwareConfigInterface[] = "MaterialSystemHardwareConfig012";
+constexpr bool kHookVBAllocTracker = false;
+constexpr bool kFixedFunction = false;
+
+// IShaderAPIDX8 (ShaderApi030): SDK 2013 slot order, identical to HL2RTX (slots_shaderapi_hl2rtx.h).
+// void SetLight(int lightNum, const LightDesc_t &desc), one at a time.
+constexpr unsigned kSlotSetLight = 126;
+constexpr bool kSetLightsArray = false;
+// void Bind(IMaterial *)
+constexpr unsigned kSlotBind = 113;
+// void SetPIXMarker(unsigned long color, const char *name) (ret 8 stub).
+constexpr unsigned kSlotSetPIXMarker = 215;
+constexpr unsigned kSlotGetMatrix = 12;
+constexpr unsigned kSlotGetCurrentNumBones = 34;
+constexpr unsigned kSlotGetSceneFogMode = 4, kSlotGetSceneFogColor = 5, kSlotGetFogDistances = 212;
+constexpr bool kSceneFogSlots = true;
+
+constexpr unsigned kRegFlexScale = 3;
+// Mapbase's game_shader_dx9 registers stock shaders with "SDK_<name>"
+constexpr char kShaderPrefix[] = "sdk_";
+
+// ISurface (vguimatsurface.dll) SetCursorAlwaysVisible(bool): VGUI_Surface030 slot 52
+constexpr char kSurfaceInterface[] = "VGUI_Surface030";
+constexpr unsigned kSlotSetCursorAlwaysVisible = 52;
+
+// The runtime: the x86 -> x64 bridge client beside the proxy (bin)
 constexpr wchar_t kRuntimePath[] = L"\\remix_bridge.dll";
 constexpr char kRuntimeLabel[] = "remix_bridge.dll";
 constexpr wchar_t kRuntimeModule[] = L"remix_bridge.dll";
