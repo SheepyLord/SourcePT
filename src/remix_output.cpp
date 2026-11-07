@@ -164,6 +164,22 @@ enum BuildKind { kBuildFlex, kBuildTransient, kBuildEye, kBuildIris, kBuildCache
 BuildKind g_buildKind = kBuildCached;
 std::atomic<uint32_t> g_usBuildKind[kBuildKinds] = {}, g_buildCalls[kBuildKinds] = {}, g_buildVertices[kBuildKinds] = {};
 std::atomic<uint32_t> g_usCreateMesh{0};
+// Texture uploads the game makes (level 0, onTextureUpload; further levels,
+// onTextureLevel): calls, bytes, level-0 uploads whose contents a live texture
+// already has, microseconds; geometryHash (mesh replacement keys): calls and
+// microseconds. Per statistics interval.
+std::atomic<uint32_t> g_textureUploads{0}, g_textureUploadKnown{0}, g_usTextureUpload{0}, g_textureLevels{0},
+    g_usTextureLevel{0}, g_geometryHashes{0}, g_usGeometryHash{0};
+std::atomic<uint64_t> g_textureUploadBytes{0};
+std::atomic<uint32_t> g_textureUploadRepeats{0};
+// Each live texture's last level-0 upload (g_textureLock): a game rewriting a
+// texture with the same pixels every frame (one per NPC on screen in Garry's
+// Mod) changes nothing, so a repeat returns before packing and hashing it.
+struct LastUpload {
+  uint32_t width = 0, height = 0, format = 0;
+  uint64_t hash = 0;
+};
+std::unordered_map<const void *, LastUpload> g_lastUploads;
 // Refreshes sent as remixapi_UpdateMeshVerticesEXT (RefreshTopology), and refused by it.
 std::atomic<uint32_t> g_vertexUpdates{0}, g_vertexUpdatesRefused{0};
 LARGE_INTEGER g_lastPresent = {};
@@ -2740,6 +2756,12 @@ bool g_hueColors = false;
 // `refresh`: new vertices for the mesh already registered under `hash`
 // (g_flexMeshes), or a plain create when there is none. `eyeScale`: the
 // projected coordinates are scaled by it about the texture's centre.
+uint64_t timedGeometryHash(const Draw &d) {
+  Timer timer(g_usGeometryHash);
+  ++g_geometryHashes;
+  return dxvk::geometryHash(d);
+}
+
 remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVertex, uint32_t *boneCount,
                               float normalOffset = 0, bool vertexColors = false, bool keepBlack = false,
                               float faceNormalSign = 1, bool *usedFaceNormals = nullptr, float flex = 0,
@@ -6724,7 +6746,7 @@ void onDraw(const Draw &d) {
         f.bones = boneCount;
         f.builtFrame = g_frame;
         if (!f.geometry)
-          f.geometry = dxvk::geometryHash(d);
+          f.geometry = timedGeometryHash(d);
         ++g_stats.flexRefreshed;
       } else if (!f.handle) {
         g_flexMeshes.erase(flexHash);
@@ -6759,7 +6781,7 @@ void onDraw(const Draw &d) {
     g_transient.push_back(mesh);
     // The replacement key only matters to mods.
     if (g_modsResult == REMIXAPI_ERROR_CODE_SUCCESS)
-      geometry = dxvk::geometryHash(d);
+      geometry = timedGeometryHash(d);
   } else if (auto it = g_meshes.find(hash); it != g_meshes.end()) {
     mesh = it->second.handle;
     boneCount = it->second.bones;
@@ -6774,7 +6796,7 @@ void onDraw(const Draw &d) {
       return;
     }
     meshBuilt = true;
-    geometry = dxvk::geometryHash(d);
+    geometry = timedGeometryHash(d);
     g_meshes[hash] = {mesh, g_frame, boneCount, geometry};
     {
       std::lock_guard<std::mutex> lock(g_transientSampleLock);
@@ -8765,6 +8787,7 @@ void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFO
                      uint32_t pitch, uint32_t levels) {
   if (!g_ready || !data || !width || !height)
     return;
+  Timer uploadTimer(g_usTextureUpload);
   remixapi_Format remixFormat;
   uint32_t rowBytes, rows;
   if (!textureLayout(format, width, height, remixFormat, rowBytes, rows)) {
@@ -8792,6 +8815,20 @@ void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFO
     ++g_stats.textureSkipped;
     return;
   }
+  ++g_textureUploads;
+  g_textureUploadBytes += uint64_t(rowBytes) * rows;
+  const LastUpload upload = {width, height, uint32_t(format), dxvk::rowsHash(data, pitch, rowBytes, rows)};
+  {
+    std::lock_guard<std::recursive_mutex> lock(g_textureLock);
+    const auto last = g_lastUploads.find(texture);
+    if (last != g_lastUploads.end() && last->second.hash == upload.hash && last->second.width == width &&
+        last->second.height == height && last->second.format == upload.format && g_textures.count(texture) &&
+        !g_pendingTextures.count(texture)) {
+      ++g_textureUploadRepeats;
+      return;
+    }
+    g_lastUploads.erase(texture); // re-recorded once this upload is in
+  }
   std::vector<uint8_t> pixels = packLevel(data, pitch, rowBytes, rows);
 #endif
   // Hashed as the game wrote it, before the X8 channel is made opaque.
@@ -8818,6 +8855,7 @@ void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFO
     if (shared == g_texturesByHash.end())
       continue;
     if (auto existing = shared->second.lock()) {
+      ++g_textureUploadKnown;
       g_textures[texture] = std::move(existing);
       g_pendingTextures.erase(texture);
 #if defined(PROXY_GAME_EZ2)
@@ -8832,6 +8870,7 @@ void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFO
   p.levelZero = true;
 #else
       storeCpuCopy(texture, width, height, format, std::move(pixels));
+      g_lastUploads[texture] = upload;
       return;
     }
   }
@@ -8849,12 +8888,17 @@ void onTextureUpload(const void *texture, uint32_t width, uint32_t height, D3DFO
     createPendingTexture(texture, p);
     g_pendingTextures.erase(texture);
   }
+#if !defined(PROXY_GAME_EZ2)
+  g_lastUploads[texture] = upload;
+#endif
 }
 
 void onTextureLevel(const void *texture, uint32_t level, uint32_t width, uint32_t height, uint32_t levelWidth,
                     uint32_t levelHeight, D3DFORMAT format, const uint8_t *data, uint32_t pitch, uint32_t levels) {
   if (!g_ready || !data || !level || level >= levels || !levelWidth || !levelHeight)
     return;
+  Timer levelTimer(g_usTextureLevel);
+  ++g_textureLevels;
   remixapi_Format remixFormat;
   uint32_t rowBytes, rows;
   if (!textureLayout(format, levelWidth, levelHeight, remixFormat, rowBytes, rows))
@@ -9062,6 +9106,7 @@ bool createTargetTexture(TargetPixels &t) {
   record->width = t.width;
   record->height = t.height;
   ++g_stats.textures;
+  g_lastUploads.erase(t.texture); // its pixels are the target's now
   auto &slot = g_textures[t.texture];
   g_targetRecreated += slot && slot->dynamic;
   ++g_targetCreated;
@@ -9251,6 +9296,11 @@ void onTextureSubCopy(const void *source, const void *destination, const RECT *s
   auto it = g_textures.find(source);
   if (it != g_textures.end())
     g_textures[destination] = it->second;
+  // The destination holds the source's pixels: its next upload compares with those.
+  if (auto last = g_lastUploads.find(source); last != g_lastUploads.end())
+    g_lastUploads[destination] = last->second;
+  else
+    g_lastUploads.erase(destination);
   auto cpu = g_cpuTextures.find(source);
   if (cpu != g_cpuTextures.end())
     g_cpuTextures[destination] = cpu->second;
@@ -9263,6 +9313,7 @@ void onTextureReleased(const void *texture) {
   g_userMemoryTextures.erase(texture);
 #endif
   g_textures.erase(texture);
+  g_lastUploads.erase(texture);
   g_pendingTextures.erase(texture);
   auto cpu = g_cpuTextures.find(texture);
   if (cpu != g_cpuTextures.end()) {
@@ -9409,6 +9460,11 @@ void dumpStatistics(FILE *out) {
             g_vertexUpdatesRefused.exchange(0) / f);
     fprintf(out, " | of all: runtime CreateMesh %.2f ms (content cache %s)\n", g_usCreateMesh.exchange(0) / f / 1000,
             envScale("OPENREMIX_PROXY_CONTENT_CACHE", game::kFixedFunction ? 1 : 0) > 0 ? "on" : "off");
+    fprintf(out, "   per frame: texture uploads %.2f (%.2f MiB, %.2f repeats skipped, %.2f already known) %.2f ms, further levels %.2f %.2f ms | "
+                 "replacement keys (geometryHash) %.1f %.2f ms\n",
+            g_textureUploads.exchange(0) / f, g_textureUploadBytes.exchange(0) / f / 1048576.0,
+            g_textureUploadRepeats.exchange(0) / f, g_textureUploadKnown.exchange(0) / f, g_usTextureUpload.exchange(0) / f / 1000, g_textureLevels.exchange(0) / f,
+            g_usTextureLevel.exchange(0) / f / 1000, g_geometryHashes.exchange(0) / f, g_usGeometryHash.exchange(0) / f / 1000);
   }
   fprintf(out, "   ms/frame: frame %.2f | proxy draws %.2f (mesh build %.2f) present submit %.2f (BSP world %.2f, Present call %.2f)\n",
           g_usFrame.exchange(0) / f / 1000, g_usDraw.exchange(0) / f / 1000, g_usBuild.exchange(0) / f / 1000,

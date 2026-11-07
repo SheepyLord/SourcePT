@@ -27,6 +27,15 @@ namespace proxy::dxvk {
 
 uint64_t textureHash(const uint8_t *packedMip0, size_t size) { return XXH3_64bits(packedMip0, size); }
 uint64_t legacyTextureHash(const uint8_t *packedMip0, size_t size) { return XXH64(packedMip0, size, 0); }
+uint64_t rowsHash(const uint8_t *data, uint32_t pitch, uint32_t rowBytes, uint32_t rows) {
+  if (pitch == rowBytes)
+    return XXH3_64bits(data, size_t(rowBytes) * rows);
+  XXH3_state_t state;
+  XXH3_64bits_reset(&state);
+  for (uint32_t r = 0; r < rows; ++r)
+    XXH3_64bits_update(&state, data + size_t(r) * pitch, rowBytes);
+  return XXH3_64bits_digest(&state);
+}
 
 uint64_t geometryHash(const remix::Draw &d) {
   if (!d.indices.data || !d.elements)
