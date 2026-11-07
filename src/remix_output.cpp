@@ -155,6 +155,15 @@ std::mutex g_transientSampleLock;
 std::unordered_map<const void *, uint32_t> g_transientDecls; // declaration -> transient draws
 // Microseconds per statistics interval (10 s).
 std::atomic<uint32_t> g_usDraw{0}, g_usBuild{0}, g_usSubmit{0}, g_usPresent{0}, g_usFrame{0}, g_usBsp{0};
+// buildMesh by caller (render thread sets g_buildKind before each call): a
+// model's refreshed vertices (flexed faces, CPU-deformed models), per-frame
+// transient draws, eyes (EyeRefract), irises (Eyes), first builds of cached
+// draws; microseconds, calls and vertices per statistics interval, and the
+// part spent in the runtime's CreateMesh.
+enum BuildKind { kBuildFlex, kBuildTransient, kBuildEye, kBuildIris, kBuildCached, kBuildKinds };
+BuildKind g_buildKind = kBuildCached;
+std::atomic<uint32_t> g_usBuildKind[kBuildKinds] = {}, g_buildCalls[kBuildKinds] = {}, g_buildVertices[kBuildKinds] = {};
+std::atomic<uint32_t> g_usCreateMesh{0};
 LARGE_INTEGER g_lastPresent = {};
 // For logFrameSpike: the same timers without the statistics reset (draw,
 // mesh build, present submit, BSP world, Present call), the last frame's
@@ -2719,6 +2728,10 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
                               const float *eyeProjection = nullptr, bool refresh = false,
                               float eyeScale = 1) {
   Timer timer(g_usBuild, &g_totalUs[1]);
+  const BuildKind kind = std::exchange(g_buildKind, kBuildCached);
+  Timer kindTimer(g_usBuildKind[kind]);
+  g_buildCalls[kind].fetch_add(1, std::memory_order_relaxed);
+  g_buildVertices[kind].fetch_add(d.numVertices, std::memory_order_relaxed);
   const auto *pos = findElement(d.elements, D3DDECLUSAGE_POSITION, 0);
   const auto *boneWeights = findElement(d.elements, D3DDECLUSAGE_BLENDWEIGHT, 0);
   const auto *boneIndices = findElement(d.elements, D3DDECLUSAGE_BLENDINDICES, 0);
@@ -3067,7 +3080,12 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
   if (refresh)
     info.pNext = &deform;
   remixapi_MeshHandle handle = nullptr;
-  if (g_api.CreateMesh(&info, &handle) != REMIXAPI_ERROR_CODE_SUCCESS) {
+  remixapi_ErrorCode created;
+  {
+    Timer createTimer(g_usCreateMesh);
+    created = g_api.CreateMesh(&info, &handle);
+  }
+  if (created != REMIXAPI_ERROR_CODE_SUCCESS) {
     ++g_stats.rejected;
     return nullptr;
   }
@@ -6530,7 +6548,8 @@ void onDraw(const Draw &d) {
   // draws (no mesh a frame built, sent and its acceleration structure made
   // anew). A model the CPU deforms keeps its refreshed mesh, refreshed only
   // when its contents change. OPENREMIX_PROXY_CONTENT_CACHE=0: per frame.
-  static const bool contentCache = game::kFixedFunction && envScale("OPENREMIX_PROXY_CONTENT_CACHE", 1) > 0;
+  // Other games: off unless OPENREMIX_PROXY_CONTENT_CACHE=1 (measured case by case).
+  static const bool contentCache = envScale("OPENREMIX_PROXY_CONTENT_CACHE", game::kFixedFunction ? 1 : 0) > 0;
   // So is Portal 2's light bridge (SolidEnergy, below), rewritten every frame
   // with the same contents: one mesh while it stands, one instance, so its
   // light stays in the light tree (refit, not rebuilt) and its estimate is
@@ -6570,6 +6589,7 @@ void onDraw(const Draw &d) {
   if (flexTracked) {
     FlexMesh &f = g_flexMeshes[flexHash];
     if (!f.handle || f.content != flexContent) {
+      g_buildKind = kBuildFlex;
       const remixapi_MeshHandle refreshed =
           buildMesh(d, flexHash, bonesPerVertex, &boneCount, 0, meshColors, meshColors, windingSign, &faceNormals, flex,
                     nullptr, true);
@@ -6603,6 +6623,7 @@ void onDraw(const Draw &d) {
       ++g_transientDecls[d.declaration];
     }
     // Additive as onPresent classifies it (destination factor ONE): raster only.
+    g_buildKind = kBuildTransient;
     mesh = buildMesh(d, hash, bonesPerVertex, &boneCount, lift, additiveDraw || meshColors, meshColors, windingSign,
                      &faceNormals, flex);
     if (!mesh) {
@@ -6621,6 +6642,7 @@ void onDraw(const Draw &d) {
     it->second.lastFrame = g_frame;
     ++g_stats.cacheHits;
   } else {
+    g_buildKind = kBuildCached;
     mesh = buildMesh(d, hash, bonesPerVertex, &boneCount, lift, meshColors, meshColors, windingSign, &faceNormals);
     if (!mesh) {
       g_stats.decalNoMesh += lifted;
@@ -6949,6 +6971,7 @@ void onDraw(const Draw &d) {
     g_liftVertexStep = 0;
     const remixapi_MaterialHandle eyeMaterial = clampedMaterialFor(d.texture1, isPointSampler(d.samplerStates, 1));
     const uint64_t eyeHash = (eyesPerFrame ? hash : flexHash) ^ 0xe7e2ef2ac7e7e2efull;
+    g_buildKind = kBuildEye;
     remixapi_MeshHandle eyeMesh =
         eyeMaterial ? buildMesh(d, eyeHash, bonesPerVertex, &eyeBones, 0, false, false, 1, nullptr, flex,
                                 irisProjection, !eyesPerFrame, 0.5f)
@@ -7082,6 +7105,7 @@ void onDraw(const Draw &d) {
     const remixapi_MaterialHandle irisMaterial = clampedMaterialFor(d.texture1, isPointSampler(d.samplerStates, 1));
     // From buffers the engine rewrites (not seen for eyes) it stays per frame.
     const uint64_t irisHash = (eyesPerFrame ? hash : flexHash) ^ 0x1215e5e5e5e51215ull;
+    g_buildKind = kBuildIris;
     remixapi_MeshHandle irisMesh =
         // Lifted out of the eyeball: by face normals (an eye has no vertex
         // normals) these wind as the model's do (faceNormalSign; 1 put the
@@ -9249,6 +9273,15 @@ void dumpStatistics(FILE *out) {
       fprintf(out, "     kept dynamic world draws: texture %016llX (%s) %.1f/frame\n", (unsigned long long)hash,
               bsp::materialName(hash).c_str(), n / f);
     g_keptWorldTextures.clear();
+  }
+  {
+    static const char *names[kBuildKinds] = {"flex refresh", "transient", "eye", "iris", "cached first"};
+    fprintf(out, "   mesh build per frame by kind:");
+    for (int k = 0; k < kBuildKinds; ++k)
+      fprintf(out, "%s %s %.1f calls %.0f vertices %.2f ms", k ? " |" : "", names[k], g_buildCalls[k].exchange(0) / f,
+              g_buildVertices[k].exchange(0) / f, g_usBuildKind[k].exchange(0) / f / 1000);
+    fprintf(out, " | of all: runtime CreateMesh %.2f ms (content cache %s)\n", g_usCreateMesh.exchange(0) / f / 1000,
+            envScale("OPENREMIX_PROXY_CONTENT_CACHE", game::kFixedFunction ? 1 : 0) > 0 ? "on" : "off");
   }
   fprintf(out, "   ms/frame: frame %.2f | proxy draws %.2f (mesh build %.2f) present submit %.2f (BSP world %.2f, Present call %.2f)\n",
           g_usFrame.exchange(0) / f / 1000, g_usDraw.exchange(0) / f / 1000, g_usBuild.exchange(0) / f / 1000,
