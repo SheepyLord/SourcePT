@@ -164,6 +164,8 @@ enum BuildKind { kBuildFlex, kBuildTransient, kBuildEye, kBuildIris, kBuildCache
 BuildKind g_buildKind = kBuildCached;
 std::atomic<uint32_t> g_usBuildKind[kBuildKinds] = {}, g_buildCalls[kBuildKinds] = {}, g_buildVertices[kBuildKinds] = {};
 std::atomic<uint32_t> g_usCreateMesh{0};
+// Refreshes sent as remixapi_UpdateMeshVerticesEXT (RefreshTopology), and refused by it.
+std::atomic<uint32_t> g_vertexUpdates{0}, g_vertexUpdatesRefused{0};
 LARGE_INTEGER g_lastPresent = {};
 // For logFrameSpike: the same timers without the statistics reset (draw,
 // mesh build, present submit, BSP world, Present call), the last frame's
@@ -250,8 +252,24 @@ std::unordered_map<uint64_t, CachedMesh> g_meshes;
 // (remixapi_MeshInfoDeformEXT), so the face stays the same mesh and
 // the same instance from frame to frame: motion vectors and denoiser history,
 // which a new mesh every frame did not have (a talking face smeared).
+// What a refreshed mesh's last full build read (buildMesh): with the same
+// draw topology a refresh sends only new positions, normals and texture
+// coordinates (remixapi_UpdateMeshVerticesEXT), over the same vertex span.
+struct RefreshTopology {
+  remixapi_MeshHandle handle = nullptr; // what the build registered
+  const void *indexBuffer = nullptr, *declaration = nullptr;
+  uint32_t indexVersion = 0, startIndex = 0, primCount = 0, minIndex = 0, type = 0, bonesPerVertex = 0;
+  uint32_t low = 0, count = 0, boneCount = 0; // the span's start (rebased) and size; buildMesh's *boneCount
+  bool valid = false;
+  bool matches(const Draw &d, uint32_t bones) const {
+    return valid && indexBuffer == d.indices.buffer && indexVersion == d.indices.version && !d.indices.dynamic &&
+           declaration == d.declaration && startIndex == d.startIndex && primCount == d.primCount &&
+           minIndex == d.minIndex && type == uint32_t(d.type) && bonesPerVertex == bones;
+  }
+};
 struct FlexMesh {
   remixapi_MeshHandle handle = nullptr;
+  RefreshTopology topology;
   uint64_t lastFrame = 0;
   uint64_t content = 0; // the flex deltas it was built from (0: at rest)
   uint32_t bones = 0;
@@ -2726,7 +2744,7 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
                               float normalOffset = 0, bool vertexColors = false, bool keepBlack = false,
                               float faceNormalSign = 1, bool *usedFaceNormals = nullptr, float flex = 0,
                               const float *eyeProjection = nullptr, bool refresh = false,
-                              float eyeScale = 1) {
+                              float eyeScale = 1, RefreshTopology *topology = nullptr) {
   Timer timer(g_usBuild, &g_totalUs[1]);
   const BuildKind kind = std::exchange(g_buildKind, kBuildCached);
   Timer kindTimer(g_usBuildKind[kind]);
@@ -2744,6 +2762,107 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
   const auto *flexNrm = flex != 0 ? findElement(d.elements, D3DDECLUSAGE_NORMAL, 1) : nullptr;
   uint32_t anyRgb = 0;
   const auto &ps = d.streams[pos->Stream];
+  // A refresh of the topology the last full build read: new positions,
+  // normals and texture coordinates only, decoded as below. Whatever else a
+  // build may change (lift, colours, projected or transformed coordinates)
+  // takes the full path.
+  // OPENREMIX_PROXY_VERTEX_UPDATES=0: every refresh in full (comparison).
+  static const auto updateVertices = [] {
+    char value[8] = {};
+    const bool off = GetEnvironmentVariableA("OPENREMIX_PROXY_VERTEX_UPDATES", value, sizeof(value)) && value[0] == '0';
+    return off ? nullptr
+               : reinterpret_cast<PFN_remixapi_UpdateMeshVerticesEXT>(
+                     GetProcAddress(game::runtimeModule(), "remixapi_UpdateMeshVerticesEXT"));
+  }();
+  const bool simple = refresh && topology && updateVertices && !eyeProjection && !g_ffGenerated && normalOffset == 0 &&
+                      !col && !g_ffUv && !g_screenUv;
+  if (simple && topology->matches(d, bonesPerVertex)) {
+    const uint32_t first = uint32_t(d.baseVertex) + d.minIndex + topology->low, count = topology->count;
+    auto fetch = [&](const D3DVERTEXELEMENT9 *e, uint32_t v, uint32_t bytes) -> const uint8_t * {
+      const auto &s = d.streams[e->Stream];
+      if (!s.data)
+        return nullptr;
+      const uint64_t at = uint64_t(s.offset) + uint64_t(first + v) * s.stride + e->Offset;
+      return at + bytes <= s.size ? s.data + at : nullptr;
+    };
+    const bool floatTex = tex && (tex->Type == D3DDECLTYPE_FLOAT2 || tex->Type == D3DDECLTYPE_FLOAT3 ||
+                                  tex->Type == D3DDECLTYPE_FLOAT4);
+    const bool normals = (nrm && (nrm->Type == D3DDECLTYPE_UBYTE4 || nrm->Type == D3DDECLTYPE_FLOAT3)) ||
+                         (flexNrm && flexNrm->Type == D3DDECLTYPE_FLOAT3);
+    static thread_local std::vector<float> positions, normalValues, texcoords;
+    positions.resize(size_t(count) * 3);
+    normalValues.assign(normals ? size_t(count) * 3 : 0, 0.0f);
+    texcoords.assign(floatTex ? size_t(count) * 2 : 0, 0.0f);
+    bool ok = true;
+    for (uint32_t v = 0; v < count && ok; ++v) {
+      float *out = &positions[size_t(v) * 3];
+      const uint8_t *p = fetch(pos, v, 12);
+      if (!p) {
+        ok = false;
+        break;
+      }
+      std::memcpy(out, p, 12);
+      if (flexPos)
+        if (const uint8_t *f = fetch(flexPos, v, 12)) {
+          float delta[3];
+          std::memcpy(delta, f, 12);
+          for (int j = 0; j < 3; ++j)
+            out[j] += delta[j] * flex;
+        }
+      ok = std::isfinite(out[0]) && std::isfinite(out[1]) && std::isfinite(out[2]);
+      if (floatTex) {
+        float *uv = &texcoords[size_t(v) * 2];
+        if (const uint8_t *t = fetch(tex, v, 8))
+          std::memcpy(uv, t, 8);
+        if (!std::isfinite(uv[0]) || !std::isfinite(uv[1]))
+          uv[0] = uv[1] = 0;
+      }
+      if (normals) {
+        float *n = &normalValues[size_t(v) * 3];
+        if (nrm && nrm->Type == D3DDECLTYPE_UBYTE4) {
+          if (const uint8_t *e = fetch(nrm, v, 4))
+            unpackNormalUByte4(e, n);
+        } else if (nrm && nrm->Type == D3DDECLTYPE_FLOAT3) {
+          if (const uint8_t *e = fetch(nrm, v, 12))
+            std::memcpy(n, e, 12);
+          if (!std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2]))
+            n[0] = n[1] = n[2] = 0;
+        }
+        if (flexNrm && flexNrm->Type == D3DDECLTYPE_FLOAT3)
+          if (const uint8_t *f = fetch(flexNrm, v, 12)) {
+            float delta[3], m[3];
+            std::memcpy(delta, f, 12);
+            for (int j = 0; j < 3; ++j)
+              m[j] = n[j] + delta[j] * flex;
+            const float len = std::sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+            if (std::isfinite(len) && len > 1e-6f)
+              for (int j = 0; j < 3; ++j)
+                n[j] = m[j] / len;
+          }
+      }
+    }
+    if (!ok) {
+      ++g_stats.nonFinite;
+      return nullptr;
+    }
+    const remixapi_MeshHandle handle = topology->handle;
+    const remixapi_MeshVerticesEXT update = {0, count, positions.data(), normals ? normalValues.data() : nullptr,
+                                             floatTex ? texcoords.data() : nullptr};
+    remixapi_ErrorCode result;
+    {
+      Timer createTimer(g_usCreateMesh);
+      result = updateVertices(handle, 1, &update);
+    }
+    if (result == REMIXAPI_ERROR_CODE_SUCCESS) {
+      ++g_vertexUpdates;
+      if (boneCount)
+        *boneCount = topology->boneCount;
+      return handle;
+    }
+    // Refused (the mesh was replaced meanwhile): rebuilt in full below.
+    ++g_vertexUpdatesRefused;
+    topology->valid = false;
+  }
 
   std::vector<uint32_t> indices;
   auto index = [&](uint32_t i, uint32_t &out) {
@@ -3090,6 +3209,12 @@ remixapi_MeshHandle buildMesh(const Draw &d, uint64_t hash, uint32_t bonesPerVer
     return nullptr;
   }
   ++g_stats.created;
+  if (topology) {
+    *topology = {};
+    if (simple)
+      *topology = {handle, d.indices.buffer, d.declaration, d.indices.version, d.startIndex, d.primCount, d.minIndex,
+                   uint32_t(d.type), bonesPerVertex, low, count, boneCount ? *boneCount : 0, true};
+  }
   return handle;
 }
 
@@ -6592,7 +6717,7 @@ void onDraw(const Draw &d) {
       g_buildKind = kBuildFlex;
       const remixapi_MeshHandle refreshed =
           buildMesh(d, flexHash, bonesPerVertex, &boneCount, 0, meshColors, meshColors, windingSign, &faceNormals, flex,
-                    nullptr, true);
+                    nullptr, true, 1, &f.topology);
       if (refreshed) {
         f.handle = refreshed;
         f.content = flexContent;
@@ -9280,6 +9405,8 @@ void dumpStatistics(FILE *out) {
     for (int k = 0; k < kBuildKinds; ++k)
       fprintf(out, "%s %s %.1f calls %.0f vertices %.2f ms", k ? " |" : "", names[k], g_buildCalls[k].exchange(0) / f,
               g_buildVertices[k].exchange(0) / f, g_usBuildKind[k].exchange(0) / f / 1000);
+    fprintf(out, " | sent as vertex updates %.1f (refused %.1f)", g_vertexUpdates.exchange(0) / f,
+            g_vertexUpdatesRefused.exchange(0) / f);
     fprintf(out, " | of all: runtime CreateMesh %.2f ms (content cache %s)\n", g_usCreateMesh.exchange(0) / f / 1000,
             envScale("OPENREMIX_PROXY_CONTENT_CACHE", game::kFixedFunction ? 1 : 0) > 0 ? "on" : "off");
   }
