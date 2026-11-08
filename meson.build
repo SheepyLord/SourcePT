@@ -232,8 +232,11 @@ remix_ui_test = executable('remix-ui-test', 'tests/remix_ui.cpp', 'src/remix_ui.
   dependencies: meson.get_compiler('cpp').find_library('user32'),
   cpp_args: cpp_args,
   link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
-test('Runtime shortcut packaged SDL input bridge and native window ownership', remix_ui_test,
-  args: [remix_inc / '../../_work/build/forwardplus/subprojects/SDL3-3.4.14/SDL3_shared.dll'])
+sdl_test_dll = get_option('sdl_test_dll')
+if sdl_test_dll != ''
+  test('Runtime shortcut packaged SDL input bridge and native window ownership', remix_ui_test,
+    args: [sdl_test_dll])
+endif
 
 source_lights_test = executable('source-lights-test', 'tests/source_lights.cpp', 'src/source_lights.cpp',
   include_directories: include_directories('src', remix_inc),

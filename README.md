@@ -42,6 +42,7 @@ Multiplayer works out of the box since everything lives in the wrapper.
 The [OpenRemix setup guide](https://github.com/OpenRenderCollective/OpenRemix/blob/main/docs/features/forward-plus-setup.md)
 covers the native runtime, building this wrapper, and staging an isolated test installation.
 The [cubemap editor guide](tools/probe_editor/README.md) covers authoring map reflection bounds.
+To run the Windows input-bridge test, set Meson's `sdl_test_dll` option to the absolute path to `SDL3_shared.dll`.
 
 ## Credits
 * Jane for helping me make the logo.
