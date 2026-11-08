@@ -204,6 +204,7 @@ test('Engine culling follows bake publication and backend transitions', engine_v
 remix_ui_test = executable('remix-ui-test', 'tests/remix_ui.cpp', 'src/remix_ui.cpp',
   include_directories: include_directories('src', remix_inc, sdl_inc),
   dependencies: meson.get_compiler('cpp').find_library('user32'),
+  cpp_args: cpp_args,
   link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
 test('Runtime shortcut packaged SDL input bridge and native window ownership', remix_ui_test,
   args: [remix_inc / '../../_work/build/forwardplus/subprojects/SDL3-3.4.14/SDL3_shared.dll'])
