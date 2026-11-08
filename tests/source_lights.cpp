@@ -125,4 +125,3 @@ int main() {
   require(!createLight(api, light, 129), "Runtime rejection is propagated");
   std::puts("Source light units, intensity, surface sidedness, spot cones and ABI passed");
 }
-
