@@ -18,6 +18,7 @@ Multiplayer works out of the box since everything lives in the wrapper.
 ### Games the wrapper works with
 * Garry's Mod **(CI only builds for this one)**
 * Team Fortress 2 (64-bit, `tf_win64.exe`)
+* Entropy: Zero 2
 * Left 4 Dead 2
 * Half-Life 2 RTX
 * Portal with RTX

@@ -23,6 +23,9 @@ endif
 if game == 'hl2rtx' and cpu != 'x86'
   error('the Half-Life 2 RTX proxy is a 32-bit DLL: configure with cross/i686-w64-mingw32.txt')
 endif
+if game == 'ez2' and cpu != 'x86'
+  error('the Entropy: Zero 2 proxy is a 32-bit DLL: configure with cross/i686-w64-mingw32.txt')
+endif
 
 remix_inc = get_option('openremix_include')
 if remix_inc == ''
@@ -52,8 +55,13 @@ sources = [
   'src/vertex_program.cpp', 'src/shader_tables.cpp', 'src/particles.cpp', 'src/fixed_function.cpp', 'src/diag.cpp', 'src/lzma_source.cpp', 'src/host_passes.cpp', 'src/vb_origins.cpp',
   'deps/lzma/LzmaDec.c', host_shaders,
 ]
-cpp_args = []
-link_args = ['-static', '-static-libgcc', '-static-libstdc++']
+cpp_compiler = meson.get_compiler('cpp')
+is_gcc_syntax = cpp_compiler.get_argument_syntax() == 'gcc'
+cpp_args = ['-DNOMINMAX', '-D_CRT_SECURE_NO_WARNINGS']
+link_args = []
+if is_gcc_syntax
+  link_args += ['-static', '-static-libgcc', '-static-libstdc++']
+endif
 if game == 'gmod'
   cpp_args += '-DPROXY_GAME_GMOD'
   # Engine-side hooks (GMod has no client mod) and the in-process panel.
@@ -74,16 +82,23 @@ else
   # the runtime UI in the bridge host.
   cpp_args += ['-DREMIX_ALLOW_X86=']
   sources += ['src/gmod_only_stubs.cpp', 'src/pe_module.cpp', 'src/bridge_ui.cpp']
-  link_args += '-Wl,--enable-stdcall-fixup'
+  if is_gcc_syntax
+    link_args += '-Wl,--enable-stdcall-fixup'
+  endif
   if game == 'l4d2'
     # L4D2's own engine side (src/l4d2.h).
     cpp_args += '-DPROXY_GAME_L4D2'
     sources += ['src/l4d2_engine.cpp', 'src/l4d2_cull.cpp', 'src/l4d2_lights.cpp', 'src/l4d2_infected.cpp']
     def_file = 'shaderapidx9_l4d2.def'
-  else
+  elif game == 'hl2rtx'
     # Half-Life 2 RTX: no engine side yet (src/hl2rtx_engine.cpp).
     cpp_args += '-DPROXY_GAME_HL2RTX'
     sources += ['src/hl2rtx_engine.cpp']
+    def_file = 'shaderapidx9_hl2rtx.def'
+  elif game == 'ez2'
+    # Entropy : Zero 2 (src/ez2_engine.cpp).
+    cpp_args += '-DPROXY_GAME_EZ2'
+    sources += ['src/ez2_engine.cpp']
     def_file = 'shaderapidx9_hl2rtx.def'
   endif
 endif

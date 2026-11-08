@@ -229,6 +229,9 @@ bool lockVolume(const void *object, uint32_t &width, uint32_t &height, uint32_t 
   }
   D3DLOCKED_BOX locked = {};
   if (const HRESULT result = texture->LockBox(0, &locked, nullptr, D3DLOCK_READONLY); FAILED(result) || !locked.pBits) {
+    // A default-pool volume: what the engine wrote to it (Entropy : Zero 2).
+    if (proxy::d3d::volumeCopy(object, width, height, depth, pixels))
+      return true;
     snprintf(why, 64, "volume lock %08lx pool %u", static_cast<unsigned long>(result), unsigned(desc.Pool));
     return false;
   }
@@ -297,6 +300,12 @@ const Shader *shaderFor(const void *object) {
     ::dxvk::DxsoReader reader(reinterpret_cast<const char *>(code->data()));
     ::dxvk::DxsoModule module(reader);
     ::dxvk::DxsoModuleInfo info = {};
+#if defined(PROXY_GAME_EZ2)
+    // DxsoOptions' constructor leaves its members unset: whatever the stack held
+    // (forceSamplerTypeSpecConstants among them) made a shader declare one sampler
+    // type and sample another, which the driver could not run.
+    std::memset(&info.options, 0, sizeof(info.options));
+#endif
     const auto analysis = module.analyze();
     shader.vertex = module.info().type() == ::dxvk::DxsoProgramTypes::VertexShader;
     ::dxvk::D3D9ConstantLayout layout = {};
@@ -465,11 +474,17 @@ bool wants(const remix::Draw &d) {
 // materials (GMod's Lua effects use pp/ ones). The runtime's post-processing
 // (exposure, bloom, tonemapping) does that job on the path-traced frame, so
 // these are dropped: neither replayed nor drawn. OPENREMIX_PROXY_ENGINE_POST=1
-// keeps them.
+// keeps them. Entropy : Zero 2 keeps them unless it is 0: engine_post applies
+// the colour correction (its night vision, maps' grading) and bloom feeds it.
 bool enginePost(const char *name) {
   static const bool keep = [] {
     char value[8] = {};
-    return GetEnvironmentVariableA("OPENREMIX_PROXY_ENGINE_POST", value, sizeof(value)) && value[0] == '1';
+    const bool set = GetEnvironmentVariableA("OPENREMIX_PROXY_ENGINE_POST", value, sizeof(value)) != 0;
+#if defined(PROXY_GAME_EZ2)
+    return !set || value[0] != '0';
+#else
+    return set && value[0] == '1';
+#endif
   }();
   if (keep || _strnicmp(name, "dev/", 4) != 0)
     return false;
@@ -591,7 +606,9 @@ bool recordDraw(const remix::Draw &d, const float projection[16]) {
           if (type == D3DRTYPE_VOLUMETEXTURE) {
             // A volume: read through D3D once, up as a sampled-only target.
             auto &uploaded = g_uploaded[texture];
-            if (uploaded.version != 1) {
+            // The engine's writes to a volume it keeps in the default pool (0: read once).
+            const uint32_t volumeVersion = std::max(proxy::d3d::volumeVersion(texture), 1u);
+            if (uploaded.version != volumeVersion) {
               std::vector<uint8_t> pixels;
               uint32_t depth = 0;
               char why[64] = "no volume support in the runtime";
@@ -609,7 +626,7 @@ bool recordDraw(const remix::Draw &d, const float projection[16]) {
                           n, texture, why);
                 return false;
               }
-              uploaded = {1, width, height};
+              uploaded = {volumeVersion, width, height};
               g_established.insert(texture);
               ++g_stats.uploads;
             }

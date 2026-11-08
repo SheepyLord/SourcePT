@@ -144,6 +144,14 @@ void onTexturePartialUpload(const void *texture, uint32_t width, uint32_t height
                             const uint8_t *data, uint32_t pitch);
 // UpdateTexture(src, dst): dst now shows src's contents.
 void onTextureCopy(const void *source, const void *destination);
+// Pre-allocates a CPU texture record for UI drawing so subsequent sub-rectangle
+// updates (e.g. UpdateSurface) have a destination buffer ready.
+void initCpuTexture(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format);
+// A system-memory texture over the caller's memory (D3D9Ex): its level 0 is
+// read from there when it is copied (onTextureCopy).
+void onUserMemoryTexture(const void *texture, uint32_t width, uint32_t height, D3DFORMAT format, const uint8_t *bits);
+// UpdateSurface sub-rectangle copy (source surface to destination surface).
+void onTextureSubCopy(const void *source, const void *destination, const RECT *srcRect, const POINT *dstPoint);
 void onTextureReleased(const void *texture);
 // IShaderAPI::Bind (engine_materials): the material now bound and its name.
 void onMaterialBound(const engine_materials::Shading &shading, const char *material);

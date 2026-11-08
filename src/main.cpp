@@ -15,7 +15,7 @@
 #ifdef PROXY_GAME_L4D2
 #include "l4d2.h"
 #include "slots_shaderapi_l4d2.h"
-#elif defined(PROXY_GAME_HL2RTX)
+#elif defined(PROXY_GAME_HL2RTX) || defined(PROXY_GAME_EZ2)
 #include "slots_shaderapi_hl2rtx.h"
 #elif defined(PROXY_GAME_TF2)
 #include "slots_shaderapi_tf2.h"
@@ -130,10 +130,11 @@ void forceSwitches() {
   // GetProcAddress(d3d9, "Direct3DCreate9Ex").)
   appendSwitch("-nod3d9ex");
 #endif
-#if defined(PROXY_GAME_L4D2) || defined(PROXY_GAME_TF2)
-  // L4D2 (l4d2-rtx's proxy saw the plain device without -nod3d9ex), TF2: the
-  // proxy replaces a game module and hooks the engine's vtables, which VAC
-  // must never see, so the game stays off VAC-secured servers.
+#if defined(PROXY_GAME_L4D2) || defined(PROXY_GAME_TF2) || defined(PROXY_GAME_EZ2)
+  // L4D2 (l4d2-rtx's proxy saw the plain device without -nod3d9ex), TF2, EZ2:
+  // the proxy replaces a game module, patches engine code and hooks its
+  // vtables, which VAC must never see, so the game stays off VAC-secured
+  // servers.
   appendSwitch("-insecure");
 #endif
 }
@@ -191,8 +192,32 @@ bool PROXY_THISCALL deviceMgrConnect(proxy::Wrapper *self, CreateInterfaceFn fac
   g_connectFactory = factory;
   log("proxy: IShaderDeviceMgr::Connect(factory %p)", reinterpret_cast<void *>(factory));
   proxy::diag::stage("IShaderDeviceMgr::Connect");
-  return proxy::original<Fn>(self, 0)(self->real, factory ? connectFactory : nullptr);
+  bool ok = proxy::original<Fn>(self, 0)(self->real, factory ? connectFactory : nullptr);
+  log("proxy: IShaderDeviceMgr::Connect -> %s", ok ? "true" : "false");
+  proxy::diag::stage("IShaderDeviceMgr::Connect -> %s", ok ? "true" : "false");
+  return ok;
 }
+
+#ifdef PROXY_GAME_EZ2
+// IShaderDeviceMgr slot 1: void Disconnect() (IAppSystem).
+void PROXY_THISCALL deviceMgrDisconnect(proxy::Wrapper *self) {
+  using Fn = void(PROXY_THISCALL *)(void *);
+  log("proxy: IShaderDeviceMgr::Disconnect");
+  proxy::diag::stage("IShaderDeviceMgr::Disconnect");
+  proxy::original<Fn>(self, 1)(self->real);
+}
+
+// IShaderDeviceMgr slot 3: InitReturnVal_t Init() (IAppSystem).
+int PROXY_THISCALL deviceMgrInit(proxy::Wrapper *self) {
+  using Fn = int(PROXY_THISCALL *)(void *);
+  log("proxy: IShaderDeviceMgr::Init");
+  proxy::diag::stage("IShaderDeviceMgr::Init");
+  int rc = proxy::original<Fn>(self, 3)(self->real);
+  log("proxy: IShaderDeviceMgr::Init -> %d", rc);
+  proxy::diag::stage("IShaderDeviceMgr::Init -> %d", rc);
+  return rc;
+}
+#endif
 
 // IShaderDeviceMgr slot 4: void Shutdown() (IAppSystem). The material system
 // shuts the shader device down on quit, on the main thread: OpenRemix stops
@@ -281,7 +306,13 @@ const KnownInterface kKnown[] = {
     {"ShaderDeviceMgr001",
      [](proxy::Kind *k) {
        proxy::setHook(k, 0, reinterpret_cast<void *>(&deviceMgrConnect));
+#ifdef PROXY_GAME_EZ2
+       proxy::setHook(k, 1, reinterpret_cast<void *>(&deviceMgrDisconnect));
+#endif
        proxy::setHook(k, 2, reinterpret_cast<void *>(&deviceMgrQueryInterface));
+#ifdef PROXY_GAME_EZ2
+       proxy::setHook(k, 3, reinterpret_cast<void *>(&deviceMgrInit));
+#endif
        proxy::setHook(k, 4, reinterpret_cast<void *>(&deviceMgrShutdown));
        proxy::setHook(k, 12, reinterpret_cast<void *>(&deviceMgrSetMode));
      }},
@@ -969,5 +1000,10 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
     proxy::diag::stage("proxy loaded");
     preferCachedDxvkBuffers();
   }
+#ifdef PROXY_GAME_EZ2
+  else if (reason == DLL_PROCESS_DETACH) {
+    proxy::diag::uninstall();
+  }
+#endif
   return TRUE;
 }

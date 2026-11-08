@@ -215,6 +215,7 @@ public:
 // --- Materials (VMT) and texture hashes (VTF) --------------------------------
 struct KeyValues {
   std::string shader;
+  std::string shaderAsWritten; // lowercase, before stockShaderName ("sdk_lightmappedgeneric")
   std::map<std::string, std::string> values;                 // top level, lowercase keys
   std::map<std::string, std::map<std::string, std::string>> blocks; // top-level sub-blocks (patch insert/replace)
 };
@@ -265,6 +266,7 @@ bool parseKeyValues(const std::string &text, KeyValues &out) {
     return false;
   // Mapbase's game shaders ("SDK_LightmappedGeneric") as the stock ones.
   out.shader = lower(game::stockShaderName(plain(tokens[0]).c_str()));
+  out.shaderAsWritten = lower(plain(tokens[0]));
   size_t i = 2;
   // Skips a block whose '{' was consumed.
   auto skip = [&]() {
@@ -331,6 +333,19 @@ bool loadMaterial(const std::string &name, KeyValues &out, int depth = 0) {
     if (condition.size() > 3 && condition[0] == '>' && condition.find("dx") != std::string::npos)
       for (auto &[k, v] : block)
         kv.values[k] = v;
+#if defined(PROXY_GAME_EZ2)
+  // The shader's DX9 fallback block, as the material system merges it
+  // ("SDK_LightmappedGeneric_HDR_DX9", else "..._DX9"; HDR is on): Half-Life
+  // 2's materials keep their normal map and reflection mask there (metal/
+  // citadel_metalwall077a), without which a strong reflection over a dark
+  // base read as polished metal across Entropy : Zero 2's Combine walls.
+  for (const char *suffix : {"_hdr_dx9", "_dx9"})
+    if (const auto block = kv.blocks.find(kv.shaderAsWritten + suffix); block != kv.blocks.end()) {
+      for (auto &[k, v] : block->second)
+        kv.values[k] = v;
+      break;
+    }
+#endif
   if (kv.shader != "patch") {
     out = std::move(kv);
     return true;
@@ -1581,6 +1596,14 @@ int materialByName(const std::string &name, bool brush) {
       ++g_world.skippedTranslucent;
       return slot;
     }
+#if defined(PROXY_GAME_EZ2)
+    // A window imposter (dev/dev_windowportal): a cubemap of the room behind,
+    // which the path tracer has itself (see remix_output's onDraw).
+    if (kv.shader.rfind("windowimposter", 0) == 0) {
+      ++g_world.skippedIgnored;
+      return slot;
+    }
+#endif
     m.alphaTest = flag("$alphatest");
     m.noCull = flag("$nocull");
     m.pointSample = flag("$pointsample") || flag("$point");
