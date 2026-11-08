@@ -13,6 +13,7 @@ remixapi_Float3D radiance;
 unsigned calls = 0;
 bool reject = false;
 bool hasCookie = false;
+float forwardCutoff = 0;
 remixapi_LightBakingHintEXT bakingHint = REMIXAPI_LIGHT_BAKING_DEFAULT_EXT;
 void require(bool value, const char *message) {
   if (!value) { std::fprintf(stderr, "%s\n", message); std::exit(1); }
@@ -22,6 +23,7 @@ remixapi_ErrorCode REMIXAPI_CALL capture(const remixapi_LightInfo *info, remixap
   radiance = info->radiance;
   bakingHint = REMIXAPI_LIGHT_BAKING_DEFAULT_EXT;
   hasCookie = false;
+  forwardCutoff = 0;
   const auto type = *static_cast<const remixapi_StructType *>(info->pNext);
   if (type == REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT)
     sphere = *static_cast<const remixapi_LightInfoSphereEXT *>(info->pNext);
@@ -31,7 +33,12 @@ remixapi_ErrorCode REMIXAPI_CALL capture(const remixapi_LightInfo *info, remixap
     require(false, "Unknown native light shape");
   if (type == REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT && sphere.pNext) {
     const void *next = sphere.pNext;
-    if (*static_cast<const remixapi_StructType *>(next) == REMIXAPI_STRUCT_TYPE_LIGHT_INFO_COOKIE_EXT) {
+    if (*static_cast<const remixapi_StructType *>(next) == REMIXAPI_STRUCT_TYPE_LIGHT_INFO_FORWARD_CUTOFF_EXT) {
+      const auto &cutoff = *static_cast<const remixapi_LightInfoForwardCutoffEXT *>(next);
+      forwardCutoff = cutoff.distance;
+      next = cutoff.pNext;
+    }
+    if (next && *static_cast<const remixapi_StructType *>(next) == REMIXAPI_STRUCT_TYPE_LIGHT_INFO_COOKIE_EXT) {
       const auto &cookie = *static_cast<const remixapi_LightInfoCookieEXT *>(next);
       require(std::wcscmp(cookie.texture, L"0xABC") == 0 && cookie.fovDegrees == 90 && cookie.up.y == 1,
               "Projected cookie retains texture, orientation and FOV");
@@ -70,6 +77,12 @@ int main() {
   require(std::abs(radiance.x * pi * sphere.radius * sphere.radius - 4) < 1e-5f,
           "Quadratic point conversion preserves forward radiant intensity");
   const auto pointRadiance = radiance;
+  require(forwardCutoff == 0, "Ordinary point lights omit the cutoff extension");
+  light.forwardCutoff = 128;
+  require(createLight(api, light, 131) && forwardCutoff == 128 && sphere.radius == 2 &&
+              radiance.x == pointRadiance.x,
+          "Compiled point cutoff stays separate from emitter size and energy");
+  light.forwardCutoff = 0;
   light.type = kSurface;
   light.direction[2] = -7;
   require(createLight(api, light, 124), "Surface conversion failed");

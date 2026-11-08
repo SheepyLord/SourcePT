@@ -51,8 +51,16 @@ bool textureRgba(const std::string &name, uint32_t &width, uint32_t &height, std
 // Loads `maps/<mapName>.bsp` from the search paths; an empty name unloads.
 // Returns whether the map's world is now provided from the BSP. The host
 // enables styled lights only when it can supply current engine lightstyles.
-bool load(const remixapi_Interface &api, const std::string &mapName, bool lightStylesAvailable = false,
-          bool decodeSkybox = false);
+struct LoadOptions {
+  bool lightStylesAvailable = false;
+  bool decodeSkybox = false;
+  bool freezeAnimation = false;
+  bool operator==(const LoadOptions &other) const {
+    return lightStylesAvailable == other.lightStylesAvailable &&
+           decodeSkybox == other.decodeSkybox && freezeAnimation == other.freezeAnimation;
+  }
+};
+bool load(const remixapi_Interface &api, const std::string &mapName, LoadOptions options = {});
 struct SkyboxFace {
   uint32_t width = 0, height = 0;
   std::vector<uint8_t> rgba;
@@ -111,6 +119,7 @@ struct Light {
   float color[3] = {}, position[3] = {}, direction[3] = {};
   float attenuation[3] = {}; // constant, linear, quadratic
   float thetaDot = 0, phiDot = 0; // spot inner and outer cone cosines
+  float forwardCutoff = 0; // compiled cutoff for point/spot lights
   uint64_t hash = 0;
   int style = 0; // lightstyle scaling the color each frame (0: none)
 };

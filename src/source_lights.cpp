@@ -14,6 +14,8 @@ remixapi_LightHandle createLight(remixapi_Interface &api, const SourceLight &lig
   info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
   info.hash = hash;
   remixapi_LightInfoSphereEXT sphere = {};
+  remixapi_LightInfoForwardCutoffEXT cutoff{REMIXAPI_STRUCT_TYPE_LIGHT_INFO_FORWARD_CUTOFF_EXT, nullptr,
+                                           light.forwardCutoff};
   remixapi_LightInfoBakingEXT baking{REMIXAPI_STRUCT_TYPE_LIGHT_BAKING_EXT, nullptr,
                                     REMIXAPI_LIGHT_BAKING_PREFER_BAKED_EXT};
   sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
@@ -77,6 +79,10 @@ remixapi_LightHandle createLight(remixapi_Interface &api, const SourceLight &lig
       sphere.shaping_value.coneSoftness = 0;
       cookie.pNext = sphere.pNext;
       sphere.pNext = &cookie;
+    }
+    if (light.forwardCutoff > 0 && (light.type == 1 || light.type == 3)) {
+      cutoff.pNext = sphere.pNext;
+      sphere.pNext = &cutoff;
     }
     info.pNext = &sphere;
   }

@@ -85,6 +85,13 @@ int main() {
           "Camera paths interpolate positions and take the short angular route across 360 degrees");
   require(proxy::replay::pathCamera(pathSettings, 1000).position.x == 64 &&
               parse("").cameraPath.empty(), "Camera paths clamp at their endpoint and default off");
+  const auto fixedPath = parse("replay.cameraKey=0 -2800 -4200 -64 0 45 0\n"
+                               "replay.cameraKey=420 -2800 -4200 -64 0 45 0\n");
+  for (uint32_t frame = 0; frame <= 420; ++frame) {
+    const auto position = proxy::replay::pathCamera(fixedPath, frame).position;
+    require(position.x == -2800 && position.y == -4200 && position.z == -64,
+            "Identical camera keys keep a bit-exact position on every frame");
+  }
   require(pathSettings.cameraCaptureInterval == 32 && proxy::replay::capturePathFrame(pathSettings, 0) &&
               proxy::replay::capturePathFrame(pathSettings, 32) && proxy::replay::capturePathFrame(pathSettings, 64) &&
               !proxy::replay::capturePathFrame(pathSettings, 31), "Default camera capture cadence is preserved");
@@ -183,6 +190,19 @@ int main() {
   refuse("replay.lightStyleValue=-1");
   refuse("replay.lightStyleValue=nan");
   refuse("replay.lightStyleValue=5");
+  const auto stylePath = parse("replay.styledLights=1\nreplay.cameraKey=0 0 0 0 0 0 0\n"
+                               "replay.cameraKey=48 0 0 0 0 0 0\n"
+                               "replay.lightStyleKey=16 0\nreplay.lightStyleKey=32 1 34");
+  require(stylePath.lightStyleKeys.size() == 2 && stylePath.lightStyleKeys[0].frame == 16 &&
+          stylePath.lightStyleKeys[0].multiplier == 0 && stylePath.lightStyleKeys[0].style == 0 &&
+          stylePath.lightStyleKeys[1].multiplier == 1 && stylePath.lightStyleKeys[1].style == 34,
+          "Lightstyle steps are tied to camera path frames");
+  refuse("replay.styledLights=1\nreplay.lightStyleKey=16 0");
+  refuse("replay.styledLights=1\nreplay.cameraKey=0 0 0 0 0 0 0\n"
+         "replay.cameraKey=48 0 0 0 0 0 0\nreplay.lightStyleKey=16 0 128");
+  refuse("replay.styledLights=1\nreplay.cameraKey=0 0 0 0 0 0 0\n"
+         "replay.cameraKey=48 0 0 0 0 0 0\nreplay.lightStyleKey=49 0");
+  refuse("replay.lightStyleKey=16 0\nreplay.lightStyleKey=16 1");
   require(!parse("").probeBounds &&
               parse("replay.probeBounds=-4 -3 -2 4 3 2").probeBounds ==
                   std::optional<std::array<float, 6>>({-4, -3, -2, 4, 3, 2}),

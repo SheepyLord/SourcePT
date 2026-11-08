@@ -1,6 +1,7 @@
 #include "frame_profile.h"
 #include "diag.h"
 #include <windows.h>
+#include <atomic>
 #include <cstdio>
 #include <chrono>
 #include <cstring>
@@ -12,6 +13,7 @@
 
 namespace proxy::frame_profile {
 namespace {
+std::atomic<uint32_t> worldListsUs{0}, worldPatchesUs{0};
 struct Recorder {
   using File = std::unique_ptr<FILE, decltype(&std::fclose)>;
   File file{nullptr, &std::fclose};
@@ -51,11 +53,13 @@ struct Recorder {
                "depthMs,viewmodelMs,viewmodelSunShadowMs,viewmodelLocalShadowMs,bakeState,bakeHash,"
                "hostFocused,processFocused,windowStatus,nativeFocused,nativeMinimized,nativeWidth,nativeHeight,cpuStatus,bakeStatus,"
                "gpuTruncated,probeGatherAvailable,probeGatherMs,viewmodelColorMs,viewmodelDepthMs,"
-               "cpuAttempt,cpuNew,cpuPresented,cpuPresentMs,cpuSceneMs,cpuAcquireMs,cpuSubmitMs,cpuQueuePresentMs,profilePreviousMs\n", file.get());
+               "cpuAttempt,cpuNew,cpuPresented,cpuPresentMs,cpuSceneMs,cpuAcquireMs,cpuSubmitMs,cpuQueuePresentMs,profilePreviousMs,"
+               "hostStagesValid,hostProxyDrawMs,hostMeshBuildMs,hostSubmitMs,hostBspMs,hostPresentCallMs,"
+               "hostWorldListsMs,hostWorldPatchesMs\n", file.get());
   }
 
   void sample(double hostMs, remixapi_ErrorCode presentStatus,
-              HWND hostWindow, PFN_remixapi_GetWindowState getWindowState) {
+              HWND hostWindow, PFN_remixapi_GetWindowState getWindowState, const HostStages &stages) {
     if (!file) return;
     const auto began = std::chrono::steady_clock::now();
     // Record observations without changing focus. Missing window state is an
@@ -99,7 +103,7 @@ struct Recorder {
     const bool cpuFresh = cpuStatus == REMIXAPI_ERROR_CODE_SUCCESS && frame.attempts != lastCpu;
     std::fprintf(file.get(), "%llu,%.6f,%u,%.6f,%.6f,%u,%u,%llu,%.6f,%u,%u,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,"
         "%.6f,%.6f,%.6f,%.6f,%u,%llu,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%.6f,%.6f,%.6f,"
-        "%llu,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
+        "%llu,%u,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%u,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f\n",
         static_cast<unsigned long long>(unixMs), hostMs, unsigned(presentStatus), frame.recordMilliseconds, frame.fenceMilliseconds,
         unsigned(available), unsigned(fresh), static_cast<unsigned long long>(timings.frame), timings.frameMilliseconds,
         timings.renderWidth, timings.renderHeight, timings.outputWidth, timings.outputHeight,
@@ -115,7 +119,9 @@ struct Recorder {
         pass("Forward+ viewmodel color"), pass("Forward+ viewmodel depth prepass"),
         static_cast<unsigned long long>(frame.attempts), unsigned(cpuFresh), frame.presented,
         frame.presentMilliseconds, frame.sceneMilliseconds, frame.acquireMilliseconds,
-        frame.submitMilliseconds, frame.queuePresentMilliseconds, previousSampleMilliseconds);
+        frame.submitMilliseconds, frame.queuePresentMilliseconds, previousSampleMilliseconds,
+        unsigned(stages.valid), stages.draws, stages.meshBuild, stages.submission, stages.bsp, stages.present,
+        stages.worldLists, stages.worldPatches);
     if (available) lastGpu = timings.frame;
     if (cpuStatus == REMIXAPI_ERROR_CODE_SUCCESS) lastCpu = frame.attempts;
     if (++rows % 120 == 0) std::fflush(file.get());
@@ -125,11 +131,25 @@ struct Recorder {
         std::chrono::steady_clock::now() - began).count();
   }
 };
+Recorder &recorder() {
+  static Recorder instance;
+  return instance;
+}
+}
+
+bool enabled() { return bool(recorder().file); }
+
+void recordWorldLists(uint32_t lists, uint32_t patches) {
+  worldListsUs.fetch_add(lists, std::memory_order_relaxed);
+  worldPatchesUs.fetch_add(patches, std::memory_order_relaxed);
+}
+
+WorldListTotals worldListTotals() {
+  return {worldListsUs.load(std::memory_order_relaxed), worldPatchesUs.load(std::memory_order_relaxed)};
 }
 
 void sample(double hostFrameMilliseconds, remixapi_ErrorCode presentStatus,
-            HWND hostWindow, PFN_remixapi_GetWindowState getWindowState) {
-  static Recorder recorder;
-  recorder.sample(hostFrameMilliseconds, presentStatus, hostWindow, getWindowState);
+            HWND hostWindow, PFN_remixapi_GetWindowState getWindowState, const HostStages &stages) {
+  recorder().sample(hostFrameMilliseconds, presentStatus, hostWindow, getWindowState, stages);
 }
 }

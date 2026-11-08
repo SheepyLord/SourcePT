@@ -2844,7 +2844,9 @@ bool loadMap(const char *name) {
     return false;
   resetSky(name);
   diag::stage("Map lifecycle: %s", name && *name ? name : "unload");
-  return bsp::load(g_api, name ? name : "", engine_lights::stylesActive());
+  bsp::LoadOptions options;
+  options.lightStylesAvailable = engine_lights::stylesActive();
+  return bsp::load(g_api, name ? name : "", options);
 }
 
 void setSkyFaces(const uint8_t *const faces[6]) {
@@ -6314,6 +6316,26 @@ void onPresent() {
     g_frameBegan.store(now.QuadPart, std::memory_order_relaxed);
     g_frameThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
   }
+  frame_profile::HostStages hostStages;
+  if (frame_profile::enabled()) {
+    // Take the deltas before any submission timer for the new frame begins.
+    static uint32_t previous[5] = {};
+    static frame_profile::WorldListTotals previousWorld;
+    static bool havePrevious = false;
+    double milliseconds[5];
+    for (size_t i = 0; i < std::size(previous); ++i) {
+      const uint32_t current = g_totalUs[i].load(std::memory_order_relaxed);
+      milliseconds[i] = double(uint32_t(current - previous[i])) / 1000;
+      previous[i] = current;
+    }
+    const auto world = frame_profile::worldListTotals();
+    if (havePrevious)
+      hostStages = {true, milliseconds[0], milliseconds[1], milliseconds[2], milliseconds[3], milliseconds[4],
+                    double(uint32_t(world.lists - previousWorld.lists)) / 1000,
+                    double(uint32_t(world.patches - previousWorld.patches)) / 1000};
+    previousWorld = world;
+    havePrevious = true;
+  }
   Timer timer(g_usSubmit, &g_totalUs[2]);
   // Classify this frame's perspective views. The main view is the one with the
   // most draws among those sharing the most common field of view. Views with
@@ -7006,6 +7028,7 @@ void onPresent() {
       l.attenuation2 = b.attenuation[2];
       l.thetaDot = b.thetaDot;
       l.phiDot = b.phiDot;
+      l.forwardCutoff = b.forwardCutoff;
       if (b.style) {
         // Switchable and flickering lights: scaled by their lightstyle (off at 0).
         const float value = engineLights && engineLights->styles && b.style > 0 && b.style < 128
@@ -7092,6 +7115,7 @@ void onPresent() {
         authored.attenuation2 = light.attenuation[2];
         authored.thetaDot = light.thetaDot;
         authored.phiDot = light.phiDot;
+        authored.forwardCutoff = light.forwardCutoff;
         const float currentStyle = engineLights && engineLights->styles && light.style < 128
                                        ? engineLights->style[light.style] : 1.f;
         const auto captured = g_styledBakeLights.capture(g_api, authored, light.hash, light.style,
@@ -7219,7 +7243,7 @@ void onPresent() {
     diag::stage("OpenRemix Present returned %u (previous %u)", unsigned(presentResult), unsigned(previousPresentResult));
     previousPresentResult = presentResult;
   }
-  frame_profile::sample(g_frameIntervalMs, presentResult, g_gameWindow, g_api.GetWindowState);
+  frame_profile::sample(g_frameIntervalMs, presentResult, g_gameWindow, g_api.GetWindowState, hostStages);
   if (mark)
     diag::stage("frame %u: presented", presents);
   logWindowState(presents);

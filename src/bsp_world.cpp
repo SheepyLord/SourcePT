@@ -884,7 +884,7 @@ struct World {
   // Prop placements by 64-unit cell of their origin, for matching engine draws.
   std::unordered_map<uint64_t, std::vector<uint32_t>> propCells;
   std::map<std::array<int32_t, 6>, Group> groups;
-  bool lightStylesAvailable = false;
+  LoadOptions options;
   bool hasPlayerStart = false;
   SkyboxImages skyboxImages;
   float playerOrigin[3] = {}, playerAngles[3] = {};
@@ -1475,7 +1475,7 @@ const char *vtfFrames(const std::string &name, uint32_t &width, uint32_t &height
 SurfaceNormal *surfaceNormal(const std::string &name, float fps) {
   // Nonpositive/invalid rates retain the existing nonanimated policy. Distinct
   // positive rates need distinct runtime textures: uploads mutate the texture.
-  const float rate = std::isfinite(fps) && fps > 0 ? fps : 0;
+  const float rate = !g_world.options.freezeAnimation && std::isfinite(fps) && fps > 0 ? fps : 0;
   for (auto &known : g_world.surfaceNormals)
     if (known->name == name && known->requestedFps == rate)
       return known->texture ? known.get() : nullptr;
@@ -1753,6 +1753,12 @@ int materialByName(const std::string &name, bool brush) {
         scroll.layers = 3;
         std::copy_n(scroll1, 2, scroll.layer1);
         std::copy_n(scroll2, 2, scroll.layer2);
+      }
+      if (g_world.options.freezeAnimation) {
+        // Retain the frame-zero multi-layer normal mix without UV motion.
+        std::fill_n(scroll.base, 2, 0.f);
+        std::fill_n(scroll.layer1, 2, 0.f);
+        std::fill_n(scroll.layer2, 2, 0.f);
       }
       opaque.pNext = &scroll;
       swprintf(normalPath, 32, L"0x%llX", static_cast<unsigned long long>(normal->hash));
@@ -2609,6 +2615,11 @@ template <typename InSky> void loadLights(const Bsp &bsp, const InSky &inSky) {
   }();
   if (!enabled)
     return;
+  static const bool useLightCutoffs = [] {
+    char value[8] = {};
+    return GetEnvironmentVariableA("OPENREMIX_PROXY_BSP_LIGHT_CUTOFFS", value, sizeof(value)) == 1 &&
+           value[0] == '1';
+  }();
   int index = kWorldLightsHdr;
   if (!bsp.lump<uint8_t>(index).second)
     index = kWorldLights;
@@ -2637,7 +2648,7 @@ template <typename InSky> void loadLights(const Bsp &bsp, const InSky &inSky) {
     // The sun keeps its light (GMod's light_environment often has a style,
     // e.g. 33 on gm_construct, for day/night control).
     const bool styled = w.style != 0 && w.type != kEmitSky;
-    if (styled && !g_world.lightStylesAvailable) {
+    if (styled && !g_world.options.lightStylesAvailable) {
       ++g_world.styledLights;
       continue;
     }
@@ -2660,6 +2671,9 @@ template <typename InSky> void loadLights(const Bsp &bsp, const InSky &inSky) {
       l.attenuation[0] = l.attenuation[1] = 0, l.attenuation[2] = 1;
     l.thetaDot = w.stopdot;
     l.phiDot = w.stopdot2;
+    if (useLightCutoffs && (w.type == kEmitPoint || w.type == kEmitSpot) &&
+        std::isfinite(w.radius) && w.radius > 0)
+      l.forwardCutoff = w.radius;
     // By index and contents: the index alone named the same light on every
     // map, so after a map change the renderer found the previous map's light
     // cached under that name and went on drawing it in place of the new one.
@@ -3558,8 +3572,7 @@ bool textureMeanColor(const std::string &name, float rgba[4]) {
   return value[4] != 0;
 }
 
-bool load(const remixapi_Interface &api, const std::string &requestedMap, bool lightStylesAvailable,
-          bool decodeSkybox) {
+bool load(const remixapi_Interface &api, const std::string &requestedMap, LoadOptions options) {
   std::string mapName = lower(requestedMap);
   if (mapName.rfind("maps/", 0) == 0)
     mapName.erase(0, 5);
@@ -3569,13 +3582,13 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap, bool l
     char v[8] = {};
     return !(GetEnvironmentVariableA("OPENREMIX_PROXY_BSP_WORLD", v, sizeof(v)) && v[0] == '0');
   }();
-  if (!mapName.empty() && lower(mapName) == g_world.map && g_active)
+  if (!mapName.empty() && mapName == g_world.map && g_active && options == g_world.options)
     return true;
   publishPropIndex(nullptr);
   destroyMeshes();
   g_world = World{};
   g_world.api = &api;
-  g_world.lightStylesAvailable = lightStylesAvailable;
+  g_world.options = options;
   g_active = false;
   // Old inputs must not survive a map unload, missing BSP, or disabled world.
   invalidateBakeScene();
@@ -3642,7 +3655,7 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap, bool l
     }
     publishPropIndex(std::move(index));
   }
-  if (g_active && decodeSkybox && !g_world.skyboxImages.name.empty()) {
+  if (g_active && options.decodeSkybox && !g_world.skyboxImages.name.empty()) {
     // Decode while the map pakfile is mounted, just like ordinary BSP assets.
     // Procedural painted skies need an explicit frozen live-sky reference.
     const char *suffixes[] = {"rt", "lf", "bk", "ft", "up", "dn"};

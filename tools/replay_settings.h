@@ -10,6 +10,11 @@ struct CameraKey {
   uint32_t frame;
   std::array<float, 3> position, angles;
 };
+struct LightStyleKey {
+  uint32_t frame;
+  float multiplier;
+  uint32_t style = 0; // zero updates every style
+};
 struct Settings {
   std::optional<std::array<float, 3>> position, angles;
   // Repeated replay.cameraKey=frame x y z pitch yaw roll; first frame is zero.
@@ -32,7 +37,9 @@ struct Settings {
   bool requireSky = false; // quality references must not silently omit sky illumination
   bool styledLights = false; // explicit diagnostic authored-style playback
   float lightStyleValue = 1; // multiplier for all styled lights in the diagnostic snapshot
-  bool freezeAnimation = false; // explicit frame-zero material snapshots, not engine playback
+  // replay.lightStyleKey=frame multiplier [style]; applies after bake readiness.
+  std::vector<LightStyleKey> lightStyleKeys;
+  bool freezeAnimation = false; // use frame-zero textures and UVs
   std::string mods; // optional USD mod directory; relative to the settings file
 };
 // Applies runtime keys through the SDK and parses the replay-only settings.

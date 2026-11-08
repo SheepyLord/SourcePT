@@ -80,6 +80,16 @@ std::filesystem::file_time_type lastWrite(const std::filesystem::path &path) {
   return error ? std::filesystem::file_time_type::min() : time;
 }
 
+void waitForScreenshot(remixapi_Interface &api, const std::string &path,
+                       std::filesystem::file_time_type previous, Clock::time_point deadline) {
+  while (lastWrite(path) == previous) {
+    if (Clock::now() >= deadline)
+      throw std::runtime_error("Replay screenshot did not complete: " + path);
+    check(api.PumpEvents(), "Finish screenshot readback");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+}
+
 // Materials and images outlive the retained BSP instances. Missing inputs stay
 // unresolved and are reported once, rather than silently replaced for a bake.
 class Materials {
@@ -291,14 +301,16 @@ proxy::lighting::SourceLight sourceLight(const proxy::bsp::Light &source) {
   light.attenuation2 = source.attenuation[2];
   light.thetaDot = source.thetaDot;
   light.phiDot = source.phiDot;
+  light.forwardCutoff = source.forwardCutoff;
   return light;
 }
 
 void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *map, const char *output,
             unsigned frames, const proxy::replay::Settings &settings) {
+  const auto previousOutput = lastWrite(output);
   Materials materials(api, !settings.mods.empty(), settings.freezeAnimation);
   if (settings.freezeAnimation)
-    std::fprintf(stderr, "Diagnostic scope: animated textures frozen at frame zero; no engine playback/proxies\n");
+    std::fprintf(stderr, "Diagnostic scope: BSP material animation frozen at frame zero; no engine playback\n");
   currentMaterials = &materials;
   proxy::replay::Sky sky(api);
   struct SceneLifetime {
@@ -313,7 +325,11 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
       currentMaterials = nullptr;
     }
   } scene{api, {}, {}};
-  if (!proxy::bsp::load(api, map, settings.styledLights, true))
+  proxy::bsp::LoadOptions loadOptions;
+  loadOptions.lightStylesAvailable = settings.styledLights;
+  loadOptions.decodeSkybox = true;
+  loadOptions.freezeAnimation = settings.freezeAnimation;
+  if (!proxy::bsp::load(api, map, loadOptions))
     throw std::runtime_error("BSP load failed");
   sky.load(proxy::bsp::skyboxImages(), map);
   if (settings.requireSky && !sky.light())
@@ -349,6 +365,12 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
   std::vector<remixapi_LightHandle> bakeLights;
   if (sky.light()) bakeLights.push_back(sky.light());
   std::vector<remixapi_BakeStyledLightEXT> styledLights;
+  struct StyledRuntimeLight {
+    proxy::lighting::SourceLight authored;
+    uint64_t hash;
+    uint32_t style;
+  };
+  std::vector<StyledRuntimeLight> styledRuntimeLights;
   for (const auto &source : proxy::bsp::lights()) {
     const auto authored = sourceLight(source);
     auto current = authored;
@@ -361,11 +383,18 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
       const auto captured = scene.styled.capture(api, authored, source.hash, source.style, 1, 1, settings.lightStyleValue);
       if (!captured.authoredLight) throw std::runtime_error("Styled bake light creation failed");
       styledLights.push_back(captured);
+      if (!settings.lightStyleKeys.empty()) styledRuntimeLights.push_back({authored, source.hash, uint32_t(source.style)});
     } else bakeLights.push_back(handle);
   }
   if (settings.styledLights)
     std::printf("Diagnostic styled lights: %zu at multiplier %.3f; immutable full-on bake definitions\n",
                 styledLights.size(), settings.lightStyleValue);
+  if (!settings.lightStyleKeys.empty() && styledRuntimeLights.empty())
+    throw std::runtime_error("Lightstyle path requires a map with styled lights");
+  for (const auto &key : settings.lightStyleKeys)
+    if (key.style && std::none_of(styledRuntimeLights.begin(), styledRuntimeLights.end(),
+                                 [&](const auto &light) { return light.style == key.style; }))
+      throw std::runtime_error("Lightstyle path references missing style " + std::to_string(key.style));
   const auto statistics = reinterpret_cast<PFN_remixapi_GetBakeStatisticsEXT>(
       GetProcAddress(library, "remixapi_GetBakeStatisticsEXT"));
   const auto backendStatistics = reinterpret_cast<PFN_remixapi_GetBackendCapabilitiesEXT>(
@@ -386,11 +415,13 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
   remixapi_PreparationStatisticsEXT finalPreparation{};
   Clock::time_point preparationPendingSince{};
   proxy::replay::HostProfile hostProfile(library, output, measurement.enabled());
+  const bool traceStyleTimings = !settings.cameraPath.empty() && !settings.lightStyleKeys.empty() && gpuStatistics;
   if (measurement.enabled()) {
     if (!backendStatistics || !gpuStatistics || (settings.waitForBake && !statistics))
       throw std::runtime_error("Runtime lacks GPU measurement statistics");
-    check(api.SetConfigVariable("rtx.native.gpuPassTimers", "1"), "Enable GPU timestamps");
   }
+  if (measurement.enabled() || traceStyleTimings)
+    check(api.SetConfigVariable("rtx.native.gpuPassTimers", "1"), "Enable GPU timestamps");
   const char *profile = std::getenv("REMIX_CONFIG_DIR");
   const std::filesystem::path diagnostics =
       profile ? std::filesystem::path(profile) : std::filesystem::path();
@@ -403,10 +434,16 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
   uint32_t lastState = ~0u;
   bool reportedPendingInputs = false;
   uint32_t pathWarmup = 0, pathFrame = 0;
+  size_t nextLightStyleKey = 0;
   uint64_t pathHash = 0;
   unsigned pathEnd = ~0u;
   bool pathReady = false;
   std::ofstream pathTrace;
+  std::ofstream pathTiming;
+  const std::array styleTimingPasses{
+      "Forward+ stable styled lighting composition", "Forward+ opaque world shading",
+      "Forward+ local shadow maps", "Forward+ light clustering", "Forward+ sun shadow cascades",
+      "Forward+ measured water"};
   std::map<std::string, std::filesystem::file_time_type> pathSnapshots;
   if (!settings.cameraPath.empty()) {
     if (!statistics) throw std::runtime_error("Camera paths require bake statistics");
@@ -417,6 +454,15 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
     pathTrace.exceptions(std::ios::failbit | std::ios::badbit);
     pathTrace.precision(9);
     pathTrace << "pathFrame,x,y,z,screenshot\n";
+    if (traceStyleTimings) {
+      trace.replace_extension("style-timings.csv");
+      pathTiming.exceptions(std::ios::failbit | std::ios::badbit);
+      pathTiming.open(trace);
+      pathTiming.precision(9);
+      pathTiming << "pathFrame,replayFrame,hostMs,completedGpuFrame,gpuMs,styleCompositionMs,"
+                    "opaqueMs,localShadowMs,clusterMs,sunShadowMs,waterMs,truncated,"
+                    "submitUnixMs,receiptUnixMs,lastStyleKeyFrame,lastStyleGroup,lastStyleMultiplier\n";
+    }
   }
   const auto start = Clock::now();
   proxy::replay::ProbeReceivers receivers(api, settings.probeReceivers,
@@ -429,7 +475,22 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
       TranslateMessage(&message);
       DispatchMessageW(&message);
     }
-    if (pathReady && pathEnd == ~0u) {
+    const bool onPath = pathReady && pathEnd == ~0u;
+    const auto currentPathFrame = pathFrame;
+    if (onPath) {
+      if (nextLightStyleKey < settings.lightStyleKeys.size() &&
+          settings.lightStyleKeys[nextLightStyleKey].frame == pathFrame) {
+        const auto &key = settings.lightStyleKeys[nextLightStyleKey++];
+        for (const auto &light : styledRuntimeLights) {
+          if (key.style && light.style != key.style) continue;
+          auto current = light.authored;
+          for (auto &value : current.color) value *= key.multiplier;
+          if (!proxy::lighting::createLight(api, current, light.hash))
+            throw std::runtime_error("Styled runtime light update failed");
+        }
+        std::fprintf(stderr, "Replay lightstyle frame %u: group %u (0 = all), multiplier %.3f\n",
+                     pathFrame, key.style, key.multiplier);
+      }
       params = proxy::replay::pathCamera(settings, pathFrame);
       params.pNext = &medium;
       const float movingEye[] = {params.position.x, params.position.y, params.position.z};
@@ -465,8 +526,42 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
         (measurementEnd != ~0u && frame == measurementEnd + 1) ||
         (pathEnd != ~0u && frame == pathEnd + 32)))
       check(api.RequestPresentedScreenshot(output), "RequestPresentedScreenshot");
+    const auto traceStyleFrame = onPath && traceStyleTimings;
+    const auto submitTime = traceStyleFrame ? std::chrono::system_clock::now() : std::chrono::system_clock::time_point{};
     check(api.Present(nullptr), "Present");
     const double hostMs = std::chrono::duration<double, std::milli>(Clock::now() - frameStart).count();
+    remixapi_GpuPassTimingsEXT timing{};
+    if (traceStyleFrame || (measurement.enabled() && !measurement.complete())) {
+      timing.structSize = sizeof(timing);
+      check(gpuStatistics(&timing), "GetGpuPassTimings");
+    }
+    if (traceStyleFrame) {
+      pathTiming << currentPathFrame << ',' << frame << ',' << hostMs << ',';
+      if (timing.available) {
+        std::array<double, styleTimingPasses.size()> durations{};
+        const uint32_t count = std::min(timing.passCount, uint32_t(REMIXAPI_GPU_PASS_TIMING_CAPACITY_EXT));
+        for (uint32_t pass = 0; pass < count; ++pass) {
+          const auto &sample = timing.passes[pass];
+          const auto found = std::find_if(styleTimingPasses.begin(), styleTimingPasses.end(),
+              [&](const char *name) { return std::strcmp(sample.name, name) == 0; });
+          if (found != styleTimingPasses.end()) durations[found - styleTimingPasses.begin()] += sample.milliseconds;
+        }
+        pathTiming << timing.frame << ',' << timing.frameMilliseconds;
+        for (const double duration : durations) pathTiming << ',' << duration;
+        pathTiming << ',' << timing.truncated;
+      } else {
+        for (size_t column = 0; column < styleTimingPasses.size() + 2; ++column) pathTiming << ',';
+      }
+      const auto unixMs = [](auto time) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(time.time_since_epoch()).count();
+      };
+      pathTiming << ',' << unixMs(submitTime) << ',' << unixMs(std::chrono::system_clock::now());
+      if (nextLightStyleKey != 0) {
+        const auto &key = settings.lightStyleKeys[nextLightStyleKey - 1];
+        pathTiming << ',' << key.frame << ',' << key.style << ',' << key.multiplier;
+      } else pathTiming << ",,,";
+      pathTiming << '\n';
+    }
     if (preparationStatistics) {
       remixapi_PreparationStatisticsEXT preparation{};
       preparation.structSize = sizeof(preparation);
@@ -537,9 +632,6 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
       remixapi_BackendCapabilitiesEXT backend{};
       backend.structSize = sizeof(backend);
       check(backendStatistics(&backend), "GetBackendCapabilities");
-      remixapi_GpuPassTimingsEXT timing{};
-      timing.structSize = sizeof(timing);
-      check(gpuStatistics(&timing), "GetGpuPassTimings");
       bool ready = preparationReadyState && materials.complete() && backend.activeBackend == backend.requestedBackend &&
                    (backend.activeBackend != 2 || !settings.waitForBake || stats.active);
       if (backend.activeBackend == 2 && settings.waitForBake)
@@ -594,7 +686,7 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
     if (measurementEnd != ~0u && frame >= measurementEnd + drain) {
       // Runtime file requests are serviced every 30 presents. A short timing
       // window can finish before that poll; drain the requested probe report
-      // as well as the screenshot, without including either in measurements.
+      // without including the report drain in measurements.
       const bool pendingProbes = profile && requestedProbes &&
                                  !probeReport.ready();
       const bool pendingPipelines = requestedPipelines && !pipelineReport.ready();
@@ -609,16 +701,21 @@ void replay(remixapi_Interface &api, HMODULE library, HWND window, const char *m
     if (!stats.active && settings.denoiseFrameDelayMs &&
         std::strstr(stats.status, "Denoising surface lightmaps"))
       std::this_thread::sleep_for(std::chrono::milliseconds(settings.denoiseFrameDelayMs));
-    else if (!measurement.enabled())
+    // A timed style path is a measurement too. Keep the throttle for
+    // preparation and screenshot-only camera paths.
+    else if (!measurement.enabled() && !traceStyleFrame)
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   if (!settings.cameraPath.empty() && (pathEnd == ~0u || frames <= pathEnd + 60))
     throw std::runtime_error("Replay frame budget ended before the camera path drained");
-  for (const auto &[snapshot, previous] : pathSnapshots)
-    if (lastWrite(snapshot) == previous)
-      throw std::runtime_error("Camera path produced no fresh screenshot: " + snapshot);
   if (measurement.enabled())
     measurement.write(output, map);
+  // A fixed number of presents can leave the capture fence pending. Finish
+  // readbacks while the runtime still owns them, without recording extra frames.
+  const auto screenshotDeadline = Clock::now() + std::chrono::seconds(10);
+  for (const auto &[snapshot, previous] : pathSnapshots)
+    waitForScreenshot(api, snapshot, previous, screenshotDeadline);
+  waitForScreenshot(api, output, previousOutput, screenshotDeadline);
   // Requested accumulation is not evidence that history survived scene updates.
   // Keep the final submitted tracing state beside replay receipts so a noisy
   // reference cannot be mistaken for a converged multi-frame image.
@@ -718,12 +815,11 @@ int main(int argc, char **argv) {
   struct Stage {
     const char *map, *settings;
     std::string output;
-    std::filesystem::file_time_type previous;
   };
   std::vector<Stage> stages;
   auto appendStage = [&](const char *map, const char *output, const char *settings) {
     const auto absolute = std::filesystem::absolute(output).lexically_normal().string();
-    stages.push_back({map, settings, absolute, lastWrite(absolute)});
+    stages.push_back({map, settings, absolute});
   };
   appendStage(argv[3], argv[4], argc > 6 ? argv[6] : nullptr);
   for (int i = 7; i < argc; i += 3)
@@ -783,12 +879,6 @@ int main(int argc, char **argv) {
   }
   if (library)
     remixapi_lib_shutdownAndUnloadRemixDll(&api, library);
-  for (const auto &stage : stages) {
-    if (!result && lastWrite(stage.output) == stage.previous) {
-      std::fprintf(stderr, "Replay produced no screenshot: %s\n", stage.output.c_str());
-      result = 1;
-    }
-  }
   DestroyWindow(window);
   return result;
 }

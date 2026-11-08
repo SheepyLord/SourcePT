@@ -101,6 +101,22 @@ Settings configure(remixapi_Interface &api, const std::string &path) {
         settings.lightStyleValue = numbers<1>(value)[0];
         if (settings.lightStyleValue < 0 || settings.lightStyleValue > 4)
           throw std::runtime_error("Diagnostic style value must be in [0,4]");
+      } else if (key == "replay.lightStyleKey") {
+        std::istringstream input(value);
+        float frame, multiplier;
+        if (!(input >> frame >> multiplier) || !std::isfinite(frame) || !std::isfinite(multiplier))
+          throw std::runtime_error("Lightstyle key requires a finite frame and multiplier");
+        uint32_t style = 0;
+        if (!(input >> std::ws).eof()) {
+          if (!(input >> style) || style == 0 || style > 127 || !(input >> std::ws).eof())
+            throw std::runtime_error("Lightstyle key group must be an integer in [1,127]");
+        }
+        if (frame < 0 || frame > 1024 || frame != std::floor(frame) ||
+            (!settings.lightStyleKeys.empty() && frame <= settings.lightStyleKeys.back().frame))
+          throw std::runtime_error("Lightstyle keys need increasing integer frames in [0,1024]");
+        if (multiplier < 0 || multiplier > 4)
+          throw std::runtime_error("Diagnostic style value must be in [0,4]");
+        settings.lightStyleKeys.push_back({uint32_t(frame), multiplier, style});
       } else if (key == "replay.warmupSeconds") {
         settings.warmupSeconds = numbers<1>(value)[0];
         if (settings.warmupSeconds < 0 || settings.warmupSeconds > 60)
@@ -159,6 +175,9 @@ Settings configure(remixapi_Interface &api, const std::string &path) {
     const auto count = last / interval + 1 + uint32_t(last % interval != 0);
     if (count > 64) throw std::runtime_error("Camera path exceeds 64 screenshots; increase its capture interval");
   }
+  if (!settings.lightStyleKeys.empty() && (!settings.styledLights || settings.cameraPath.empty() ||
+      settings.lightStyleKeys.back().frame > settings.cameraPath.back().frame))
+    throw std::runtime_error("Lightstyle keys require styled lights and must fall within the camera path");
   return settings;
 }
 bool capturePathFrame(const Settings &settings, uint32_t frame) {
@@ -181,7 +200,9 @@ remixapi_CameraInfoParameterizedEXT pathCamera(const Settings &settings, uint32_
   view.position = a.position;
   view.angles = a.angles;
   for (size_t axis = 0; axis < 3; ++axis) {
-    (*view.position)[axis] = a.position[axis] * (1 - t) + b.position[axis] * t;
+    // A stationary axis must stay exact, including during light-only replays.
+    if (a.position[axis] != b.position[axis])
+      (*view.position)[axis] = a.position[axis] * (1 - t) + b.position[axis] * t;
     (*view.angles)[axis] += t * std::remainder(b.angles[axis] - a.angles[axis], 360.f);
   }
   return camera(view, {}, {});
