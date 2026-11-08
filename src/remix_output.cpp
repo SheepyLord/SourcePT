@@ -1000,13 +1000,19 @@ namespace {
 //   2  (default) also the self-illuminated parts of what the engine draws
 //      (models, the view model). Their emitters come and go with the prop;
 //      the runtime keeps them in the dynamic part of its light hierarchy.
-//   3  also every unlit surface (foliage cards, skybox scenery, 3D2D panels,
+//      Entropy : Zero 2 and Black Mesa: not skinned models' (see materialFor).
+//   3  also every unlit surface (and there, skinned models) (foliage cards, skybox scenery, 3D2D panels,
 //      sprites: many emitters, changing every frame).
-bool emissiveLights(const engine_materials::Shading &s, bool bspWorld) {
+int emissiveLightsMode() {
   static const int mode = [] {
     char v[8] = {};
     return GetEnvironmentVariableA("OPENREMIX_PROXY_EMISSIVE_LIGHTS", v, sizeof(v)) ? std::atoi(v) : 2;
   }();
+  return mode;
+}
+
+bool emissiveLights(const engine_materials::Shading &s, bool bspWorld) {
+  const int mode = emissiveLightsMode();
   if (mode <= 0)
     return false;
   if (s.mode == engine_materials::Shading::Unlit)
@@ -1489,8 +1495,9 @@ void countPbr(const PbrMaps &maps) {
 
 // A draw's material: the texture's lit one, or its unlit / self-illuminated
 // variant (falling back to the lit one when its mask texture is not known),
-// with the material's PBR conversion.
-remixapi_MaterialHandle materialFor(const void *texture, const engine_materials::Shading &s, bool nearest = false) {
+// with the material's PBR conversion. skinned: a skinned (studio model) draw.
+remixapi_MaterialHandle materialFor(const void *texture, const engine_materials::Shading &s, bool nearest = false,
+                                    bool skinned = false) {
   using engine_materials::Shading;
   if (const int slot = screenSlot(texture); slot >= 0)
     return screenMaterial(slot);
@@ -1501,7 +1508,15 @@ remixapi_MaterialHandle materialFor(const void *texture, const engine_materials:
   const uint64_t maskHash = masked ? maskTextureHash(s.mask) : 0;
   if (masked && !maskHash && !s.pbr.active)
     return materialFor(texture, 0, nearest);
+#if defined(PROXY_GAME_EZ2)
+  // Skinned models' self-illumination glows without lighting the scene
+  // (unless OPENREMIX_PROXY_EMISSIVE_LIGHTS is 3): their emitters move with
+  // every frame's pose, which the runtime rebuilds. A dozen acid antlions
+  // (Entropy : Zero 2's ez2_c1_3) took 35 ms of every frame that way.
+  const bool lights = emissiveLights(s, false) && (!skinned || emissiveLightsMode() >= 3);
+#else
   const bool lights = emissiveLights(s, false);
+#endif
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
 #if defined(PROXY_GAME_EZ2)
   auto t = findOrRealizeTexture(texture);
@@ -6543,11 +6558,11 @@ void onDraw(const Draw &d) {
     inst.material = materialForName(engine_materials::current().base, nearest);
     ++(inst.material ? g_stats.cableDraws : g_stats.cableNoBase);
   } else {
-    inst.material = d.texture0 ? materialFor(d.texture0, shading, nearest) : nullptr;
+    inst.material = d.texture0 ? materialFor(d.texture0, shading, nearest, skinnedDraw) : nullptr;
     if (!inst.material && d.texture0 == nullptr) {
       for (int s = 1; s < 8; ++s) {
         if (d.stageTextures[s] && !(d.textureTargets >> s & 1)) {
-          inst.material = materialFor(d.stageTextures[s], shading, nearest);
+          inst.material = materialFor(d.stageTextures[s], shading, nearest, skinnedDraw);
           if (inst.material)
             break;
         }
