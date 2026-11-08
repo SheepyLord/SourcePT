@@ -113,6 +113,12 @@ float skyTracedReach();
 // The BSP material using a texture (for statistics), or empty.
 std::string materialName(uint64_t textureHash);
 
+// The path-traced mirror for a LightmappedReflective material (reflective
+// glass, which the engine draws from its reflection render target), by the
+// material system's name; null for other materials, before a map is read or
+// with OPENREMIX_PROXY_MIRRORS=0. Render thread.
+remixapi_MaterialHandle mirrorMaterial(const char *materialName);
+
 // Whether `materialName` (as the material system names it, lower case) is the
 // map's detail sprite material: worldspawn's "detailmaterial", else the
 // engine's default "detail/detailsprites". The client's detail object system

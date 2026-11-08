@@ -841,6 +841,7 @@ struct World {
   std::string pbrNames; // statistics: each world material's PBR conversion
   CullStatistics cull;
   std::unordered_map<std::string, int> overlayMaterialIndex;
+  uint32_t mirrorMaterials = 0, mirrorDraws = 0; // BSP faces', engine draws' (mirrorMaterial)
   uint32_t overlays = 0, overlayTriangles = 0, waterMaterials = 0, waterNormalCount = 0, waterAnimated = 0,
            waterDownFaces = 0;
   uint32_t smoothNormals = 0; // brush face corners VRAD's vertex normal turns off the plane's (build)
@@ -1333,6 +1334,16 @@ bool waterNormalsEnabled() {
   return on;
 }
 
+// OPENREMIX_PROXY_MIRRORS=0: reflective glass as the engine draws it (from its
+// reflection render target) instead of a path-traced mirror.
+bool mirrorsEnabled() {
+  static const bool on = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_MIRRORS", v, sizeof(v)) && v[0] == '0');
+  }();
+  return on;
+}
+
 // Every frame of a VTF's largest mip as RGBA8 (R in the lowest byte), at
 // most 64 MB of them. Else why not: a missing file, a format not read here.
 const char *vtfFrames(const std::string &name, uint32_t &width, uint32_t &height,
@@ -1461,6 +1472,45 @@ void animateWaterNormals() {
                normal->width * 4) == REMIXAPI_ERROR_CODE_SUCCESS)
       normal->shown = frame;
   }
+}
+
+// Reflective glass (LightmappedReflective: func_reflective_glass,
+// gm_construct's mirror room). Source draws it from render targets, the view
+// mirrored through it ($reflecttexture) over the one behind it
+// ($refracttexture), by a reflectivity from $minreflectivity to
+// $maxreflectivity ($fresnelpower 0: the maximum everywhere); it has no base
+// texture. Here a smooth metal of its $reflecttint at that reflectivity, the
+// rest see-through: the path tracer reflects the scene itself. Null: the
+// runtime refused it.
+remixapi_MaterialHandle createMirror(KeyValues &kv, const std::string &key) {
+  auto number = [&](const char *k, float fallback) {
+    return kv.values.count(k) ? float(std::atof(kv.values[k].c_str())) : fallback;
+  };
+  float tint[3] = {1, 1, 1};
+  if (kv.values.count("$reflecttint"))
+    parseColor(kv.values["$reflecttint"], tint);
+  const float minimum = std::clamp(number("$minreflectivity", 0), 0.0f, 1.0f);
+  const float maximum = std::clamp(number("$maxreflectivity", 1), minimum, 1.0f);
+  // Head-on (Source's Fresnel term is 0 facing the surface unless its power is 0).
+  const float reflectivity = number("$fresnelpower", 5) <= 0 ? maximum : std::max(minimum, 0.04f);
+  remixapi_MaterialInfoOpaqueEXT opaque = {};
+  opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+  opaque.albedoConstant = {std::clamp(tint[0], 0.0f, 1.0f), std::clamp(tint[1], 0.0f, 1.0f),
+                           std::clamp(tint[2], 0.0f, 1.0f)};
+  opaque.metallicConstant = 1;
+  opaque.roughnessConstant = 0;
+  opaque.opacityConstant = reflectivity < 0.99f ? reflectivity : 1.0f;
+  opaque.alphaTestType = 7; // always passes (a compare op)
+  remixapi_MaterialInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+  info.pNext = &opaque;
+  info.hash = XXH3_64bits(key.data(), key.size()) | 1;
+  info.filterMode = 1;
+  info.wrapModeU = info.wrapModeV = 1;
+  remixapi_MaterialHandle handle = nullptr;
+  if (!g_world.api || g_world.api->CreateMaterial(&info, &handle) != REMIXAPI_ERROR_CODE_SUCCESS)
+    return nullptr;
+  return handle;
 }
 
 // Index into g_world.materials, or -1 for materials left to the engine
@@ -1600,6 +1650,16 @@ int materialByName(const std::string &name, bool brush) {
     m.noCull = true;
     std::memcpy(m.waterColor, &translucent.transmittanceColor, sizeof(m.waterColor));
     m.waterDistance = translucent.transmittanceMeasurementDistance;
+    slot = int(g_world.materials.size());
+    g_world.materials.push_back(std::move(m));
+    return slot;
+  }
+  if (kv.shader == "lightmappedreflective" && mirrorsEnabled()) {
+    m.ref.handle = createMirror(kv, key);
+    if (m.ref.handle) {
+      m.resolved = m.owned = true;
+      ++g_world.mirrorMaterials;
+    }
     slot = int(g_world.materials.size());
     g_world.materials.push_back(std::move(m));
     return slot;
@@ -3714,6 +3774,27 @@ std::string materialName(uint64_t textureHash) {
   return {};
 }
 
+remixapi_MaterialHandle mirrorMaterial(const char *materialName) {
+  if (!materialName || !mirrorsEnabled())
+    return nullptr;
+  // By name for the process (the materials outlive maps; a handful at most).
+  static std::unordered_map<std::string, remixapi_MaterialHandle> mirrors;
+  const std::string key = lower(materialName);
+  const auto it = mirrors.find(key);
+  if (it != mirrors.end())
+    return it->second;
+  KeyValues kv;
+  remixapi_MaterialHandle handle = nullptr;
+  if (g_world.api && loadMaterial(key, kv) && kv.shader == "lightmappedreflective") {
+    handle = createMirror(kv, "mirror:" + key);
+    g_world.mirrorDraws += handle != nullptr;
+  }
+  // Without the API (no map read yet) the next draw asks again.
+  if (g_world.api)
+    mirrors.emplace(key, handle);
+  return handle;
+}
+
 void dumpStatistics(FILE *out) {
   if (g_partition.result >= 0 || g_partition.clusters)
     fprintf(out, "   visibility partition: %u nodes, %u leaves, %u clusters -> %d\n", g_partition.nodes,
@@ -3733,14 +3814,15 @@ void dumpStatistics(FILE *out) {
           "corners with smoothed normals %u\n"
           "   BSP static props: %zu placements (%u in the 3D skybox left to the engine), %zu models (%u failed), %u parts | overlays %u "
           "(%u triangles, %zu groups) | func_lod brushes %u (%u faces; left to the engine %u) | water materials %u, with normal maps %u (animated %u; "
-          "OPENREMIX_PROXY_WATER_NORMALS), downward faces left out %u%s%s\n",
+          "OPENREMIX_PROXY_WATER_NORMALS), downward faces left out %u%s%s | mirrors (reflective glass) %u, of brush entities %u%s\n",
           g_world.map.c_str(), g_world.faces, g_world.displacements, g_world.skyFaces, g_world.triangles, resolved,
           g_world.materials.size(), g_world.groups.size(), meshes, g_world.skippedTranslucent, g_world.skippedIgnored, g_world.keptIgnored,
           int(g_world.skyCamera), g_world.smoothNormals, g_world.props.size(), g_world.skyProps, g_world.propModels.size(),
           g_world.propModelsFailed, g_world.propParts, g_world.overlays, g_world.overlayTriangles,
           g_world.overlayGroups.size(), g_world.lodEntities, g_world.lodFaces, g_world.lodLeft, g_world.waterMaterials, g_world.waterNormalCount, g_world.waterAnimated,
           g_world.waterDownFaces,
-          g_world.waterNormalFailure.empty() ? "" : " | not loaded: ", g_world.waterNormalFailure.c_str());
+          g_world.waterNormalFailure.empty() ? "" : " | not loaded: ", g_world.waterNormalFailure.c_str(),
+          g_world.mirrorMaterials, g_world.mirrorDraws, mirrorsEnabled() ? "" : " (off: OPENREMIX_PROXY_MIRRORS=0)");
   {
     const auto &l = g_world.layers;
     uint32_t meshes = 0, waiting = 0;

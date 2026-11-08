@@ -111,7 +111,7 @@ struct Stats {
   // eye draws, those told by their vertex shader (no material name: L4D2).
   std::atomic<uint32_t> eyes{0}, eyeIrises{0}, eyeRefracts{0}, eyesByShader{0};
   // Rope draws (the Cable shader): with their base texture found by name, and without.
-  std::atomic<uint32_t> cableDraws{0}, cableNoBase{0};
+  std::atomic<uint32_t> cableDraws{0}, cableNoBase{0}, mirrorDraws{0};
   // Decals (onDraw): by kind (DecalKind order), by what marked them, and how
   // they were lifted off their receiver.
   std::atomic<uint32_t> decalKinds[5] = {};
@@ -6916,9 +6916,20 @@ void onDraw(const Draw &d) {
   if (infectedDraw)
     applyInfected(d, infected, inst, nearest, bonesPerVertex, boneCount, skinnedDraw, ps.dynamic, flexIgnored);
 #endif
+  // Reflective glass (LightmappedReflective, a func_reflective_glass mirror):
+  // a path-traced mirror (bsp::mirrorMaterial), not the engine's reflection
+  // render target, sampled as a texture, which showed that view tiled over
+  // the glass.
+  const remixapi_MaterialHandle mirror = bound.known && nameStarts(bound.shader, "lightmappedreflective")
+                                             ? bsp::mirrorMaterial(engine_materials::currentName())
+                                             : nullptr;
+  if (mirror) {
+    inst.material = mirror;
+    ++g_stats.mirrorDraws;
+  }
   if (!d.texture0 && shading.mode != engine_materials::Shading::Lit)
     ++g_stats.emissiveNoTexture;
-  if (d.texture0Target && screenSlot(d.texture0) < 0)
+  if (d.texture0Target && screenSlot(d.texture0) < 0 && !mirror)
     d3d::requestTargetContents(d.texture0);
   inst.blend = blendState(d);
   // The modulation colour: the entity's render colour and alpha (a tinted
@@ -9896,8 +9907,9 @@ void dumpStatistics(FILE *out) {
               g_stats.modulatedDraws.exchange(0) / f, g_stats.modulatedBlack.exchange(0) / f,
               g_stats.modulatedMasked.exchange(0) / f, g_stats.modulatedMetal.exchange(0) / f, m[0], m[1], m[2], m[3]);
     }
-  fprintf(out, "   cable (rope) draws per frame: base texture by name %.1f, not resolved (untextured) %.1f\n",
-          g_stats.cableDraws.exchange(0) / f, g_stats.cableNoBase.exchange(0) / f);
+  fprintf(out, "   cable (rope) draws per frame: base texture by name %.1f, not resolved (untextured) %.1f | reflective "
+               "glass drawn as mirrors %.1f (OPENREMIX_PROXY_MIRRORS)\n",
+          g_stats.cableDraws.exchange(0) / f, g_stats.cableNoBase.exchange(0) / f, g_stats.mirrorDraws.exchange(0) / f);
   fprintf(out, "   wireframe draws (D3DFILL_WIREFRAME, raster-only lines) per frame: %.1f\n",
           g_stats.wireframeDraws.exchange(0) / f);
   fprintf(out, "   flexed draws per frame (faces with flex deltas this frame): %.1f, meshes refreshed in place %.1f (%zu flex meshes live) | flex stream bound with scale 0: %.1f, with cFlexScale not named by the shader (c%u assumed): %.1f\n",
