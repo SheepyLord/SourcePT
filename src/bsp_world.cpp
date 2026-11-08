@@ -737,6 +737,7 @@ struct PropPart {
   uint64_t replacementHash = 0;
   std::vector<float> positions; // model space, for occluders()
   std::vector<uint32_t> indices;
+  std::vector<remixapi_HardcodedVertex> vertices; // model space, for clipSkyProp
 };
 struct PropModel {
   std::vector<PropPart> parts;
@@ -750,6 +751,9 @@ struct Prop {
   bool skybox = false;
   // A 3D skybox prop baked into world space (path-traced skybox).
   bool skyTraced = false;
+  // Its parts clipped at the map (clipSkyProp), in world space: drawn instead
+  // of the model's, with an identity transform. Empty: the model's.
+  std::vector<PropPart> clipped;
 };
 
 // info_overlay decals, clipped onto their faces; merged per cell and blend.
@@ -858,6 +862,7 @@ struct World {
   bool skyTraced = false;
   float playableMins[3] = {}, playableMaxs[3] = {};
   float skyReach = 0; // farthest traced sky point from the playable bounds' centre
+  uint32_t skyPiecesBehind = 0, skyClippedProps = 0, skyPropClippedTriangles = 0;
   uint32_t skyTracedTriangles = 0, skyStandInTriangles = 0, skyClippedTriangles = 0, skyTracedProps = 0,
            skyStandInProps = 0, skyCoplanarPieces = 0;
   uint64_t frames = 0;
@@ -1273,6 +1278,7 @@ bool loadPropModel(const std::string &path, int skin, PropModel &out) {
           for (const auto &v : partVertices)
             part.positions.insert(part.positions.end(), {v.position[0], v.position[1], v.position[2]});
           part.indices = std::move(partIndices);
+          part.vertices = std::move(partVertices);
           out.parts.push_back(part);
           ++g_world.propParts;
         }
@@ -1846,6 +1852,10 @@ void destroyMeshes() {
     for (auto &part : model.parts)
       if (part.mesh && g_world.api)
         g_world.api->DestroyMesh(part.mesh);
+  for (auto &prop : g_world.props)
+    for (auto &part : prop.clipped)
+      if (part.mesh && g_world.api)
+        g_world.api->DestroyMesh(part.mesh);
   for (auto &[key, group] : g_world.groups)
     if (group.mesh && g_world.api)
       g_world.api->DestroyMesh(group.mesh);
@@ -1944,6 +1954,80 @@ void clipOutsidePlayable(const Bsp &bsp, int index, std::vector<remixapi_Hardcod
   }
   clipOutsidePlayable(bsp, nodes[index].children[0], std::move(frontPart), out, split, depth + 1);
   clipOutsidePlayable(bsp, nodes[index].children[1], std::move(backPart), out, split, depth + 1);
+}
+
+// A traced 3D skybox prop, scaled into world space, can reach into the
+// playable map where its origin does not (gm_construct's skybox trees, sixteen
+// times their size, through the white room). Such a prop gets world-space
+// copies of its parts clipped at the map's BSP as skybox faces are
+// (clipOutsidePlayable); one that stays outside keeps the model's meshes.
+void clipSkyProp(const Bsp &bsp, const PropModel &model, Prop &prop) {
+  const auto &t = prop.transform;
+  std::vector<std::pair<const PropPart *, Geometry>> parts;
+  bool reaches = false;
+  std::vector<std::vector<remixapi_HardcodedVertex>> pieces;
+  for (const auto &part : model.parts) {
+    Geometry g;
+    g.vertices = part.vertices;
+    for (auto &v : g.vertices) {
+      float p[3], n[3];
+      for (int r = 0; r < 3; ++r) {
+        p[r] = t[r][0] * v.position[0] + t[r][1] * v.position[1] + t[r][2] * v.position[2] + t[r][3];
+        n[r] = t[r][0] * v.normal[0] + t[r][1] * v.normal[1] + t[r][2] * v.normal[2];
+      }
+      const float length = std::sqrt(dot(n, n));
+      std::memcpy(v.position, p, sizeof(p));
+      for (int k = 0; k < 3; ++k)
+        v.normal[k] = length > 1e-6f ? n[k] / length : v.normal[k];
+    }
+    const size_t modelVertices = g.vertices.size();
+    for (size_t i = 0; i + 2 < part.indices.size(); i += 3) {
+      const uint32_t a = part.indices[i], b = part.indices[i + 1], c = part.indices[i + 2];
+      if (a >= modelVertices || b >= modelVertices || c >= modelVertices)
+        continue;
+      pieces.clear();
+      bool split = false;
+      clipOutsidePlayable(bsp, 0, {g.vertices[a], g.vertices[b], g.vertices[c]}, pieces, split);
+      if (!split) {
+        g.indices.insert(g.indices.end(), {a, b, c});
+        continue;
+      }
+      reaches = true;
+      ++g_world.skyPropClippedTriangles;
+      for (const auto &piece : pieces) {
+        const uint32_t first = uint32_t(g.vertices.size());
+        g.vertices.insert(g.vertices.end(), piece.begin(), piece.end());
+        for (uint32_t k = 1; k + 1 < piece.size(); ++k)
+          g.indices.insert(g.indices.end(), {first, first + k, first + k + 1});
+      }
+    }
+    parts.emplace_back(&part, std::move(g));
+  }
+  if (!reaches || !g_world.api)
+    return;
+  ++g_world.skyClippedProps;
+  for (auto &[part, g] : parts) {
+    if (g.indices.empty())
+      continue;
+    remixapi_MeshInfoSurfaceTriangles surface = {};
+    surface.vertices_values = g.vertices.data();
+    surface.vertices_count = g.vertices.size();
+    surface.indices_values = g.indices.data();
+    surface.indices_count = g.indices.size();
+    remixapi_MeshInfo info = {};
+    info.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
+    info.hash = XXH3_64bits_withSeed(&part->replacementHash, sizeof(part->replacementHash), prop.id);
+    info.surfaces_values = &surface;
+    info.surfaces_count = 1;
+    PropPart clipped;
+    clipped.material = part->material;
+    clipped.replacementHash = part->replacementHash;
+    if (g_world.api->CreateMesh(&info, &clipped.mesh) == REMIXAPI_ERROR_CODE_SUCCESS)
+      prop.clipped.push_back(std::move(clipped));
+  }
+  // Placed in world space: the identity.
+  std::memset(prop.transform, 0, sizeof(prop.transform));
+  prop.transform[0][0] = prop.transform[1][1] = prop.transform[2][2] = 1;
 }
 
 void noteSkyReach(const float p[3]) {
@@ -2048,6 +2132,8 @@ template <typename InSky> void loadProps(const Bsp &bsp, const InSky &inSky) {
       noteSkyReach(moved);
       ++g_world.skyTracedProps;
       prop.skyTraced = true;
+      prop.id = XXH3_64bits_withSeed(&p, sizeof(p), 0x70726f70ull) | 1;
+      clipSkyProp(bsp, it->second, prop);
     }
     prop.model = &it->second;
     prop.id = XXH3_64bits_withSeed(&p, sizeof(p), 0x70726f70ull) | 1;
@@ -2634,6 +2720,49 @@ bool build(const Bsp &bsp) {
     }
     return false;
   };
+  // A kept skybox piece lying on a world face it overlaps, or less than
+  // kBehind behind it, goes kBehind behind that face's plane (into the solid
+  // the face bounds). onWorldFace drops the pieces whose centre lies over a
+  // face; a piece mostly elsewhere (gm_construct's skybox ground continuing the
+  // north wall down into the ground) still overlaps the face with its rest and
+  // z-fought with it. Behind it the face hides it, and beyond the face (behind
+  // the sky brushes) it is where it was within a few units.
+  constexpr float kBehind = 2;
+  auto behindWorldFace = [&](std::vector<remixapi_HardcodedVertex> &piece) {
+    const float *a = piece[0].position, *b = piece[1].position, *c = piece[2].position;
+    const float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+    float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+    const float length = std::sqrt(dot(n, n));
+    if (length < 1e-6f)
+      return false;
+    for (float &x : n)
+      x /= length;
+    float mins[3], maxs[3], centroid[3] = {};
+    for (int k = 0; k < 3; ++k) {
+      mins[k] = maxs[k] = piece[0].position[k];
+      for (const auto &v : piece) {
+        mins[k] = std::min(mins[k], v.position[k]);
+        maxs[k] = std::max(maxs[k], v.position[k]);
+        centroid[k] += v.position[k] / float(piece.size());
+      }
+    }
+    for (const auto &w : worldPlanes) {
+      const float d = dot(w.normal, centroid) - w.dist;
+      if (std::fabs(dot(w.normal, n)) < 0.996f || d >= 0.5f || d <= -kBehind)
+        continue;
+      bool overlap = true;
+      for (int k = 0; k < 3 && overlap; ++k)
+        overlap = mins[k] <= w.maxs[k] + 1 && maxs[k] >= w.mins[k] - 1;
+      if (!overlap)
+        continue;
+      const float shift = d + kBehind;
+      for (auto &v : piece)
+        for (int k = 0; k < 3; ++k)
+          v.position[k] -= w.normal[k] * shift;
+      return true;
+    }
+    return false;
+  };
 
   // The world's faces, then those of the func_lod brushes.
   std::vector<int32_t> faceList;
@@ -2760,6 +2889,11 @@ bool build(const Bsp &bsp) {
                                       return coplanar;
                                     }),
                      pieces.end());
+        for (auto &piece : pieces) {
+          const bool moved = behindWorldFace(piece);
+          g_world.skyPiecesBehind += moved && count;
+          split |= moved;
+        }
         if (!split) {
           g.indices.insert(g.indices.end(), triangles.begin() + i, triangles.begin() + i + 3);
           g_world.skyTracedTriangles += count;
@@ -3496,7 +3630,7 @@ void submit(MaterialLookup lookup) {
   for (const auto &prop : g_world.props) {
     if (prop.skybox)
       continue;
-    for (const auto &part : prop.model->parts) {
+    for (const auto &part : prop.clipped.empty() ? prop.model->parts : prop.clipped) {
       const auto &m = g_world.materials[part.material];
       remixapi_InstanceInfoMaterialEXT material = {};
       material.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_MATERIAL_EXT;
@@ -3873,9 +4007,11 @@ void dumpStatistics(FILE *out) {
   }
   if (g_world.skyTraced)
     fprintf(out, "   3D skybox path traced: %u triangles, %u clipped at the map, %u props (in playable space: %u "
-            "triangles, %u props; pieces on world faces %u), reach %.0f\n",
+            "triangles, %u props; pieces on world faces %u, moved behind world faces %u; props reaching into it, "
+            "clipped %u: %u triangles), reach %.0f\n",
             g_world.skyTracedTriangles, g_world.skyClippedTriangles, g_world.skyTracedProps,
-            g_world.skyStandInTriangles, g_world.skyStandInProps, g_world.skyCoplanarPieces, g_world.skyReach);
+            g_world.skyStandInTriangles, g_world.skyStandInProps, g_world.skyCoplanarPieces, g_world.skyPiecesBehind,
+            g_world.skyClippedProps, g_world.skyPropClippedTriangles, g_world.skyReach);
   {
     // Unresolved materials: no predictable texture hash (VTF missing or its
     // format not modelled) vs. a hash the engine never uploaded.
