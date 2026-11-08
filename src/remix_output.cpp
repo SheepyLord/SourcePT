@@ -5981,8 +5981,10 @@ void onDraw(const Draw &d) {
   // A brush entity faded out by its render alpha (pixel shader c1.w, the
   // modulation, which LightmappedGeneric blends by): a func_areaportalwindow's
   // brush (halflife/black across a doorway) drawn at alpha 0 when the player
-  // is near, invisible in the game and a black wall here.
-  if (d.blend && d.psConstants && !(d.psConstants[1 * 4 + 3] > 0.004f) && engine_materials::bound().known &&
+  // is near, invisible in the game and a black wall here. Only alpha-blended:
+  // an additive brush's c1.w is 0 however visible (frosted glass, $additive).
+  if (d.blend && d.dstBlend == D3DBLEND_INVSRCALPHA && d.psConstants && !(d.psConstants[1 * 4 + 3] > 0.004f) &&
+      engine_materials::bound().known &&
       nameStarts(engine_materials::bound().shader, "lightmappedgeneric")) {
     ++g_stats.windowImpostersDropped;
     return;
