@@ -785,7 +785,7 @@ constexpr Code kCode = {
 };
 #elif defined(PROXY_GAME_EZ2)
 // Entropy : Zero 2: the getters ask slot 138 (call [eax+0x228]); m_pMaterial is at 0x2b38.
-#define X86_VAR_GETTER(tail)                                                                                          \
+#define VAR_GETTER(tail)                                                                                              \
   "56 8B F1 8B 0D ? ? ? ? 8B 01 FF 90 28 02 00 00 85 C0 74 2C F6 46 1C 80 75 26 8A 46 1D 3C FF 74 1F 8B 0D ? ? ? ? " \
   "0F B6 C0 8D 04 80 8D 34 C5 ? ? ? ? 8B 01 FF 90 28 02 00 00 85 C0 75 D4 " tail
 constexpr Code kCode = {
@@ -798,21 +798,37 @@ constexpr Code kCode = {
     // mov eax,[ebx]; mov ecx,ebx; call [eax+0x1c8] (FlushBufferedPrimitives,
     // slot 114); mov [ebx+0x2b38],edi; pop edi; pop ebx; pop ebp; ret 4
     "8B 03 8B CB FF 90 C8 01 00 00 89 BB 38 2B 00 00 5F 5B 5D C2 04 00", 0x77,
+    // add ecx,0x18 (the name symbol); jmp CUtlSymbol::String
+    "83 C1 18 E9",
+    "0F B6 41 22 C3",
+    "8B 41 24 C3",
     // push esi; mov esi,ecx; PrecacheVars(0,0,0,0) (slot 63); mov ecx,[esi+0x14];
     // pop esi; test ecx,ecx; je; mov eax,[ecx]; jmp [eax] (IShader::GetName)
     "56 8B F1 6A 00 6A 00 6A 00 8B 06 6A 00 FF 90 FC 00 00 00 8B 4E 14 5E 85 C9 74 04 8B 01 FF 20",
+    // push esi; movzx esi, word [ecx+0x1e] (the name symbol); 0xffff: none
+    "56 0F B7 71 1E B8 FF FF 00 00 66 3B F0",
     // mov cl,[ecx+0x1c]; xor eax,eax; and cl,0xf; cmp cl,6; setne al; ret
     "8A 49 1C 33 C0 80 E1 0F 80 F9 06 0F 95 C0 C3",
+    // ...; mov eax,[esi+8]; pop esi; ret
+    VAR_GETTER("8B 46 08 5E C3"),
+    // ...; fld dword [esi+0xc]; pop esi; ret
+    VAR_GETTER("D9 46 0C 5E C3"),
+    // ...; lea eax,[esi+0xc]; pop esi; ret
+    VAR_GETTER("8D 46 0C 5E C3"),
     // The twin as above (in ebx); movzx eax, byte [ebx+0x1c]; and eax,0xf;
     // cmp eax,8; ja; jmp [eax*4+table] (by type)
     "55 8B EC 83 EC 08 53 8B D9 8B 0D ? ? ? ? 56 57 8B 01 FF 90 28 02 00 00 85 C0 74 2F 8D 49 00 F6 43 1C 80 75 26 8A "
     "43 1D 3C FF 74 1F 8B 0D ? ? ? ? 0F B6 C0 8D 04 80 8D 1C C5 ? ? ? ? 8B 01 FF 90 28 02 00 00 85 C0 75 D4 0F B6 43 "
     "1C 83 E0 0F 83 F8 08 0F 87 ? ? ? ? FF 24 85",
+    // mov eax,[ebx+4]; ...; ret
+    "8B 43 04 5F 5E 5B 8B E5 5D C3",
     // mov ecx,[ebx+0x24]; cmp ecx,-1; jne; ... mov eax,"env_cubemap"; ...;
     // mov ecx,[ebx+0x24]; mov eax,[ecx]; call [eax]
     "8B 4B 24 83 F9 FF 75 0F 5F 5E B8 ? ? ? ? 5B 8B E5 5D C3 8B 4B 24 8B 01 FF 10",
     // add ecx,0xc (its name symbol); jmp CUtlSymbol::String
     "83 C1 0C E9",
+    // mov eax,[ecx+4] (the page)
+    "8B 41 04 C3",
 };
 #endif
 
