@@ -832,6 +832,8 @@ inline constexpr FieldDesc kMaterialGradientMapEXTFields[] = {
     {40, 56, 8, F_POD, 0, 65535}, // float[2] detailV
     {48, 64, 12, F_POD, 0, 65535}, // remixapi_Float3D bloodColor
     {60, 76, 8, F_POD, 0, 65535}, // float[2] bloodRange
+    {68, 88, 8, F_WSTR, 0, 65535}, // remixapi_Path burnTexture
+    {72, 96, 4, F_POD, 0, 65535}, // float burnStrength
 };
 inline constexpr FieldDesc kMaterialInfoFields[] = {
     {0, 0, 4, F_POD, 0, 65535}, // remixapi_StructType sType
@@ -1305,7 +1307,7 @@ inline constexpr StructDesc kStructs[S_COUNT] = {
   {"remixapi_LocalLightGuidingStatisticsEXT", 0x0u, 320, 320, 8, 8, 14, kLocalLightGuidingStatisticsEXTFields},
   {"remixapi_LocalLightSetStatisticsEXT", 0x0u, 184, 184, 8, 8, 22, kLocalLightSetStatisticsEXTFields},
   {"remixapi_LocalLightStatisticsEXT", 0x0u, 344, 344, 8, 8, 17, kLocalLightStatisticsEXTFields},
-  {"remixapi_MaterialGradientMapEXT", 0x7fff1027u, 68, 88, 4, 8, 11, kMaterialGradientMapEXTFields},
+  {"remixapi_MaterialGradientMapEXT", 0x7fff1027u, 76, 104, 4, 8, 13, kMaterialGradientMapEXTFields},
   {"remixapi_MaterialInfo", 0x2u, 56, 80, 8, 8, 15, kMaterialInfoFields},
   {"remixapi_MaterialInfoEmissionEXT", 0x7fff100au, 12, 24, 4, 8, 3, kMaterialInfoEmissionEXTFields},
   {"remixapi_MaterialInfoOpaqueEXT", 0x5u, 92, 112, 4, 8, 21, kMaterialInfoOpaqueEXTFields},

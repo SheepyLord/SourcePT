@@ -36,6 +36,26 @@ struct IndexStream {
   bool dynamic = false;
 };
 
+// D3D9's fixed-function state, as the D3D hooks track it where the game
+// draws that way (game::kFixedFunction): what a draw with no vertex shader
+// is transformed, blended and textured by. Matrices are D3D's (row-major
+// D3DX, row vectors: p' = p M).
+struct FixedFunction {
+  const float (*worlds)[16] = nullptr;   // D3DTS_WORLDMATRIX(0..255); 0 is D3DTS_WORLD
+  const float *view = nullptr, *projection = nullptr; // D3DTS_VIEW, D3DTS_PROJECTION
+  const float (*textures)[16] = nullptr; // D3DTS_TEXTURE0..7
+  const DWORD (*stages)[33] = nullptr;   // [stage 0..7][D3DTEXTURESTAGESTATETYPE]
+  const DWORD *renderStates = nullptr;   // [D3DRENDERSTATETYPE], 256
+  uint32_t fvf = 0;                      // the layout came from SetFVF (0: a vertex declaration)
+  uint32_t worldsSet = 0;                // highest WORLDMATRIX index set since the device was made, + 1
+  const uint32_t *worldDraw = nullptr;   // [n]: `draw` of the draw before which WORLDMATRIX(n) was last set (probe)
+  uint32_t draw = 0;                     // this draw's number among the fixed-function draws
+  // Diagnostics (the fixed-function probe): the material and lights.
+  const D3DMATERIAL9 *material = nullptr;
+  const D3DLIGHT9 *lights = nullptr; // indices 0..31
+  uint32_t lightsEnabled = 0;        // bit n: LightEnable(n, TRUE)
+};
+
 // Everything a DrawIndexedPrimitive needs, gathered by the D3D hooks.
 struct Draw {
   D3DPRIMITIVETYPE type;
@@ -90,6 +110,12 @@ struct Draw {
   D3DVIEWPORT9 viewport = {};
   RECT scissor = {};
   bool scissorTest = false;
+  // No vertex shader is bound, in a game that draws through the
+  // fixed-function pipeline: its state (nullptr for shader draws, and in the
+  // games that have none). onDraw converts such a draw into the shader draws'
+  // terms (fixed_function.h) and sets `fixedFunctionConverted`.
+  const FixedFunction *fixedFunction = nullptr;
+  bool fixedFunctionConverted = false;
 };
 
 bool enabled();

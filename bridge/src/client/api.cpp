@@ -15,6 +15,7 @@
 
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 using namespace bridge;
@@ -52,6 +53,11 @@ struct ClientState {
   Transport transport;
   Encoder encoder{transport, log};
   IdPool materials, meshes, lights, textures, sceneInstances, hostShaders;
+  // Mesh ids by the hash they were created with: a refresh in place
+  // (remixapi_MeshInfoDeformEXT) of a mesh created here keeps its id, as the
+  // runtime keeps its handle, instead of taking (and never releasing) a new one.
+  std::unordered_map<uint64_t, uint32_t> meshByHash;
+  std::unordered_map<uint32_t, uint64_t> hashOfMesh;
   bool started = false;
   bool runtimeStarted = false;
   uint64_t framesSubmitted = 0;
@@ -254,7 +260,26 @@ static remixapi_ErrorCode REMIXAPI_CALL createMesh(const remixapi_MeshInfo *info
   if (!info || !out || info->sType != REMIXAPI_STRUCT_TYPE_MESH_INFO)
     return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
   GUARD();
-  const uint32_t id = state().meshes.alloc();
+  auto &s = state();
+  struct Header { // every extension struct starts so
+    remixapi_StructType sType;
+    const void *pNext;
+  };
+  bool deform = false;
+  for (auto *next = static_cast<const Header *>(info->pNext); next && !deform;
+       next = static_cast<const Header *>(next->pNext))
+    deform = next->sType == REMIXAPI_STRUCT_TYPE_MESH_DEFORM_EXT;
+  const auto known = s.meshByHash.find(info->hash);
+  uint32_t id;
+  if (deform && known != s.meshByHash.end()) {
+    id = known->second;
+  } else {
+    id = s.meshes.alloc();
+    if (known != s.meshByHash.end())
+      s.hashOfMesh.erase(known->second); // that id keeps its handle, no longer this hash
+    s.meshByHash[info->hash] = id;
+    s.hashOfMesh[id] = info->hash;
+  }
   Encoder &e = begin(Op::CreateMesh, sizeof(proto::ArgsCreate));
   e.setArgs(proto::ArgsCreate{id, e.structure(S_MeshInfo, info)});
   *out = fromId<remixapi_MeshHandle>(id);
@@ -266,7 +291,13 @@ static remixapi_ErrorCode REMIXAPI_CALL destroyMesh(remixapi_MeshHandle handle) 
     return REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS;
   GUARD();
   auto r = postHandle(Op::DestroyMesh, toId(handle));
-  state().meshes.release(toId(handle));
+  auto &s = state();
+  const auto hash = s.hashOfMesh.find(toId(handle));
+  if (hash != s.hashOfMesh.end()) {
+    s.meshByHash.erase(hash->second);
+    s.hashOfMesh.erase(hash);
+  }
+  s.meshes.release(toId(handle));
   return r;
 }
 

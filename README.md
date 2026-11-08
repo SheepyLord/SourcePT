@@ -1,26 +1,29 @@
 > This project uses AI-generated code
 
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/ecee9efd-d865-494c-96e4-f0b4ed3c01d9" width="500" />
+<p align="left">
+  <img src="https://github.com/user-attachments/assets/4dc256a6-8795-4c1b-885c-addf341d66eb" width="150" />
 </p>
 
-> proper logo someday
 
-This is currently a proxy `shaderapidx9.dll` for Garry's Mod that wraps the
+This is currently a proxy `shaderapidx9.dll` for a few Source Engine games that wraps the
 Source shader API (and later D3D9) to submit the game's rendering to
 [OpenRemix](https://github.com/OpenRenderCollective/OpenRemix) through the Remix C API. 
 
 This removes the need to force the engine to run in the fixed function pipeline, so all shader-based systems are supported and are translated when applicable. OpenRemix has its own rasterization pass for sprites and other effects that would not work well in path-tracing and can be integrated seamlessly.
 
-RTX Remix mods from the old version of the project will be supported, and also any lua stools like the Remix API lights, etc.
+RTX Remix mods from the old version of the project will be supported, and also any lua stools like the Remix API lights, etc for Garry's Mod.
 
 Multiplayer works out of the box since everything lives in the wrapper.
 
-### Games supported
-* Garry's Mod
+### Games the wrapper works with
+* Garry's Mod **(CI only builds for this one)**
+* Team Fortress 2 (64-bit, `tf_win64.exe`)
 * Left 4 Dead 2
+* Half-Life 2 RTX
+* Portal with RTX
+* Portal 2
 
-## Installation
+## Garry's Mod Installation Instructions
 - Ensure you're on the `main` branch of Garry's Mod on Steam (not `x86-64`)
 - Run the vanilla game at least once, especially if you switched branches.
 - Download [RTXLauncher](https://github.com/Xenthio/RTXLauncher/releases) (Use the newer nightly if available).
@@ -38,6 +41,22 @@ when available. Materials without that information explicitly use roughness 1
 in Forward+ and keep diffuse-only shading in path tracing. Authored PBR values,
 water and shared USD replacements retain their own roughness and metalness.
 The conversion reuses existing textures; it does not generate missing surface detail.
+
+## Team Fortress 2 Installation Instructions
+The proxy runs in the 64-bit game (`tf_win64.exe`, `bin/x64`) with OpenRemix in process, as in Garry's Mod.
+- Build it with `-Dgame=tf2` (see Build) and get an OpenRemix runtime
+  ([nightly](https://github.com/OpenRenderCollective/OpenRemix/releases/tag/nightly), `openremix-windows-x64.zip`).
+- In `Team Fortress 2/bin/x64`: rename `shaderapidx9.dll` to `shaderapidx9_orig.dll`, copy the built
+  `shaderapidx9.dll` there, and extract the runtime zip into `bin/x64/openremix/` (so `bin/x64/openremix/remix.dll`).
+- The proxy adds `-insecure` (it hooks the engine: stay off VAC-secured servers) and `-nod3d9ex` itself. Play on a
+  local server or an insecure one.
+- The runtime starts in its raster backend: choose path tracing in OpenRemix's panel (Alt+X), or start the game
+  with the environment variable `OPENREMIX_PROXY_BACKEND=pathtrace`.
+- Recommended video settings, as for Garry's Mod: `mat_hdr_level 0`, `mat_antialias 1`, `mat_motion_blur_enabled 0`,
+  `r_shadowrendertotexture 0`, `mat_colorcorrection 0`.
+- A game update or Steam's file verification puts the original `shaderapidx9.dll` back (the proxy is then simply
+  gone); install the proxy again, renaming the new original to `shaderapidx9_orig.dll`.
+
 
 ## Forward+ development handoff
 
@@ -537,16 +556,11 @@ two from 8 through 512; smaller capture budgets and face sizes remain available.
 published bounds instead of assuming the budget covers every room.
 This toggle is a diagnostic option and does not edit the map or installed game.
 
-## Left 4 Dead 2 (experimental)
+Team Fortress 2: the same cross file with `-Dgame=tf2` (the TF2 section above for the install).
 
-The same tree builds the proxy for Left 4 Dead 2 (x86, work in progress: the
-runtime is reached through the bridge, `remix_bridge.dll` beside the proxy in
-`bin`), with the 32-bit cross file:
+    meson setup --cross-file cross/x86_64-w64-mingw32.txt -Dgame=tf2 -Dopenremix_include=<openremix>/public/include _build-tf2
+    meson compile -C _build-tf2
 
-    meson setup --cross-file cross/i686-w64-mingw32.txt _build-l4d2
-    meson compile -C _build-l4d2
-
-The game follows the cross file (`-Dgame=gmod|l4d2` names it; a mismatch with
-the cross file is an error). What differs between the games is in
-`src/game.h`; the GMod-only engine modules are left out of the L4D2 build
-(`src/gmod_only_stubs.cpp`).
+## Credits
+* Jane for helping me make the logo.
+* Xenthio for ToPBR, Foward+, and general guidance

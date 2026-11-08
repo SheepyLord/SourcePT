@@ -1,6 +1,6 @@
-// shaderapidx9.dll proxy for Garry's Mod (x64) and Left 4 Dead 2 (x86, see
-// game.h): loads the original as shaderapidx9_orig.dll and hands out
-// forwarding wrappers for its interfaces.
+// shaderapidx9.dll proxy for Garry's Mod and Team Fortress 2 (x64), Left 4
+// Dead 2 and Half-Life 2 RTX (x86, see game.h): loads the original as
+// shaderapidx9_orig.dll and hands out forwarding wrappers for its interfaces.
 // Phase 1: pure pass-through with per-slot call statistics.
 #include "diag.h"
 #include "diagnostic_workers.h"
@@ -16,6 +16,10 @@
 #ifdef PROXY_GAME_L4D2
 #include "l4d2.h"
 #include "slots_shaderapi_l4d2.h"
+#elif defined(PROXY_GAME_HL2RTX)
+#include "slots_shaderapi_hl2rtx.h"
+#elif defined(PROXY_GAME_TF2)
+#include "slots_shaderapi_tf2.h"
 #endif
 #include "vb_origins.h"
 #include "vtable_proxy.h"
@@ -85,48 +89,57 @@ uint32_t countSlots(const void *const *vtbl) {
   return n;
 }
 
-#ifdef PROXY_GAME_GMOD
-// The proxy hooks the original's import of d3d9!Direct3DCreate9. Without
-// -nod3d9ex the shader API asks d3d9.dll for Direct3DCreate9Ex instead (by
-// name, at run time) and creates an IDirect3DDevice9Ex nothing here sees: the
-// game then runs without the proxy's D3D hooks. The original looks the switch
-// up when it connects (tier0's ICommandLine::FindParm), so it is appended to
-// the command line before the original is loaded.
-// ICommandLine slots, as the original calls them in GMod x64: AppendParm 5
-// (after CreateCmdLine x2, GetCmdLine, CheckParm, RemoveParm), ParmValue
-// (name, int) 7, FindParm 10.
-void forceNoD3D9Ex() {
-  constexpr char kSwitch[] = "-nod3d9ex";
+// Appends a switch to tier0's command line before the original is loaded,
+// for the engine to find when it looks it up (ICommandLine::FindParm).
+// ICommandLine slots, the same in GMod x64, L4D2 x86 and Half-Life 2 RTX x86
+// (L4D2's engine calls FindParm at vtable +0x28, Half-Life 2 RTX's shader API
+// too, and its tier0's CheckParm, slot 3): AppendParm 5 (after CreateCmdLine
+// x2, GetCmdLine, CheckParm, RemoveParm), FindParm 10.
+void appendSwitch(const char *name) {
   HMODULE tier0 = GetModuleHandleW(L"tier0.dll");
   auto get = tier0 ? reinterpret_cast<void *(*)()>(GetProcAddress(tier0, "CommandLine_Tier0")) : nullptr;
   void *commandLine = get ? get() : nullptr;
   if (!commandLine) {
-    log("proxy: no tier0 command line; pass -nod3d9ex yourself");
+    log("proxy: no tier0 command line; pass %s yourself", name);
     return;
   }
   void **vt = *static_cast<void ***>(commandLine);
   const auto [begin, end] = codeRangeOf(vt[0]);
   for (int slot : {5, 10})
     if (reinterpret_cast<uintptr_t>(vt[slot]) < begin || reinterpret_cast<uintptr_t>(vt[slot]) >= end) {
-      log("proxy: tier0 command line vtable not as expected; pass -nod3d9ex yourself");
+      log("proxy: tier0 command line vtable not as expected; pass %s yourself", name);
       return;
     }
   using FindParmFn = int(PROXY_THISCALL *)(void *, const char *);
   using AppendParmFn = void(PROXY_THISCALL *)(void *, const char *, const char *);
   const auto findParm = reinterpret_cast<FindParmFn>(vt[10]);
-  if (findParm(commandLine, kSwitch)) {
-    log("proxy: -nod3d9ex given");
+  if (findParm(commandLine, name)) {
+    log("proxy: %s given", name);
   } else {
-    reinterpret_cast<AppendParmFn>(vt[5])(commandLine, kSwitch, nullptr);
-    log("proxy: -nod3d9ex appended to the command line (%s)",
-        findParm(commandLine, kSwitch) ? "found there now" : "NOT found afterwards: pass it yourself");
+    reinterpret_cast<AppendParmFn>(vt[5])(commandLine, name, nullptr);
+    log("proxy: %s appended to the command line (%s)", name,
+        findParm(commandLine, name) ? "found there now" : "NOT found afterwards: pass it yourself");
   }
 }
-#else
-// L4D2: l4d2-rtx's proxy saw the plain device without it (tier0's command
-// line slots there are not known); to be checked in game.
-void forceNoD3D9Ex() {}
+
+void forceSwitches() {
+#if defined(PROXY_GAME_GMOD) || defined(PROXY_GAME_HL2RTX) || defined(PROXY_GAME_TF2)
+  // The proxy hooks the original's import of d3d9!Direct3DCreate9 (TF2: its
+  // GetProcAddress, d3d_hooks.h). Without -nod3d9ex the shader API asks
+  // d3d9.dll for Direct3DCreate9Ex instead (by name, at run time) and creates
+  // an IDirect3DDevice9Ex nothing here sees: the game then runs without the
+  // proxy's D3D hooks. (Half-Life 2 RTX's and TF2's shader APIs are SDK
+  // 2013's in this: CShaderDeviceMgrDx8 asks FindParm for -nod3d9ex, then
+  // GetProcAddress(d3d9, "Direct3DCreate9Ex").)
+  appendSwitch("-nod3d9ex");
 #endif
+#if defined(PROXY_GAME_L4D2) || defined(PROXY_GAME_TF2)
+  // L4D2 (l4d2-rtx's proxy saw the plain device without -nod3d9ex), TF2: the
+  // proxy replaces a game module and hooks the engine's vtables, which VAC
+  // must never see, so the game stays off VAC-secured servers.
+  appendSwitch("-insecure");
+#endif
+}
 
 bool loadOriginal() {
   if (g_orig)
@@ -143,7 +156,7 @@ bool loadOriginal() {
   }
   proxy::diag::captureEngineErrors();
   proxy::diag::stage("first CreateInterface: loading shaderapidx9_orig.dll");
-  forceNoD3D9Ex();
+  forceSwitches();
   g_orig = LoadLibraryW((g_dir + L"\\shaderapidx9_orig.dll").c_str());
   if (!g_orig) {
     const DWORD error = GetLastError();
@@ -153,7 +166,7 @@ bool loadOriginal() {
   }
   g_origCreateInterface = reinterpret_cast<CreateInterfaceFn>(GetProcAddress(g_orig, "CreateInterface"));
   if (!proxy::d3d::install(g_orig))
-    log("proxy: d3d9!Direct3DCreate9 import not found; D3D hooks inactive");
+    log("proxy: neither a d3d9!Direct3DCreate9 nor a GetProcAddress import found; D3D hooks inactive");
   log("proxy: loaded original at %p", static_cast<void *>(g_orig));
   proxy::diag::stage("shaderapidx9_orig.dll loaded at %p, CreateInterface %s", static_cast<void *>(g_orig),
                      g_origCreateInterface ? "found" : "MISSING");
@@ -249,30 +262,30 @@ void PROXY_THISCALL shaderUtilRestoreShaderObjects(proxy::Wrapper *self, CreateI
   proxy::original<Fn>(self, 12)(self->real, factory ? restoreFactory : nullptr, flags);
 }
 
-// IShaderAPI (ShaderApi030) slot 127: void SetLight(int lightNum,
-// const LightDesc_t &desc) (copies 88 bytes into its light array). SDK 2013
-// sets the model lights one at a time; L4D2's IShaderAPIDX8 slot 88 is
-// void SetLights(int nCount, const LightDesc_t *pDesc), an array (game.h).
+// IShaderAPI (ShaderApi030) slot 127 (Half-Life 2 RTX 126): void
+// SetLight(int lightNum, const LightDesc_t &desc) (copies 88 bytes into its
+// light array). SDK 2013 sets the model lights one at a time; L4D2's
+// IShaderAPIDX8 slot 88 is void SetLights(int nCount, const LightDesc_t
+// *pDesc), an array (game.h).
 void PROXY_THISCALL shaderApiSetLight(proxy::Wrapper *self, int index, const void *desc) {
   using Fn = void(PROXY_THISCALL *)(void *, int, const void *);
   proxy::remix::onSetLights(proxy::game::kSetLightsArray ? index : 1, desc);
   proxy::original<Fn>(self, proxy::game::kSlotSetLight)(self->real, index, desc);
 }
 
-// IShaderAPI slot 114: void Bind(IMaterial *pMaterial): the material of the
-// draws that follow (those buffered for the previous one are flushed inside).
-// Hooked only when engine_materials validated the slot.
-#ifdef PROXY_GAME_GMOD
+// IShaderAPI slot 114 (L4D2 76, Half-Life 2 RTX 113): void Bind(IMaterial
+// *pMaterial): the material of the draws that follow (GMod, Half-Life 2 RTX:
+// those buffered for the previous one are flushed inside). Hooked only when
+// engine_materials validated the slot.
 void PROXY_THISCALL shaderApiBind(proxy::Wrapper *self, void *material) {
   using Fn = void(PROXY_THISCALL *)(void *, void *);
   proxy::original<Fn>(self, proxy::game::kSlotBind)(self->real, material);
   proxy::engine_materials::onBind(material);
 }
-#endif
 
-// IShaderAPI slot 216 (L4D2 181): void SetPIXMarker(unsigned long color,
-// const char *name) (an empty stub in release builds). Markers
-// "openremix:..." are ours.
+// IShaderAPI slot 216 (L4D2 181, Half-Life 2 RTX 215): void
+// SetPIXMarker(unsigned long color, const char *name) (an empty stub in
+// release builds). Markers "openremix:..." are ours.
 void PROXY_THISCALL shaderApiSetPIXMarker(proxy::Wrapper *self, unsigned long color, const char *name) {
   using Fn = void(PROXY_THISCALL *)(void *, unsigned long, const char *);
   if (proxy::remix::onMarker(name))
@@ -296,15 +309,13 @@ const KnownInterface kKnown[] = {
      }},
     {proxy::game::kShaderApiInterface,
      [](proxy::Kind *k) {
-#ifdef PROXY_GAME_L4D2
+#ifndef PROXY_GAME_GMOD
        k->slotNames.assign(proxy::slots::kShaderApi, proxy::slots::kShaderApi + std::size(proxy::slots::kShaderApi));
 #endif
        proxy::setHook(k, proxy::game::kSlotSetLight, reinterpret_cast<void *>(&shaderApiSetLight));
        proxy::setHook(k, proxy::game::kSlotSetPIXMarker, reinterpret_cast<void *>(&shaderApiSetPIXMarker));
-#ifdef PROXY_GAME_GMOD
        if (proxy::engine_materials::install(k->realVtbl))
          proxy::setHook(k, proxy::game::kSlotBind, reinterpret_cast<void *>(&shaderApiBind));
-#endif
      }},
     {"ShaderDevice001", nullptr},
     {"ShaderShadow010", nullptr},
@@ -791,8 +802,8 @@ void hookFileOpens() {
       reinterpret_cast<void *>(g_createFileW));
 }
 #else
-// L4D2: neither the remembered misses nor the video options' layout (GMod's
-// GameUI build, its search paths); the opens are not counted.
+// L4D2, Half-Life 2 RTX: neither the remembered misses nor the video options'
+// layout (GMod's GameUI build, its search paths); the opens are not counted.
 void hookFileOpens() {}
 #endif
 

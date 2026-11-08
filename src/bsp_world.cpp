@@ -274,7 +274,8 @@ bool parseKeyValues(const std::string &text, KeyValues &out) {
   auto plain = [](std::string t) { return !t.empty() && t[0] == '\x01' ? t.substr(1) : t; };
   if (tokens.size() < 2 || tokens[1] != "{")
     return false;
-  out.shader = lower(plain(tokens[0]));
+  // Mapbase's game shaders ("SDK_LightmappedGeneric") as the stock ones.
+  out.shader = lower(game::stockShaderName(plain(tokens[0]).c_str()));
   size_t i = 2;
   // Skips a block whose '{' was consumed.
   auto skip = [&]() {
@@ -873,6 +874,7 @@ struct World {
   std::map<std::array<int32_t, 5>, OverlayGroup> layerGroups;
   std::unordered_map<int, SecondLayer> secondLayers; // by base material index
   LayerStatistics layers;
+  std::string pbrNames; // statistics: each world material's PBR conversion
   CullStatistics cull;
   std::unordered_map<std::string, int> overlayMaterialIndex;
   uint32_t overlays = 0, overlayTriangles = 0, waterMaterials = 0, surfaceNormalCount = 0, surfaceNormalAnimated = 0,
@@ -1026,6 +1028,40 @@ void parseMapCameras(const Bsp &bsp) {
         g_world.skyScale = 16;
     }
   }
+}
+
+// The detail sprite material (isDetailSpriteMaterial): the engine's default
+// until a map names another.
+constexpr char kDefaultDetailMaterial[] = "detail/detailsprites";
+std::string g_detailMaterial = kDefaultDetailMaterial;
+
+// A material path as the material system names it: lower case, forward
+// slashes, without "materials/" and ".vmt".
+std::string materialPath(std::string name) {
+  name = lower(name);
+  std::replace(name.begin(), name.end(), '\\', '/');
+  if (name.rfind("materials/", 0) == 0)
+    name.erase(0, 10);
+  if (name.size() > 4 && name.compare(name.size() - 4, 4, ".vmt") == 0)
+    name.resize(name.size() - 4);
+  return name;
+}
+
+// worldspawn (the entity lump's first entity) "detailmaterial".
+void parseDetailMaterial(const Bsp &bsp) {
+  g_detailMaterial = kDefaultDetailMaterial;
+  const auto [text, length] = bsp.lump<char>(kEntities);
+  if (!text)
+    return;
+  const std::string entities(text, length);
+  const size_t open = entities.find('{'), close = open == std::string::npos ? open : entities.find('}', open);
+  KeyValues kv;
+  if (close == std::string::npos || !parseKeyValues("entity " + entities.substr(open, close - open + 1), kv) ||
+      lower(kv.values["classname"]) != "worldspawn")
+    return;
+  const std::string named = materialPath(kv.values["detailmaterial"]);
+  if (!named.empty())
+    g_detailMaterial = named;
 }
 
 // func_lod brush models (indices into the models lump). One with an origin
@@ -1800,8 +1836,21 @@ int materialByName(const std::string &name, bool brush) {
     }
     if (emissiveEnabled())
       m.shading = materialShading(kv, m.maskCandidates);
-    if (pbr::enabled() && (m.shading.pbr = materialPbr(kv)).active)
+    if (pbr::enabled() && (m.shading.pbr = materialPbr(kv)).active) {
       m.shading.base = lower(kv.values["$basetexture"]);
+      if (g_world.pbrNames.size() < 60000) {
+        const auto &p = m.shading.pbr;
+        char line[700];
+        std::snprintf(line, sizeof(line),
+                      "      %s (%s): roughness %g metallic %g normal %s | rough %s ch %u inv %d exp %g bias %g scale %g | "
+                      "metal %s ch %u inv %d | blur %g%s\n",
+                      name.c_str(), kv.shader.c_str(), p.roughness, p.metallic, p.normal.c_str(), p.maps[0].texture.c_str(),
+                      p.maps[0].channel, int(p.maps[0].invert), p.maps[0].exponent, p.maps[0].bias, p.maps[0].scale,
+                      p.maps[1].texture.c_str(), p.maps[1].channel, int(p.maps[1].invert), p.blur,
+                      p.metalColored ? " metal colour" : "");
+        g_world.pbrNames += line;
+      }
+    }
     // A texture is optional for a constant UnlitGeneric material. Lost Coast's
     // waterfog is only $color; waiting for a texture upload can never resolve it
     // and used to hold the entire map's bake in the loading state forever.
@@ -3530,6 +3579,7 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap, bool l
   g_active = false;
   // Old inputs must not survive a map unload, missing BSP, or disabled world.
   invalidateBakeScene();
+  g_detailMaterial = kDefaultDetailMaterial;
   if (mapName.empty()) {
     sendPartition(nullptr);
     return false;
@@ -3556,6 +3606,7 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap, bool l
     }
   }
   sendPartition(&bsp);
+  parseDetailMaterial(bsp); // with the BSP world or without it
   if (!enabled)
     return false;
   const auto [pak, pakBytes] = bsp.lump<uint8_t>(kPakfile);
@@ -3619,6 +3670,10 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap, bool l
 }
 
 bool active() { return g_active; }
+
+bool isDetailSpriteMaterial(const char *materialName) {
+  return materialName && *materialName && g_detailMaterial == materialName;
+}
 
 bool overlaysActive() { return g_active && !g_world.overlayGroups.empty(); }
 
@@ -4437,6 +4492,7 @@ void dumpStatistics(FILE *out) {
             l.secondTriangles, l.blendedTriangles, g_world.layerGroups.size(), meshes, l.flat, l.withoutTexture,
             l.noHash, waiting, l.modulated, l.modulateUnread, l.fourWay, l.brushFaces, l.names.c_str());
   }
+  fprintf(out, "   BSP materials with a PBR conversion:\n%s", g_world.pbrNames.c_str());
   {
     const auto &c = g_world.cull;
     fprintf(out,

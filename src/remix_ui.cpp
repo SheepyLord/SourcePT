@@ -1,4 +1,5 @@
 #include "remix_ui.h"
+#include "game.h"
 
 #include <SDL3/SDL_events.h>
 #include <SDL3/SDL_keyboard.h>
@@ -31,19 +32,19 @@ template <class Fn> Fn sdl(const char *name) {
   return module ? reinterpret_cast<Fn>(GetProcAddress(module, name)) : nullptr;
 }
 
-// IVGUI surface (VGUI_Surface030) slot 52: SetCursorAlwaysVisible. While it
-// is set the engine shows the OS cursor and stops mouse look (verified in
-// GMod's x64 vguimatsurface.dll: stores the flag at +0x3c8, read by slot 53
-// IsCursorVisible).
+// ISurface::SetCursorAlwaysVisible (game::kSurfaceInterface, slot
+// game::kSlotSetCursorAlwaysVisible). While it is set the engine shows the OS
+// cursor and stops mouse look.
 void setCursorVisible(bool visible) {
   using CreateInterfaceFn = void *(*)(const char *, int *);
   static void *surface = [] {
     HMODULE m = GetModuleHandleA("vguimatsurface.dll");
     auto factory = m ? reinterpret_cast<CreateInterfaceFn>(GetProcAddress(m, "CreateInterface")) : nullptr;
-    return factory ? factory("VGUI_Surface030", nullptr) : nullptr;
+    return factory ? factory(game::kSurfaceInterface, nullptr) : nullptr;
   }();
   if (surface)
-    reinterpret_cast<void (*)(void *, bool)>((*static_cast<void ***>(surface))[52])(surface, visible);
+    reinterpret_cast<void (*)(void *, bool)>((*static_cast<void ***>(surface))[game::kSlotSetCursorAlwaysVisible])(
+        surface, visible);
 }
 
 SDL_Scancode scancode(uint32_t vk) {
