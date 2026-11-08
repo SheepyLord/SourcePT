@@ -92,6 +92,7 @@ struct Stats {
   std::atomic<uint32_t> setLightKept[4] = {};
   // Unlit and self-illuminated draws (engine_materials): by kind, and why some stayed lit.
   std::atomic<uint32_t> luaLitDraws{0}; // unlit Lua meshes lit as surfaces (onDraw)
+  std::atomic<uint32_t> detailSpriteDraws{0}; // detail sprites lit as surfaces (onDraw)
   std::atomic<uint32_t> unlitDraws{0}, selfIllumDraws{0}, selfIllumMaskDraws{0}, selfIllumMaskAlphaDraws{0},
       emissiveLightDraws{0}, unlitVertexColorDraws{0}, modulatedDraws{0}, wireframeDraws{0}, modulatedBlack{0}, modulatedMasked{0}, modulatedMetal{0}, emissiveNoTexture{0}, emissiveMaskNoHash{0},
       emissiveMaskNotUploaded{0}, emissiveCreated{0}, emissiveFailed{0}, emissiveEvicted{0};
@@ -6202,6 +6203,16 @@ void onDraw(const Draw &d) {
       ++g_stats.luaLitDraws;
     }
   }
+  // Detail sprites (the map's grass, bushes, ...): UnlitGeneric only because
+  // the engine lights them itself, with the lighting the map compiler baked at
+  // each sprite as its vertex colours. Emitted, that light glowed in the dark.
+  // Lit as surfaces, those colours dropped: the path tracer lights them.
+  if (shading.mode == engine_materials::Shading::Unlit &&
+      bsp::isDetailSpriteMaterial(engine_materials::currentName())) {
+    shading = {};
+    shading.base = engine_materials::current().base;
+    ++g_stats.detailSpriteDraws;
+  }
   // An unlit material's $vertexcolor: its vertices carry the colour (3D2D
   // panels, sprites). Other COLOR0 streams (baked prop lighting) do not.
   const bool hasColors = findElement(d.elements, D3DDECLUSAGE_COLOR, 0) != nullptr;
@@ -8945,8 +8956,9 @@ void dumpStatistics(FILE *out) {
           g_stats.bspPropsDropped.exchange(0) / f, g_stats.bspOverlaysDropped.exchange(0) / f,
           g_stats.bspBrushEntitiesDropped.exchange(0) / f);
   vb_origins::write(out, f);
-  fprintf(out, "   Lua meshes lit as surfaces per frame: %.1f (OPENREMIX_PROXY_LUA_MESHES_LIT)\n",
-          g_stats.luaLitDraws.exchange(0) / f);
+  fprintf(out, "   Lua meshes lit as surfaces per frame: %.1f (OPENREMIX_PROXY_LUA_MESHES_LIT); detail sprite draws "
+               "lit as surfaces %.1f\n",
+          g_stats.luaLitDraws.exchange(0) / f, g_stats.detailSpriteDraws.exchange(0) / f);
   bsp::dumpStatistics(out);
   remix_ui::dumpStatistics(out);
   {

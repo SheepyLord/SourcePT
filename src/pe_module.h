@@ -4,13 +4,15 @@
 
 #include <cstdint>
 
-// The 32-bit games' engine modules (L4D2, Half-Life 2 RTX): what the proxy
-// reads of them, found instead of assumed. Code by a byte pattern or checked
-// against the bytes it expects, classes by their MSVC RTTI. Was l4d2.h's
-// (L4D2 names them through using-declarations there).
-namespace proxy::x86 {
+// The engine modules of the games whose builds are found instead of assumed
+// (L4D2 and Half-Life 2 RTX, PE32; TF2, PE32+): what the proxy reads of them.
+// Code by a byte pattern or checked against the bytes it expects, classes by
+// their MSVC RTTI. Was x86_module.h, before that l4d2.h's (L4D2 names them
+// through using-declarations there).
+namespace proxy::pe {
 
-// A module loaded in this process (PE32).
+// A module loaded in this process (PE32 in the 32-bit proxy, PE32+ in the
+// 64-bit one).
 struct Module {
   const char *name = "";
   uintptr_t base = 0, size = 0;
@@ -56,4 +58,4 @@ bool writeJump(void *at, const void *target, size_t n);
 bool envFlag(const char *name, bool fallback);
 float envFloat(const char *name, float fallback);
 
-} // namespace proxy::x86
+} // namespace proxy::pe

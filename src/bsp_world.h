@@ -113,6 +113,14 @@ float skyTracedReach();
 // The BSP material using a texture (for statistics), or empty.
 std::string materialName(uint64_t textureHash);
 
+// Whether `materialName` (as the material system names it, lower case) is the
+// map's detail sprite material: worldspawn's "detailmaterial", else the
+// engine's default "detail/detailsprites". The client's detail object system
+// draws the map's grass and other detail sprites with it (UnlitGeneric,
+// $vertexcolor), their vertex colours the lighting the map compiler baked at
+// each sprite. Render thread (the map is read when its marker arrives).
+bool isDetailSpriteMaterial(const char *materialName);
+
 void dumpStatistics(FILE *out);
 
 } // namespace proxy::bsp

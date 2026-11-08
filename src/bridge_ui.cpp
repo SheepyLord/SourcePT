@@ -15,7 +15,7 @@
 #ifdef PROXY_GAME_L4D2
 #include "l4d2.h"
 #endif
-#include "x86_module.h"
+#include "pe_module.h"
 
 #include <atomic>
 #include <cstdio>
@@ -59,7 +59,7 @@ void inject(Input type, uint32_t code, bool down, int32_t x = 0, int32_t y = 0, 
 // ISurface::SetCursorAlwaysVisible(bool) (game.h: L4D2's VGUI_Surface031
 // slot 49, Half-Life 2 RTX's VGUI_Surface030 slot 52).
 void setCursorVisible(bool visible) {
-  static void *surface = proxy::x86::createInterface("vguimatsurface.dll", proxy::game::kSurfaceInterface);
+  static void *surface = proxy::pe::createInterface("vguimatsurface.dll", proxy::game::kSurfaceInterface);
   if (surface)
     reinterpret_cast<void(PROXY_THISCALL *)(void *, bool)>(
         (*static_cast<void ***>(surface))[proxy::game::kSlotSetCursorAlwaysVisible])(surface, visible);

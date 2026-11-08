@@ -1,8 +1,12 @@
 // The GMod-only modules' entry points for the builds that do not have them
-// (Left 4 Dead 2, Half-Life 2 RTX): engine_patches, engine_nocull,
-// engine_shadows and engine_lights patch one build of GMod's x64 engine.dll
-// and client.dll. Each is off here, as it is on GMod when it does not
-// validate.
+// (Team Fortress 2, Left 4 Dead 2, Half-Life 2 RTX): engine_patches,
+// engine_nocull, engine_shadows and engine_lights patch one build of GMod's
+// x64 engine.dll and client.dll. Each is off here, as it is on GMod when it
+// does not validate.
+//
+// TF2 shares GMod's engine_hooks (the world-list and map markers through
+// engine interfaces, the slots per game.h) and its in-process panel
+// (remix_ui).
 //
 // L4D2 has its own engine side (l4d2.h): engine::install (l4d2_engine.cpp:
 // world lists, overlays, static props, the map, cvars, anti-culling,

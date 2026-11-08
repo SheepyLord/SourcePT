@@ -1,10 +1,11 @@
 project('gmodrtx', ['cpp', 'c'], version: '0.1.0',
         default_options: ['cpp_std=c++17', 'warning_level=2', 'buildtype=release', 'b_ndebug=if-release'])
 
-# One tree, three games, chosen at configure time (-Dgame=, default by the
-# cross file): Garry's Mod x64 (cross/x86_64-w64-mingw32.txt), Left 4 Dead 2
-# x86 or Half-Life 2 RTX x86 (cross/i686-w64-mingw32.txt, -Dgame=hl2rtx).
-# src/game.h holds what differs.
+# One tree, four games, chosen at configure time (-Dgame=, default by the
+# cross file): Garry's Mod x64 or Team Fortress 2 x64
+# (cross/x86_64-w64-mingw32.txt, -Dgame=tf2), Left 4 Dead 2 x86 or Half-Life 2
+# RTX x86 (cross/i686-w64-mingw32.txt, -Dgame=hl2rtx). src/game.h holds what
+# differs.
 game = get_option('game')
 cpu = host_machine.cpu_family()
 if game == 'auto'
@@ -12,6 +13,9 @@ if game == 'auto'
 endif
 if game == 'gmod' and cpu != 'x86_64'
   error('the Garry\'s Mod proxy is a 64-bit DLL: configure with cross/x86_64-w64-mingw32.txt')
+endif
+if game == 'tf2' and cpu != 'x86_64'
+  error('the Team Fortress 2 proxy is a 64-bit DLL (tf_win64.exe): configure with cross/x86_64-w64-mingw32.txt')
 endif
 if game == 'l4d2' and cpu != 'x86'
   error('the Left 4 Dead 2 proxy is a 32-bit DLL: configure with cross/i686-w64-mingw32.txt')
@@ -64,13 +68,20 @@ if game == 'gmod'
   sources += ['src/engine_hooks.cpp', 'src/remix_ui.cpp', 'src/engine_patches.cpp', 'src/engine_lights.cpp',
               'src/engine_shadows.cpp', 'src/engine_nocull.cpp']
   def_file = 'shaderapidx9.def'
+elif game == 'tf2'
+  # Team Fortress 2 x64: OpenRemix in process and GMod's interface-based engine
+  # hooks and panel; GMod's build-specific engine patches off (their entry
+  # points as no-ops); the module helpers for the classes it finds by RTTI.
+  cpp_args += '-DPROXY_GAME_TF2'
+  sources += ['src/engine_hooks.cpp', 'src/remix_ui.cpp', 'src/gmod_only_stubs.cpp', 'src/pe_module.cpp']
+  def_file = 'shaderapidx9.def'
 else
   # x86: the Remix API is used through the bridge (remix_c.h is 64-bit only
   # unless allowed; empty, as the headers that define it themselves). The
   # GMod-only modules' entry points as no-ops, the 32-bit module helpers and
   # the runtime UI in the bridge host.
   cpp_args += ['-DREMIX_ALLOW_X86=']
-  sources += ['src/gmod_only_stubs.cpp', 'src/x86_module.cpp', 'src/bridge_ui.cpp']
+  sources += ['src/gmod_only_stubs.cpp', 'src/pe_module.cpp', 'src/bridge_ui.cpp']
   if is_gcc_syntax
     link_args += '-Wl,--enable-stdcall-fixup'
   endif

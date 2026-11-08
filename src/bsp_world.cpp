@@ -959,6 +959,40 @@ void parseSkyCamera(const Bsp &bsp) {
   }
 }
 
+// The detail sprite material (isDetailSpriteMaterial): the engine's default
+// until a map names another.
+constexpr char kDefaultDetailMaterial[] = "detail/detailsprites";
+std::string g_detailMaterial = kDefaultDetailMaterial;
+
+// A material path as the material system names it: lower case, forward
+// slashes, without "materials/" and ".vmt".
+std::string materialPath(std::string name) {
+  name = lower(name);
+  std::replace(name.begin(), name.end(), '\\', '/');
+  if (name.rfind("materials/", 0) == 0)
+    name.erase(0, 10);
+  if (name.size() > 4 && name.compare(name.size() - 4, 4, ".vmt") == 0)
+    name.resize(name.size() - 4);
+  return name;
+}
+
+// worldspawn (the entity lump's first entity) "detailmaterial".
+void parseDetailMaterial(const Bsp &bsp) {
+  g_detailMaterial = kDefaultDetailMaterial;
+  const auto [text, length] = bsp.lump<char>(kEntities);
+  if (!text)
+    return;
+  const std::string entities(text, length);
+  const size_t open = entities.find('{'), close = open == std::string::npos ? open : entities.find('}', open);
+  KeyValues kv;
+  if (close == std::string::npos || !parseKeyValues("entity " + entities.substr(open, close - open + 1), kv) ||
+      lower(kv.values["classname"]) != "worldspawn")
+    return;
+  const std::string named = materialPath(kv.values["detailmaterial"]);
+  if (!named.empty())
+    g_detailMaterial = named;
+}
+
 // func_lod brush models (indices into the models lump). One with an origin
 // or angles (a brush model placed away from where it was compiled) is left
 // to the engine.
@@ -3065,6 +3099,7 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap) {
   g_world = World{};
   g_world.api = &api;
   g_active = false;
+  g_detailMaterial = kDefaultDetailMaterial;
   if (mapName.empty()) {
     sendPartition(nullptr);
     return false;
@@ -3080,6 +3115,7 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap) {
     return false;
   }
   sendPartition(&bsp);
+  parseDetailMaterial(bsp); // with the BSP world or without it
   if (!enabled)
     return false;
   const auto [pak, pakBytes] = bsp.lump<uint8_t>(kPakfile);
@@ -3105,6 +3141,10 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap) {
 }
 
 bool active() { return g_active; }
+
+bool isDetailSpriteMaterial(const char *materialName) {
+  return materialName && *materialName && g_detailMaterial == materialName;
+}
 
 bool overlaysActive() { return g_active && !g_world.overlayGroups.empty(); }
 

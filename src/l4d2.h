@@ -1,6 +1,6 @@
 #pragma once
 
-#include "x86_module.h"
+#include "pe_module.h"
 
 #include <windows.h>
 
@@ -30,17 +30,17 @@ struct remixapi_Interface;
 
 namespace proxy::l4d2 {
 
-// The module helpers (x86_module.h; Module, Pattern, ... as they were here).
-using x86::Module;
-using x86::Pattern;
-using x86::bytesAt;
-using x86::rttiVtable;
-using x86::createInterface;
-using x86::swapSlot;
-using x86::writeCode;
-using x86::writeJump;
-using x86::envFlag;
-using x86::envFloat;
+// The module helpers (pe_module.h; Module, Pattern, ... as they were here).
+using pe::Module;
+using pe::Pattern;
+using pe::bytesAt;
+using pe::rttiVtable;
+using pe::createInterface;
+using pe::swapSlot;
+using pe::writeCode;
+using pe::writeJump;
+using pe::envFlag;
+using pe::envFloat;
 
 // "openremix:..." markers through the calling thread's material system render
 // context (queued with the draws under mat_queue_mode 2).

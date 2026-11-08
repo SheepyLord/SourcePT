@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <psapi.h>
 
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <memory>
@@ -120,6 +121,63 @@ template <class Fn> void hookSlot(void **vtable, unsigned slot, Fn hook, Fn &ori
   original = reinterpret_cast<Fn>(patch(vtable, slot, reinterpret_cast<void *>(hook)));
 }
 
+// The resources' hooks, per class. One D3D9 interface can be implemented by
+// several classes: Windows' own d3d9.dll has one per pool for buffers (a
+// managed vertex buffer's vtable is not a default one's), where DXVK has one
+// class per interface. Each class's vtable is hooked when its first object is
+// seen (see), and a hook calls the original of its own object's class
+// (original): another class's function on it misbehaves (a managed buffer
+// locked through the default class's Lock returned success and no memory).
+template <unsigned N> class ClassHooks {
+public:
+  explicit ClassHooks(const unsigned (&slots)[N]) {
+    for (unsigned i = 0; i < N; ++i)
+      slots_[i] = slots[i];
+  }
+  // Hooks `object`'s class unless it is (any thread; once per class).
+  void see(void *object, const std::array<void *, N> &hooks) {
+    if (find(object))
+      return;
+    std::lock_guard<std::mutex> guard(lock_);
+    const unsigned n = count_.load(std::memory_order_relaxed);
+    if (find(object) || n == kClasses)
+      return; // more classes than expected: the others stay unhooked
+    Class &c = classes_[n];
+    c.vtable = vtableOf(object);
+    for (unsigned i = 0; i < N; ++i)
+      c.original[i] = c.vtable[slots_[i]];
+    // Published before its vtable is patched: a hook always finds its class.
+    count_.store(n + 1, std::memory_order_release);
+    for (unsigned i = 0; i < N; ++i)
+      patch(c.vtable, slots_[i], hooks[i]);
+  }
+  // `object`'s function i: its class's original, or, for a class not hooked
+  // (objects the proxy made through the real entry points), its vtable's.
+  template <class Fn> Fn original(const void *object, unsigned i) const {
+    const Class *c = find(object);
+    return reinterpret_cast<Fn>(c ? c->original[i] : (*static_cast<void *const *const *>(object))[slots_[i]]);
+  }
+  unsigned classes() const { return count_.load(std::memory_order_acquire); }
+
+private:
+  static constexpr unsigned kClasses = 8;
+  struct Class {
+    void **vtable = nullptr;
+    void *original[N] = {};
+  };
+  const Class *find(const void *object) const {
+    void *const *vtable = *static_cast<void *const *const *>(object);
+    for (unsigned i = 0, n = count_.load(std::memory_order_acquire); i < n; ++i)
+      if (classes_[i].vtable == vtable)
+        return &classes_[i];
+    return nullptr;
+  }
+  unsigned slots_[N] = {};
+  Class classes_[kClasses];
+  std::atomic<unsigned> count_{0};
+  std::mutex lock_;
+};
+
 uint64_t nowUs() {
   static const double usPerTick = [] {
     LARGE_INTEGER f;
@@ -167,9 +225,9 @@ std::unordered_map<const void *, Shadow> g_shadows;
 using ReleaseFn = ULONG(STDMETHODCALLTYPE *)(IUnknown *);
 using LockFn = HRESULT(STDMETHODCALLTYPE *)(void *, UINT, UINT, void **, DWORD);
 using UnlockFn = HRESULT(STDMETHODCALLTYPE *)(void *);
-ReleaseFn g_vbRelease = nullptr, g_ibRelease = nullptr;
-LockFn g_vbLock = nullptr, g_ibLock = nullptr;
-UnlockFn g_vbUnlock = nullptr, g_ibUnlock = nullptr;
+// Vertex and index buffers: Release, Lock, Unlock.
+enum : unsigned { kBufRelease, kBufLock, kBufUnlock };
+ClassHooks<3> g_vbClasses({kRelease, kBufferLock, kBufferUnlock}), g_ibClasses({kRelease, kBufferLock, kBufferUnlock});
 
 void forget(const void *buffer) {
   std::lock_guard<std::mutex> lock(g_shadowLock);
@@ -223,42 +281,34 @@ void noteUnlock(void *buffer) {
   s.lockPtr = nullptr;
 }
 
-ULONG STDMETHODCALLTYPE vbRelease(IUnknown *self) {
-  const ULONG refs = g_vbRelease(self);
+ULONG bufferRelease(const ClassHooks<3> &classes, IUnknown *self) {
+  const ULONG refs = classes.original<ReleaseFn>(self, kBufRelease)(self);
   if (refs == 0)
     forget(self);
   return refs;
 }
-ULONG STDMETHODCALLTYPE ibRelease(IUnknown *self) {
-  const ULONG refs = g_ibRelease(self);
-  if (refs == 0)
-    forget(self);
-  return refs;
-}
-HRESULT STDMETHODCALLTYPE vbLock(void *self, UINT offset, UINT size, void **data, DWORD flags) {
+HRESULT bufferLock(const ClassHooks<3> &classes, void *self, UINT offset, UINT size, void **data, DWORD flags) {
   const uint64_t t0 = nowUs();
-  const HRESULT hr = g_vbLock(self, offset, size, data, flags);
+  const HRESULT hr = classes.original<LockFn>(self, kBufLock)(self, offset, size, data, flags);
   g_stats.usLock += nowUs() - t0;
   if (SUCCEEDED(hr) && data)
     *data = noteLock(self, offset, size, *data, flags);
   return hr;
+}
+HRESULT bufferUnlock(const ClassHooks<3> &classes, void *self) {
+  noteUnlock(self);
+  return classes.original<UnlockFn>(self, kBufUnlock)(self);
+}
+ULONG STDMETHODCALLTYPE vbRelease(IUnknown *self) { return bufferRelease(g_vbClasses, self); }
+ULONG STDMETHODCALLTYPE ibRelease(IUnknown *self) { return bufferRelease(g_ibClasses, self); }
+HRESULT STDMETHODCALLTYPE vbLock(void *self, UINT offset, UINT size, void **data, DWORD flags) {
+  return bufferLock(g_vbClasses, self, offset, size, data, flags);
 }
 HRESULT STDMETHODCALLTYPE ibLock(void *self, UINT offset, UINT size, void **data, DWORD flags) {
-  const uint64_t t0 = nowUs();
-  const HRESULT hr = g_ibLock(self, offset, size, data, flags);
-  g_stats.usLock += nowUs() - t0;
-  if (SUCCEEDED(hr) && data)
-    *data = noteLock(self, offset, size, *data, flags);
-  return hr;
+  return bufferLock(g_ibClasses, self, offset, size, data, flags);
 }
-HRESULT STDMETHODCALLTYPE vbUnlock(void *self) {
-  noteUnlock(self);
-  return g_vbUnlock(self);
-}
-HRESULT STDMETHODCALLTYPE ibUnlock(void *self) {
-  noteUnlock(self);
-  return g_ibUnlock(self);
-}
+HRESULT STDMETHODCALLTYPE vbUnlock(void *self) { return bufferUnlock(g_vbClasses, self); }
+HRESULT STDMETHODCALLTYPE ibUnlock(void *self) { return bufferUnlock(g_ibClasses, self); }
 
 // --- Textures --------------------------------------------------------------
 // Level 0 of 2D textures goes to the Remix output at UnlockRect, straight
@@ -279,36 +329,9 @@ using TextureLockRectFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DTexture9 *, UINT
                                                        DWORD);
 using TextureUnlockRectFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DTexture9 *, UINT);
 using GetSurfaceLevelFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DTexture9 *, UINT, IDirect3DSurface9 **);
-
-struct TextureHooks {
-  ReleaseFn release = nullptr;
-  GetSurfaceLevelFn surfaceLevel = nullptr;
-  TextureLockRectFn lock = nullptr;
-  TextureUnlockRectFn unlock = nullptr;
-};
-std::mutex g_textureVtableLock;
-std::unordered_map<void *, TextureHooks> g_textureVtables;
-
-ULONG STDMETHODCALLTYPE textureRelease(IUnknown *self);
-HRESULT STDMETHODCALLTYPE textureLockRect(IDirect3DTexture9 *self, UINT level, D3DLOCKED_RECT *locked,
-                                          const RECT *rect, DWORD flags);
-HRESULT STDMETHODCALLTYPE textureUnlockRect(IDirect3DTexture9 *self, UINT level);
-HRESULT STDMETHODCALLTYPE textureGetSurfaceLevel(IDirect3DTexture9 *self, UINT level, IDirect3DSurface9 **out);
-
-void hookTexture(IDirect3DTexture9 *tex) {
-  if (!tex)
-    return;
-  void **vt = vtableOf(tex);
-  std::lock_guard<std::mutex> lock(g_textureVtableLock);
-  if (g_textureVtables.find(vt) == g_textureVtables.end()) {
-    TextureHooks hooks;
-    hookSlot(vt, kRelease, &textureRelease, hooks.release);
-    hookSlot(vt, kTextureGetSurfaceLevel, &textureGetSurfaceLevel, hooks.surfaceLevel);
-    hookSlot(vt, kTextureLockRect, &textureLockRect, hooks.lock);
-    hookSlot(vt, kTextureUnlockRect, &textureUnlockRect, hooks.unlock);
-    g_textureVtables[vt] = hooks;
-  }
-}
+// 2D textures: Release, GetSurfaceLevel, LockRect, UnlockRect.
+enum : unsigned { kTexRelease, kTexGetSurfaceLevel, kTexLockRect, kTexUnlockRect };
+ClassHooks<4> g_textureClasses({kRelease, kTextureGetSurfaceLevel, kTextureLockRect, kTextureUnlockRect});
 
 // Volume textures (Entropy : Zero 2's colour-correction lookup, which the
 // night vision pass samples): a default-pool volume cannot be locked to read
@@ -488,14 +511,7 @@ void present();
 } // namespace targetread
 
 ULONG STDMETHODCALLTYPE textureRelease(IUnknown *self) {
-  ReleaseFn origRelease = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_textureVtableLock);
-    auto it = g_textureVtables.find(vtableOf(self));
-    if (it != g_textureVtables.end())
-      origRelease = it->second.release;
-  }
-  const ULONG refs = origRelease ? origRelease(self) : 0;
+  const ULONG refs = g_textureClasses.original<ReleaseFn>(self, kTexRelease)(self);
   if (refs == 0) {
     if (auto live = targetread::g_live.find(self); live != targetread::g_live.end()) {
       targetread::drop(live->second);
@@ -512,17 +528,7 @@ ULONG STDMETHODCALLTYPE textureRelease(IUnknown *self) {
 
 HRESULT STDMETHODCALLTYPE textureLockRect(IDirect3DTexture9 *self, UINT level, D3DLOCKED_RECT *locked,
                                           const RECT *rect, DWORD flags) {
-  TextureLockRectFn origLock = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_textureVtableLock);
-    auto it = g_textureVtables.find(vtableOf(self));
-    if (it != g_textureVtables.end())
-      origLock = it->second.lock;
-  }
-  if (!origLock)
-    return D3DERR_INVALIDCALL;
-
-  const HRESULT hr = origLock(self, level, locked, rect, flags);
+  const HRESULT hr = g_textureClasses.original<TextureLockRectFn>(self, kTexLockRect)(self, level, locked, rect, flags);
   if (SUCCEEDED(hr) && locked && !(flags & D3DLOCK_READONLY)) {
     std::lock_guard<std::mutex> lock(g_textureLocks);
     g_lockedTextures[levelKey(self, level)] = {static_cast<const uint8_t *>(locked->pBits), uint32_t(locked->Pitch),
@@ -564,49 +570,34 @@ HRESULT STDMETHODCALLTYPE textureUnlockRect(IDirect3DTexture9 *self, UINT level)
       }
     }
   }
-
-  TextureUnlockRectFn origUnlock = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_textureVtableLock);
-    auto it = g_textureVtables.find(vtableOf(self));
-    if (it != g_textureVtables.end())
-      origUnlock = it->second.unlock;
-  }
-  if (!origUnlock)
-    return D3DERR_INVALIDCALL;
-  return origUnlock(self, level);
+  return g_textureClasses.original<TextureUnlockRectFn>(self, kTexUnlockRect)(self, level);
 }
 
 // Uploads through level surfaces (GetSurfaceLevel + IDirect3DSurface9::LockRect,
 // as D3DX does): forward level 0 of the containing texture.
 using SurfaceLockRectFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DSurface9 *, D3DLOCKED_RECT *, const RECT *, DWORD);
 using SurfaceUnlockRectFn = HRESULT(STDMETHODCALLTYPE *)(IDirect3DSurface9 *);
+// Texture level surfaces: LockRect, UnlockRect.
+enum : unsigned { kSurfLockRect, kSurfUnlockRect };
+ClassHooks<2> g_surfaceClasses({kSurfaceLockRect, kSurfaceUnlockRect});
 
-struct SurfaceHooks {
-  SurfaceLockRectFn lock = nullptr;
-  SurfaceUnlockRectFn unlock = nullptr;
-};
-std::mutex g_surfaceVtableLock;
-std::unordered_map<void *, SurfaceHooks> g_surfaceVtables;
-
+ULONG STDMETHODCALLTYPE textureRelease(IUnknown *self);
+HRESULT STDMETHODCALLTYPE textureLockRect(IDirect3DTexture9 *self, UINT level, D3DLOCKED_RECT *locked,
+                                          const RECT *rect, DWORD flags);
+HRESULT STDMETHODCALLTYPE textureUnlockRect(IDirect3DTexture9 *self, UINT level);
+HRESULT STDMETHODCALLTYPE textureGetSurfaceLevel(IDirect3DTexture9 *self, UINT level, IDirect3DSurface9 **out);
 HRESULT STDMETHODCALLTYPE surfaceLockRect(IDirect3DSurface9 *self, D3DLOCKED_RECT *locked, const RECT *rect,
                                           DWORD flags);
 HRESULT STDMETHODCALLTYPE surfaceUnlockRect(IDirect3DSurface9 *self);
 
-// Surface vtables vary across pools (System Memory surfaces use a different vtable
-// than RenderTarget and Default pool surfaces in Direct3D 9Ex). Hook every distinct
-// surface vtable encountered.
-void hookSurface(IDirect3DSurface9 *surf) {
-  if (!surf)
-    return;
-  void **vt = vtableOf(surf);
-  std::lock_guard<std::mutex> lock(g_surfaceVtableLock);
-  if (g_surfaceVtables.find(vt) == g_surfaceVtables.end()) {
-    SurfaceHooks hooks;
-    hookSlot(vt, kSurfaceLockRect, &surfaceLockRect, hooks.lock);
-    hookSlot(vt, kSurfaceUnlockRect, &surfaceUnlockRect, hooks.unlock);
-    g_surfaceVtables[vt] = hooks;
-  }
+// Entropy : Zero 2 (D3D9Ex): textures and surfaces the proxy did not see
+// created (other pools' classes) are hooked when they are met.
+void hookTexture(IDirect3DTexture9 *texture) {
+  g_textureClasses.see(texture, {reinterpret_cast<void *>(&textureRelease), reinterpret_cast<void *>(&textureGetSurfaceLevel),
+                                 reinterpret_cast<void *>(&textureLockRect), reinterpret_cast<void *>(&textureUnlockRect)});
+}
+void hookSurface(IDirect3DSurface9 *surface) {
+  g_surfaceClasses.see(surface, {reinterpret_cast<void *>(&surfaceLockRect), reinterpret_cast<void *>(&surfaceUnlockRect)});
 }
 
 // Returns the 2D texture whose level 0 is `surface` (not AddRef'd), or nullptr.
@@ -652,17 +643,7 @@ IDirect3DTexture9 *containerTexture(IDirect3DSurface9 *surface, UINT *outLevel =
 
 HRESULT STDMETHODCALLTYPE surfaceLockRect(IDirect3DSurface9 *self, D3DLOCKED_RECT *locked, const RECT *rect,
                                           DWORD flags) {
-  SurfaceLockRectFn origLock = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_surfaceVtableLock);
-    auto it = g_surfaceVtables.find(vtableOf(self));
-    if (it != g_surfaceVtables.end())
-      origLock = it->second.lock;
-  }
-  if (!origLock)
-    return D3DERR_INVALIDCALL;
-
-  const HRESULT hr = origLock(self, locked, rect, flags);
+  const HRESULT hr = g_surfaceClasses.original<SurfaceLockRectFn>(self, kSurfLockRect)(self, locked, rect, flags);
   if (SUCCEEDED(hr) && locked && !(flags & D3DLOCK_READONLY)) {
     std::lock_guard<std::mutex> lock(g_textureLocks);
     g_lockedTextures[self] = {static_cast<const uint8_t *>(locked->pBits), uint32_t(locked->Pitch), rect != nullptr,
@@ -711,34 +692,13 @@ HRESULT STDMETHODCALLTYPE surfaceUnlockRect(IDirect3DSurface9 *self) {
       }
     }
   }
-
-  SurfaceUnlockRectFn origUnlock = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_surfaceVtableLock);
-    auto it = g_surfaceVtables.find(vtableOf(self));
-    if (it != g_surfaceVtables.end())
-      origUnlock = it->second.unlock;
-  }
-  if (!origUnlock)
-    return D3DERR_INVALIDCALL;
-  return origUnlock(self);
+  return g_surfaceClasses.original<SurfaceUnlockRectFn>(self, kSurfUnlockRect)(self);
 }
 
 HRESULT STDMETHODCALLTYPE textureGetSurfaceLevel(IDirect3DTexture9 *self, UINT level, IDirect3DSurface9 **out) {
-  GetSurfaceLevelFn origGetSurfaceLevel = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_textureVtableLock);
-    auto it = g_textureVtables.find(vtableOf(self));
-    if (it != g_textureVtables.end())
-      origGetSurfaceLevel = it->second.surfaceLevel;
-  }
-  if (!origGetSurfaceLevel)
-    return D3DERR_INVALIDCALL;
-
-  const HRESULT hr = origGetSurfaceLevel(self, level, out);
-  if (SUCCEEDED(hr) && out && *out) {
-    hookSurface(*out);
-  }
+  const HRESULT hr = g_textureClasses.original<GetSurfaceLevelFn>(self, kTexGetSurfaceLevel)(self, level, out);
+  if (SUCCEEDED(hr) && out && *out)
+    g_surfaceClasses.see(*out, {reinterpret_cast<void *>(&surfaceLockRect), reinterpret_cast<void *>(&surfaceUnlockRect)});
   return hr;
 }
 
@@ -1038,8 +998,9 @@ SetScissorRectFn g_setScissorRect = nullptr;
 SetSamplerStateFn g_setSamplerState = nullptr;
 SetShaderConstantIFn g_setVertexShaderConstantI = nullptr, g_setPixelShaderConstantI = nullptr;
 SetShaderConstantBFn g_setVertexShaderConstantB = nullptr, g_setPixelShaderConstantB = nullptr;
-QueryIssueFn g_queryIssue = nullptr;
-QueryGetDataFn g_queryGetData = nullptr;
+// Occlusion queries: Issue, GetData.
+enum : unsigned { kQIssue, kQGetData };
+ClassHooks<2> g_queryClasses({kQueryIssue, kQueryGetData});
 // Occlusion queries between Issue(BEGIN) and Issue(END).
 std::unordered_set<IDirect3DQuery9 *> g_openOcclusion;
 // Render targets the game issued occlusion queries on, by the frame it last
@@ -1138,12 +1099,8 @@ HRESULT STDMETHODCALLTYPE createVertexBuffer(IDirect3DDevice9 *dev, UINT length,
                                              IDirect3DVertexBuffer9 **out, HANDLE *shared) {
   const HRESULT hr = g_createVertexBuffer(dev, length, usage, fvf, pool, out, shared);
   if (SUCCEEDED(hr) && out && *out) {
-    if (!g_vbLock) {
-      void **vt = vtableOf(*out);
-      hookSlot(vt, kRelease, &vbRelease, g_vbRelease);
-      hookSlot(vt, kBufferLock, &vbLock, g_vbLock);
-      hookSlot(vt, kBufferUnlock, &vbUnlock, g_vbUnlock);
-    }
+    g_vbClasses.see(*out, {reinterpret_cast<void *>(&vbRelease), reinterpret_cast<void *>(&vbLock),
+                           reinterpret_cast<void *>(&vbUnlock)});
     trackBuffer(*out, length, usage, false, pool);
   }
   return hr;
@@ -1153,12 +1110,8 @@ HRESULT STDMETHODCALLTYPE createIndexBuffer(IDirect3DDevice9 *dev, UINT length, 
                                             D3DPOOL pool, IDirect3DIndexBuffer9 **out, HANDLE *shared) {
   const HRESULT hr = g_createIndexBuffer(dev, length, usage, format, pool, out, shared);
   if (SUCCEEDED(hr) && out && *out) {
-    if (!g_ibLock) {
-      void **vt = vtableOf(*out);
-      hookSlot(vt, kRelease, &ibRelease, g_ibRelease);
-      hookSlot(vt, kBufferLock, &ibLock, g_ibLock);
-      hookSlot(vt, kBufferUnlock, &ibUnlock, g_ibUnlock);
-    }
+    g_ibClasses.see(*out, {reinterpret_cast<void *>(&ibRelease), reinterpret_cast<void *>(&ibLock),
+                           reinterpret_cast<void *>(&ibUnlock)});
     trackBuffer(*out, length, usage, format == D3DFMT_INDEX32, pool);
   }
   return hr;
@@ -1180,9 +1133,9 @@ HRESULT STDMETHODCALLTYPE createTexture(IDirect3DDevice9 *dev, UINT width, UINT 
   // texture (UpdateTexture) without ever locking it.
   if (kEz2 && SUCCEEDED(hr) && out && *out && pool == D3DPOOL_SYSTEMMEM && shared && *shared)
     remix::onUserMemoryTexture(*out, width, height, format, static_cast<const uint8_t *>(*shared));
-  if (SUCCEEDED(hr) && out && *out) {
-    hookTexture(*out);
-  }
+  if (SUCCEEDED(hr) && out && *out)
+    g_textureClasses.see(*out, {reinterpret_cast<void *>(&textureRelease), reinterpret_cast<void *>(&textureGetSurfaceLevel),
+                                reinterpret_cast<void *>(&textureLockRect), reinterpret_cast<void *>(&textureUnlockRect)});
   return hr;
 }
 
@@ -1558,7 +1511,7 @@ void releaseOccluders() {
 
 // The current map's occluder buffers on this device (created on first use).
 bool occludersReady(IDirect3DDevice9 *dev) {
-  if (!occludersEnabled() || !bsp::active() || !g_vbLock || !g_ibLock)
+  if (!occludersEnabled() || !bsp::active())
     return false;
   const auto &o = bsp::occluders();
   if (o.indices.empty())
@@ -1578,14 +1531,15 @@ bool occludersReady(IDirect3DDevice9 *dev) {
                                  nullptr)))
     return false;
   void *data = nullptr;
-  if (FAILED(g_vbLock(g_occluders.vb, 0, 0, &data, 0)))
+  if (FAILED(g_vbClasses.original<LockFn>(g_occluders.vb, kBufLock)(g_occluders.vb, 0, 0, &data, 0)) || !data)
     return false;
   std::memcpy(data, o.positions.data(), vbBytes);
-  g_vbUnlock(g_occluders.vb);
-  if (FAILED(g_ibLock(g_occluders.ib, 0, 0, &data, 0)))
+  g_vbClasses.original<UnlockFn>(g_occluders.vb, kBufUnlock)(g_occluders.vb);
+  data = nullptr;
+  if (FAILED(g_ibClasses.original<LockFn>(g_occluders.ib, kBufLock)(g_occluders.ib, 0, 0, &data, 0)) || !data)
     return false;
   std::memcpy(data, o.indices.data(), ibBytes);
-  g_ibUnlock(g_occluders.ib);
+  g_ibClasses.original<UnlockFn>(g_occluders.ib, kBufUnlock)(g_occluders.ib);
   g_occluders.vertices = UINT(o.positions.size() / 3);
   g_occluders.triangles = UINT(o.indices.size() / 3);
   g_occluders.failed = false;
@@ -1636,7 +1590,7 @@ void drawOccluders(IDirect3DDevice9 *dev) {
 }
 
 HRESULT STDMETHODCALLTYPE queryGetData(IDirect3DQuery9 *query, void *data, DWORD size, DWORD flags) {
-  const HRESULT hr = g_queryGetData(query, data, size, flags);
+  const HRESULT hr = g_queryClasses.original<QueryGetDataFn>(query, kQGetData)(query, data, size, flags);
   if (hr == S_OK && data && size >= 4 && query->GetType() == D3DQUERYTYPE_OCCLUSION) {
 #if defined(PROXY_GAME_EZ2)
     // Raytracing renders occluded entities; prevent the engine from culling
@@ -1669,7 +1623,7 @@ HRESULT STDMETHODCALLTYPE queryIssue(IDirect3DQuery9 *query, DWORD flags) {
     else if (flags & D3DISSUE_END)
       g_openOcclusion.erase(query);
   }
-  return g_queryIssue(query, flags);
+  return g_queryClasses.original<QueryIssueFn>(query, kQIssue)(query, flags);
 }
 
 // A depth clear takes the occluders with it: the engine clears depth between
@@ -1693,10 +1647,8 @@ HRESULT STDMETHODCALLTYPE clear(IDirect3DDevice9 *dev, DWORD count, const D3DREC
 
 HRESULT STDMETHODCALLTYPE createQuery(IDirect3DDevice9 *dev, D3DQUERYTYPE type, IDirect3DQuery9 **out) {
   const HRESULT hr = g_createQuery(dev, type, out);
-  if (SUCCEEDED(hr) && out && *out && type == D3DQUERYTYPE_OCCLUSION && !g_queryIssue) {
-    hookSlot(vtableOf(*out), kQueryIssue, &queryIssue, g_queryIssue);
-    hookSlot(vtableOf(*out), kQueryGetData, &queryGetData, g_queryGetData);
-  }
+  if (SUCCEEDED(hr) && out && *out && type == D3DQUERYTYPE_OCCLUSION)
+    g_queryClasses.see(*out, {reinterpret_cast<void *>(&queryIssue), reinterpret_cast<void *>(&queryGetData)});
   return hr;
 }
 
@@ -2463,17 +2415,28 @@ HRESULT WINAPI direct3DCreate9Ex(UINT sdk, IDirect3D9Ex **out) {
   }
   return hr;
 }
-
-FARPROC WINAPI proxyGetProcAddress(HMODULE module, LPCSTR procName) {
-  FARPROC real = g_getProcAddress(module, procName);
-  if (reinterpret_cast<uintptr_t>(procName) > 0xFFFF && std::strcmp(procName, "Direct3DCreate9Ex") == 0) {
-    g_createEx = reinterpret_cast<CreateExFn>(real);
-    proxy::diag::stage("hooked GetProcAddress(Direct3DCreate9Ex)");
-    return reinterpret_cast<FARPROC>(&direct3DCreate9Ex);
-  }
-  return real;
-}
 #endif
+
+// A shader API that loads d3d9.dll itself and asks for Direct3DCreate9 by
+// name (TF2's x64 one: LoadLibraryA("d3d9.dll"), then GetProcAddress for
+// Direct3DCreate9, or Direct3DCreate9Ex without -nod3d9ex) gets the hook from
+// its GetProcAddress import. Entropy : Zero 2's asks for Direct3DCreate9Ex.
+FARPROC WINAPI getProcAddress(HMODULE module, LPCSTR name) {
+  const FARPROC found = g_getProcAddress(module, name);
+  // By name only: an ordinal's value fits in the low word.
+  if (found && reinterpret_cast<uintptr_t>(name) > 0xffff && std::strcmp(name, "Direct3DCreate9") == 0) {
+    g_create = reinterpret_cast<CreateFn>(reinterpret_cast<void *>(found));
+    return reinterpret_cast<FARPROC>(reinterpret_cast<void *>(&direct3DCreate9));
+  }
+#if defined(PROXY_GAME_EZ2)
+  if (found && reinterpret_cast<uintptr_t>(name) > 0xffff && std::strcmp(name, "Direct3DCreate9Ex") == 0) {
+    g_createEx = reinterpret_cast<CreateExFn>(reinterpret_cast<void *>(found));
+    proxy::diag::stage("hooked GetProcAddress(Direct3DCreate9Ex)");
+    return reinterpret_cast<FARPROC>(reinterpret_cast<void *>(&direct3DCreate9Ex));
+  }
+#endif
+  return found;
+}
 
 // Rewrites `module`'s IAT entry for dll!name.
 void *patchImport(HMODULE module, const char *dll, const char *name, void *hook) {
@@ -2514,10 +2477,14 @@ bool install(HMODULE module) {
 #if defined(PROXY_GAME_EZ2)
   // The shader API asks for Direct3DCreate9Ex by name at run time.
   g_getProcAddress = reinterpret_cast<GetProcAddressFn>(
-      patchImport(module, "KERNEL32.dll", "GetProcAddress", reinterpret_cast<void *>(&proxyGetProcAddress)));
+      patchImport(module, "KERNEL32.dll", "GetProcAddress", reinterpret_cast<void *>(&getProcAddress)));
   return g_create != nullptr || g_getProcAddress != nullptr;
 #else
-  return g_create != nullptr;
+  if (g_create)
+    return true;
+  g_getProcAddress = reinterpret_cast<GetProcAddressFn>(
+      patchImport(module, "KERNEL32.dll", "GetProcAddress", reinterpret_cast<void *>(&getProcAddress)));
+  return g_getProcAddress != nullptr;
 #endif
 }
 
@@ -2601,6 +2568,10 @@ void dumpStatistics(FILE *out) {
             targetread::g_superseded.exchange(0), targetread::g_issueUs.exchange(0) / (issues ? issues : 1) / 1000.0,
             targetread::g_collectUs.exchange(0) / (reads ? reads : 1) / 1000.0, targetread::g_failures.exchange(0));
   }
+  fprintf(out, "   resource classes hooked (native D3D9 has several per interface, DXVK one): vertex buffers %u, index "
+               "buffers %u, textures %u, texture surfaces %u, occlusion queries %u\n",
+          g_vbClasses.classes(), g_ibClasses.classes(), g_textureClasses.classes(), g_surfaceClasses.classes(),
+          g_queryClasses.classes());
   fprintf(out, "   RT changes %.1f, SetTexture %.1f, SetStreamSource %.1f, SetVSConstF %.1f\n",
           g_stats.rtChanges.exchange(0) / f, g_stats.textureBinds.exchange(0) / f, g_stats.streamSets.exchange(0) / f,
           g_stats.vsConstCalls.exchange(0) / f);

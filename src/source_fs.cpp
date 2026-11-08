@@ -185,7 +185,7 @@ void addVpk(const std::wstring &dirFile) {
     g_paths.push_back({{}, std::move(vpk)});
 }
 
-#if defined(PROXY_GAME_HL2RTX) || defined(PROXY_GAME_EZ2)
+#if defined(PROXY_GAME_HL2RTX) || defined(PROXY_GAME_TF2) || defined(PROXY_GAME_EZ2)
 // A "directory/*" search path: its subdirectories loose and its packages
 // (<name>_dir.vpk), in alphabetical order as the engine mounts them.
 void addEach(const std::wstring &directory) {
@@ -213,8 +213,8 @@ void addEach(const std::wstring &directory) {
 // for what the proxy's index lacks: workshop addons (steamapps/workshop/.gma,
 // LZMA legacy archives), mounted games, downloads. Slots: Read 0, Open 2,
 // Close 3, Seek 4, Tell 5 (Size's two overloads are not relied on).
-// L4D2, Half-Life 2 RTX: not asked (its slots are not verified there); the
-// index is all.
+// L4D2, Half-Life 2 RTX, TF2: not asked (its slots are not verified there);
+// the index is all.
 void *engineFileSystem() {
   if (!game::kGMod)
     return nullptr;
@@ -311,6 +311,20 @@ void index() {
     addLoose(dir);
     addVpk(std::wstring(dir) + L"\\pak01_dir.vpk");
   }
+#elif defined(PROXY_GAME_TF2)
+  // tf/gameinfo.txt SearchPaths (game paths, in order; TF2 x64 layout: the
+  // exe sits in the game root): tf/custom/*, TF2's packages, Half-Life 2's
+  // and the platform's, then tf, hl2 and platform loose, downloads last.
+  addEach(L"tf\\custom");
+  for (const wchar_t *vpk : {L"tf2_textures", L"tf2_sound_vo_english", L"tf2_sound_misc", L"tf2_misc"})
+    addVpk(std::wstring(L"tf\\") + vpk + L"_dir.vpk");
+  for (const wchar_t *vpk : {L"hl2_textures", L"hl2_sound_vo_english", L"hl2_sound_misc", L"hl2_misc"})
+    addVpk(std::wstring(L"hl2\\") + vpk + L"_dir.vpk");
+  addVpk(L"platform\\platform_misc_dir.vpk");
+  addLoose(L"tf");
+  addLoose(L"hl2");
+  addLoose(L"platform");
+  addLoose(L"tf\\download");
 #elif defined(PROXY_GAME_HL2RTX)
   // hl2rtx/gameinfo.txt SearchPaths (game paths, in order): hl2rtx/custom/*,
   // the mod, Half-Life 2's packages, Mapbase's (mapbase_hl2/*, its shared

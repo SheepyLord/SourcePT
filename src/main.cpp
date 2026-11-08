@@ -1,6 +1,6 @@
-// shaderapidx9.dll proxy for Garry's Mod (x64), Left 4 Dead 2 and Half-Life 2
-// RTX (x86, see game.h): loads the original as shaderapidx9_orig.dll and
-// hands out forwarding wrappers for its interfaces.
+// shaderapidx9.dll proxy for Garry's Mod and Team Fortress 2 (x64), Left 4
+// Dead 2 and Half-Life 2 RTX (x86, see game.h): loads the original as
+// shaderapidx9_orig.dll and hands out forwarding wrappers for its interfaces.
 // Phase 1: pure pass-through with per-slot call statistics.
 #include "diag.h"
 #include "d3d_hooks.h"
@@ -17,6 +17,8 @@
 #include "slots_shaderapi_l4d2.h"
 #elif defined(PROXY_GAME_HL2RTX) || defined(PROXY_GAME_EZ2)
 #include "slots_shaderapi_hl2rtx.h"
+#elif defined(PROXY_GAME_TF2)
+#include "slots_shaderapi_tf2.h"
 #endif
 #include "vb_origins.h"
 #include "vtable_proxy.h"
@@ -118,18 +120,21 @@ void appendSwitch(const char *name) {
 }
 
 void forceSwitches() {
-#if defined(PROXY_GAME_GMOD) || defined(PROXY_GAME_HL2RTX)
-  // The proxy hooks the original's import of d3d9!Direct3DCreate9. Without
-  // -nod3d9ex the shader API asks d3d9.dll for Direct3DCreate9Ex instead (by
-  // name, at run time) and creates an IDirect3DDevice9Ex nothing here sees:
-  // the game then runs without the proxy's D3D hooks. (Half-Life 2 RTX's
-  // shader API is SDK 2013's in this: CShaderDeviceMgrDx8 asks FindParm for
-  // -nod3d9ex, then GetProcAddress(d3d9, "Direct3DCreate9Ex").)
+#if defined(PROXY_GAME_GMOD) || defined(PROXY_GAME_HL2RTX) || defined(PROXY_GAME_TF2)
+  // The proxy hooks the original's import of d3d9!Direct3DCreate9 (TF2: its
+  // GetProcAddress, d3d_hooks.h). Without -nod3d9ex the shader API asks
+  // d3d9.dll for Direct3DCreate9Ex instead (by name, at run time) and creates
+  // an IDirect3DDevice9Ex nothing here sees: the game then runs without the
+  // proxy's D3D hooks. (Half-Life 2 RTX's and TF2's shader APIs are SDK
+  // 2013's in this: CShaderDeviceMgrDx8 asks FindParm for -nod3d9ex, then
+  // GetProcAddress(d3d9, "Direct3DCreate9Ex").)
   appendSwitch("-nod3d9ex");
-#else
-  // L4D2 (l4d2-rtx's proxy saw the plain device without -nod3d9ex) and EZ2:
-  // the proxy patches engine code and hooks its vtables, which VAC must never
-  // see, so the game stays off VAC-secured servers.
+#endif
+#if defined(PROXY_GAME_L4D2) || defined(PROXY_GAME_TF2) || defined(PROXY_GAME_EZ2)
+  // L4D2 (l4d2-rtx's proxy saw the plain device without -nod3d9ex), TF2, EZ2:
+  // the proxy replaces a game module, patches engine code and hooks its
+  // vtables, which VAC must never see, so the game stays off VAC-secured
+  // servers.
   appendSwitch("-insecure");
 #endif
 }
@@ -154,7 +159,7 @@ bool loadOriginal() {
   }
   g_origCreateInterface = reinterpret_cast<CreateInterfaceFn>(GetProcAddress(g_orig, "CreateInterface"));
   if (!proxy::d3d::install(g_orig))
-    log("proxy: d3d9!Direct3DCreate9 import not found; D3D hooks inactive");
+    log("proxy: neither a d3d9!Direct3DCreate9 nor a GetProcAddress import found; D3D hooks inactive");
   log("proxy: loaded original at %p", static_cast<void *>(g_orig));
   proxy::diag::stage("shaderapidx9_orig.dll loaded at %p, CreateInterface %s", static_cast<void *>(g_orig),
                      g_origCreateInterface ? "found" : "MISSING");
