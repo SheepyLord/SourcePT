@@ -18,5 +18,7 @@ void reinstall();
 void captureEngineErrors();
 // One line, with the time since install and the calling thread.
 void stage(const char *fmt, ...);
+// DllMain: unregisters exception handlers on process detach.
+void uninstall();
 
 } // namespace proxy::diag

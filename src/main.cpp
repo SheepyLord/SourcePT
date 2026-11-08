@@ -1,5 +1,6 @@
 // shaderapidx9.dll proxy for Garry's Mod and Team Fortress 2 (x64), Left 4
-// Dead 2 and Half-Life 2 RTX (x86, see game.h): loads the original as
+// Dead 2, Half-Life 2 RTX, Entropy : Zero 2 and Portal 2 (x86, see game.h):
+// loads the original as
 // shaderapidx9_orig.dll and hands out forwarding wrappers for its interfaces.
 // Phase 1: pure pass-through with per-slot call statistics.
 #include "diag.h"
@@ -13,13 +14,17 @@
 #include "engine_shadows.h"
 #include "remix_output.h"
 #include "remix_ui.h"
+#ifdef PROXY_X86_ENGINE
+#include "x86_engine.h"
+#endif
 #ifdef PROXY_GAME_L4D2
-#include "l4d2.h"
 #include "slots_shaderapi_l4d2.h"
-#elif defined(PROXY_GAME_HL2RTX)
+#elif defined(PROXY_GAME_HL2RTX) || defined(PROXY_GAME_EZ2)
 #include "slots_shaderapi_hl2rtx.h"
 #elif defined(PROXY_GAME_TF2)
 #include "slots_shaderapi_tf2.h"
+#elif defined(PROXY_GAME_PORTAL2)
+#include "slots_shaderapi_portal2.h"
 #endif
 #include "vb_origins.h"
 #include "vtable_proxy.h"
@@ -91,13 +96,14 @@ uint32_t countSlots(const void *const *vtbl) {
 
 // Appends a switch to tier0's command line before the original is loaded,
 // for the engine to find when it looks it up (ICommandLine::FindParm).
-// ICommandLine slots, the same in GMod x64, L4D2 x86 and Half-Life 2 RTX x86
-// (L4D2's engine calls FindParm at vtable +0x28, Half-Life 2 RTX's shader API
-// too, and its tier0's CheckParm, slot 3): AppendParm 5 (after CreateCmdLine
-// x2, GetCmdLine, CheckParm, RemoveParm), FindParm 10.
+// ICommandLine slots, the same in GMod x64, L4D2, Half-Life 2 RTX and Portal 2
+// x86 (L4D2's and Portal 2's engines call FindParm at vtable +0x28, Half-Life
+// 2 RTX's shader API too, and its tier0's CheckParm, slot 3): AppendParm 5
+// (after CreateCmdLine x2, GetCmdLine, CheckParm, RemoveParm), FindParm 10.
+// The accessor's export is game::kCommandLineExport.
 void appendSwitch(const char *name) {
   HMODULE tier0 = GetModuleHandleW(L"tier0.dll");
-  auto get = tier0 ? reinterpret_cast<void *(*)()>(GetProcAddress(tier0, "CommandLine_Tier0")) : nullptr;
+  auto get = tier0 ? reinterpret_cast<void *(*)()>(GetProcAddress(tier0, proxy::game::kCommandLineExport)) : nullptr;
   void *commandLine = get ? get() : nullptr;
   if (!commandLine) {
     log("proxy: no tier0 command line; pass %s yourself", name);
@@ -133,10 +139,11 @@ void forceSwitches() {
   // GetProcAddress(d3d9, "Direct3DCreate9Ex").)
   appendSwitch("-nod3d9ex");
 #endif
-#if defined(PROXY_GAME_L4D2) || defined(PROXY_GAME_TF2)
-  // L4D2 (l4d2-rtx's proxy saw the plain device without -nod3d9ex), TF2: the
-  // proxy replaces a game module and hooks the engine's vtables, which VAC
-  // must never see, so the game stays off VAC-secured servers.
+#if defined(PROXY_GAME_L4D2) || defined(PROXY_GAME_TF2) || defined(PROXY_GAME_EZ2) || defined(PROXY_GAME_PORTAL2)
+  // L4D2 (l4d2-rtx's proxy saw the plain device without -nod3d9ex), TF2, EZ2
+  // and Portal 2 (its shader API imports only Direct3DCreate9): the proxy
+  // replaces a game module, patches engine code and hooks its vtables, which
+  // VAC must never see, so the game stays off VAC-secured servers.
   appendSwitch("-insecure");
 #endif
 }
@@ -200,17 +207,31 @@ bool PROXY_THISCALL deviceMgrConnect(proxy::Wrapper *self, CreateInterfaceFn fac
   log("proxy: IShaderDeviceMgr::Connect(factory %p)", reinterpret_cast<void *>(factory));
   proxy::diag::stage("IShaderDeviceMgr::Connect");
   const bool connected = proxy::original<Fn>(self, 0)(self->real, factory ? connectFactory : nullptr);
+  log("proxy: IShaderDeviceMgr::Connect -> %s", connected ? "true" : "false");
   proxy::diag::stage("IShaderDeviceMgr::Connect returned %u", unsigned(connected));
   return connected;
 }
 
-// IAppSystem slot 3 returns InitReturnVal_t (0 failed, 1 initialized).
-int deviceMgrInit(proxy::Wrapper *self) {
-  using Fn = int (*)(void *);
+#ifdef PROXY_GAME_EZ2
+// IShaderDeviceMgr slot 1: void Disconnect() (IAppSystem).
+void PROXY_THISCALL deviceMgrDisconnect(proxy::Wrapper *self) {
+  using Fn = void(PROXY_THISCALL *)(void *);
+  log("proxy: IShaderDeviceMgr::Disconnect");
+  proxy::diag::stage("IShaderDeviceMgr::Disconnect");
+  proxy::original<Fn>(self, 1)(self->real);
+}
+
+#endif
+
+// IShaderDeviceMgr slot 3: InitReturnVal_t Init() (IAppSystem).
+int PROXY_THISCALL deviceMgrInit(proxy::Wrapper *self) {
+  using Fn = int(PROXY_THISCALL *)(void *);
+  log("proxy: IShaderDeviceMgr::Init");
   proxy::diag::stage("IShaderDeviceMgr::Init");
-  const int result = proxy::original<Fn>(self, 3)(self->real);
-  proxy::diag::stage("IShaderDeviceMgr::Init returned %d", result);
-  return result;
+  int rc = proxy::original<Fn>(self, 3)(self->real);
+  log("proxy: IShaderDeviceMgr::Init -> %d", rc);
+  proxy::diag::stage("IShaderDeviceMgr::Init -> %d", rc);
+  return rc;
 }
 
 // IShaderDeviceMgr slot 4: void Shutdown() (IAppSystem). The material system
@@ -226,9 +247,10 @@ void PROXY_THISCALL deviceMgrShutdown(proxy::Wrapper *self) {
   proxy::remix::shutdown();
 }
 
-// IShaderDeviceMgr slot 12 (5 + 7): CreateInterfaceFn SetMode(void *hWnd,
-// int nAdapter, const ShaderDeviceInfo_t &mode). The material system fetches
-// the shader API interfaces through the factory it returns.
+// IShaderDeviceMgr slot 12 (5 + 7; Portal 2: 15, game::kSlotDeviceMgrSetMode):
+// CreateInterfaceFn SetMode(void *hWnd, int nAdapter, const ShaderDeviceInfo_t
+// &mode). The material system fetches the shader API interfaces through the
+// factory it returns.
 CreateInterfaceFn g_setModeFactory = nullptr;
 void *setModeFactory(const char *name, int *rc) {
   void *real = g_setModeFactory ? g_setModeFactory(name, rc) : nullptr;
@@ -237,7 +259,8 @@ void *setModeFactory(const char *name, int *rc) {
 CreateInterfaceFn PROXY_THISCALL deviceMgrSetMode(proxy::Wrapper *self, void *hwnd, int adapter, const void *mode) {
   using Fn = CreateInterfaceFn(PROXY_THISCALL *)(void *, void *, int, const void *);
   proxy::diag::stage("IShaderDeviceMgr::SetMode(hwnd %p, adapter %d): the engine creates its Direct3D device", hwnd, adapter);
-  CreateInterfaceFn factory = proxy::original<Fn>(self, 12)(self->real, hwnd, adapter, mode);
+  CreateInterfaceFn factory =
+      proxy::original<Fn>(self, proxy::game::kSlotDeviceMgrSetMode)(self->real, hwnd, adapter, mode);
   log("proxy: SetMode(hwnd=%p, adapter=%d) -> factory %p", hwnd, adapter, reinterpret_cast<void *>(factory));
   proxy::diag::stage("SetMode returned factory %p", reinterpret_cast<void *>(factory));
   if (!factory)
@@ -246,7 +269,8 @@ CreateInterfaceFn PROXY_THISCALL deviceMgrSetMode(proxy::Wrapper *self, void *hw
   return setModeFactory;
 }
 
-// IShaderUtil (material system) slot 12 (5 + 7): void RestoreShaderObjects(
+// IShaderUtil (material system) slot 12 (5 + 7; Portal 2: 15,
+// game::kSlotRestoreShaderObjects): void RestoreShaderObjects(
 // CreateInterfaceFn shaderFactory, int nChangeFlags). The material system
 // refreshes its global shader API pointers from this factory.
 CreateInterfaceFn g_restoreFactory = nullptr;
@@ -259,31 +283,32 @@ void PROXY_THISCALL shaderUtilRestoreShaderObjects(proxy::Wrapper *self, CreateI
   log("proxy: IShaderUtil::RestoreShaderObjects(factory %p, flags %d)", reinterpret_cast<void *>(factory), flags);
   if (factory && factory != restoreFactory)
     g_restoreFactory = factory;
-  proxy::original<Fn>(self, 12)(self->real, factory ? restoreFactory : nullptr, flags);
+  proxy::original<Fn>(self, proxy::game::kSlotRestoreShaderObjects)(self->real, factory ? restoreFactory : nullptr,
+                                                                     flags);
 }
 
 // IShaderAPI (ShaderApi030) slot 127 (Half-Life 2 RTX 126): void
 // SetLight(int lightNum, const LightDesc_t &desc) (copies 88 bytes into its
 // light array). SDK 2013 sets the model lights one at a time; L4D2's
-// IShaderAPIDX8 slot 88 is void SetLights(int nCount, const LightDesc_t
-// *pDesc), an array (game.h).
+// IShaderAPIDX8 slot 88 (Portal 2 92) is void SetLights(int nCount, const
+// LightDesc_t *pDesc), an array (game.h).
 void PROXY_THISCALL shaderApiSetLight(proxy::Wrapper *self, int index, const void *desc) {
   using Fn = void(PROXY_THISCALL *)(void *, int, const void *);
   proxy::remix::onSetLights(proxy::game::kSetLightsArray ? index : 1, desc);
   proxy::original<Fn>(self, proxy::game::kSlotSetLight)(self->real, index, desc);
 }
 
-// IShaderAPI slot 114 (L4D2 76, Half-Life 2 RTX 113): void Bind(IMaterial
-// *pMaterial): the material of the draws that follow (GMod, Half-Life 2 RTX:
-// those buffered for the previous one are flushed inside). Hooked only when
-// engine_materials validated the slot.
+// IShaderAPI slot 114 (L4D2 76, Half-Life 2 RTX 113, Portal 2 80): void
+// Bind(IMaterial *pMaterial): the material of the draws that follow (GMod,
+// Half-Life 2 RTX: those buffered for the previous one are flushed inside).
+// Hooked only when engine_materials validated the slot.
 void PROXY_THISCALL shaderApiBind(proxy::Wrapper *self, void *material) {
   using Fn = void(PROXY_THISCALL *)(void *, void *);
   proxy::original<Fn>(self, proxy::game::kSlotBind)(self->real, material);
   proxy::engine_materials::onBind(material);
 }
 
-// IShaderAPI slot 216 (L4D2 181, Half-Life 2 RTX 215): void
+// IShaderAPI slot 216 (L4D2 181, Half-Life 2 RTX 215, Portal 2 186): void
 // SetPIXMarker(unsigned long color, const char *name) (an empty stub in
 // release builds). Markers "openremix:..." are ours.
 void PROXY_THISCALL shaderApiSetPIXMarker(proxy::Wrapper *self, unsigned long color, const char *name) {
@@ -292,6 +317,63 @@ void PROXY_THISCALL shaderApiSetPIXMarker(proxy::Wrapper *self, unsigned long co
     return;
   proxy::original<Fn>(self, proxy::game::kSlotSetPIXMarker)(self->real, color, name);
 }
+
+#ifdef PROXY_GAME_GMOD
+// IShaderAPI slot 158: ReadPixels of a rect of render target 0. Engine
+// screenshots (the camera tool's "jpeg", "screenshot") and Lua captures read
+// the back buffer through it, which OpenRemix never draws (and from which the
+// shader API reads nothing under the proxy: the files came out black). Reads
+// of the back buffer get the runtime's last presented frame instead.
+struct ReadRect {
+  int x, y, width, height;
+};
+void PROXY_THISCALL shaderApiReadPixels(proxy::Wrapper *self, ReadRect *src, ReadRect *dst, unsigned char *data,
+                                        int format, int stride) {
+  using Fn = void(PROXY_THISCALL *)(void *, ReadRect *, ReadRect *, unsigned char *, int, int);
+  proxy::original<Fn>(self, proxy::game::kSlotReadPixels)(self->real, src, dst, data, format, stride);
+  uint32_t width = 0, height = 0;
+  if (!data || !proxy::d3d::backBufferBound() || !proxy::d3d::backBufferSize(width, height))
+    return;
+  // Each format's bytes as indices into B, G, R, A (4: opaque padding).
+  struct Layout {
+    int format, bytes;
+    int order[4];
+  };
+  static constexpr Layout kLayouts[] = {
+      {0, 4, {2, 1, 0, 3}},  // RGBA8888
+      {1, 4, {3, 0, 1, 2}},  // ABGR8888
+      {2, 3, {2, 1, 0, 0}},  // RGB888
+      {3, 3, {0, 1, 2, 0}},  // BGR888
+      {11, 4, {3, 2, 1, 0}}, // ARGB8888
+      {12, 4, {0, 1, 2, 3}}, // BGRA8888
+      {16, 4, {0, 1, 2, 4}}, // BGRX8888
+  };
+  const Layout *layout = nullptr;
+  for (const auto &l : kLayouts)
+    if (l.format == format)
+      layout = &l;
+  if (!layout)
+    return;
+  const ReadRect from = src ? *src : ReadRect{0, 0, int(width), int(height)};
+  const ReadRect to = dst ? *dst : ReadRect{0, 0, from.width, from.height};
+  if (from.width <= 0 || from.height <= 0 || to.width <= 0 || to.height <= 0 || to.x < 0 || to.y < 0)
+    return;
+  const auto *image = proxy::remix::presentedImage(width, height);
+  if (!image)
+    return;
+  const size_t pitch = stride > 0 ? size_t(stride) : size_t(to.width) * layout->bytes;
+  for (int y = 0; y < to.height; ++y) {
+    const int sy = std::clamp(from.y + int(int64_t(y) * from.height / to.height), 0, int(height) - 1);
+    unsigned char *row = data + size_t(to.y + y) * pitch + size_t(to.x) * layout->bytes;
+    for (int x = 0; x < to.width; ++x) {
+      const int sx = std::clamp(from.x + int(int64_t(x) * from.width / to.width), 0, int(width) - 1);
+      const uint8_t *bgra = image->data() + (size_t(sy) * width + sx) * 4;
+      for (int c = 0; c < layout->bytes; ++c)
+        row[x * layout->bytes + c] = layout->order[c] == 4 ? 255 : bgra[layout->order[c]];
+    }
+  }
+}
+#endif
 
 struct KnownInterface {
   const char *name;
@@ -302,10 +384,13 @@ const KnownInterface kKnown[] = {
     {"ShaderDeviceMgr001",
      [](proxy::Kind *k) {
        proxy::setHook(k, 0, reinterpret_cast<void *>(&deviceMgrConnect));
+#ifdef PROXY_GAME_EZ2
+       proxy::setHook(k, 1, reinterpret_cast<void *>(&deviceMgrDisconnect));
+#endif
        proxy::setHook(k, 2, reinterpret_cast<void *>(&deviceMgrQueryInterface));
        proxy::setHook(k, 3, reinterpret_cast<void *>(&deviceMgrInit));
        proxy::setHook(k, 4, reinterpret_cast<void *>(&deviceMgrShutdown));
-       proxy::setHook(k, 12, reinterpret_cast<void *>(&deviceMgrSetMode));
+       proxy::setHook(k, proxy::game::kSlotDeviceMgrSetMode, reinterpret_cast<void *>(&deviceMgrSetMode));
      }},
     {proxy::game::kShaderApiInterface,
      [](proxy::Kind *k) {
@@ -314,6 +399,9 @@ const KnownInterface kKnown[] = {
 #endif
        proxy::setHook(k, proxy::game::kSlotSetLight, reinterpret_cast<void *>(&shaderApiSetLight));
        proxy::setHook(k, proxy::game::kSlotSetPIXMarker, reinterpret_cast<void *>(&shaderApiSetPIXMarker));
+#ifdef PROXY_GAME_GMOD
+       proxy::setHook(k, proxy::game::kSlotReadPixels, reinterpret_cast<void *>(&shaderApiReadPixels));
+#endif
        if (proxy::engine_materials::install(k->realVtbl))
          proxy::setHook(k, proxy::game::kSlotBind, reinterpret_cast<void *>(&shaderApiBind));
      }},
@@ -328,7 +416,10 @@ const KnownInterface kKnown[] = {
      }},
     // Material system interface handed to the shader API.
     {"VShaderUtil001",
-     [](proxy::Kind *k) { proxy::setHook(k, 12, reinterpret_cast<void *>(&shaderUtilRestoreShaderObjects)); }},
+     [](proxy::Kind *k) {
+       proxy::setHook(k, proxy::game::kSlotRestoreShaderObjects,
+                      reinterpret_cast<void *>(&shaderUtilRestoreShaderObjects));
+     }},
 };
 
 void *wrapInterface(const char *name, void *real) {
@@ -930,8 +1021,8 @@ DWORD WINAPI statisticsThread(void *) {
       proxy::engine_nocull::dumpStatistics(f);
       proxy::engine_lights::dumpStatistics(f);
       proxy::engine_shadows::dumpStatistics(f);
-#ifdef PROXY_GAME_L4D2
-      proxy::l4d2::dumpStatistics(f);
+#ifdef PROXY_X86_ENGINE
+      proxy::x86::dumpEngineStatistics(f);
 #endif
       proxy::engine_materials::dumpStatistics(f);
       proxy::dumpStatistics(f);
@@ -995,5 +1086,10 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
   } else if (reason == DLL_PROCESS_DETACH) {
     proxy::diag::uninstall();
   }
+#ifdef PROXY_GAME_EZ2
+  else if (reason == DLL_PROCESS_DETACH) {
+    proxy::diag::uninstall();
+  }
+#endif
   return TRUE;
 }

@@ -24,6 +24,7 @@
 #include <remix/remix_bake_ext.h>
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <array>
@@ -38,6 +39,8 @@ namespace proxy::bsp {
 namespace {
 
 // --- BSP (version 21, Left 4 Dead 2 lump order) -----------------------------
+// Portal 2's maps are L4D2's format (v21, sprp v9 placements of 72 bytes, the
+// same lump versions, HDR lighting only) with the standard lump_t order.
 enum Lump {
   kEntities = 0,
   kPlanes = 1,
@@ -146,13 +149,17 @@ public:
   std::vector<uint8_t> data;
   bool open(const std::wstring &path) {
     FILE *f = _wfopen(path.c_str(), L"rb");
-    if (!f)
+    if (!f) {
+      error = "cannot open the map file";
       return false;
+    }
     _fseeki64(f, 0, SEEK_END);
     data.resize(size_t(_ftelli64(f)));
     _fseeki64(f, 0, SEEK_SET);
     const bool ok = fread(data.data(), 1, data.size(), f) == data.size();
     fclose(f);
+    if (!ok)
+      error = "cannot read the map file";
     return ok && parse();
   }
   // A map read through the file system (e.g. from a workshop addon).
@@ -162,15 +169,19 @@ public:
   }
   bool parse() {
     int32_t version = 0;
-    if (data.size() < 1036 || std::memcmp(data.data(), "VBSP", 4) != 0)
+    if (data.size() < 1036 || std::memcmp(data.data(), "VBSP", 4) != 0) {
+      error = "not a VBSP file";
       return false;
+    }
     std::memcpy(&version, data.data() + 4, 4);
-    if (version < 19 || version > 21)
+    if (version < 19 || version > 21) {
+      error = "BSP version not 19 to 21";
       return false;
+    }
     // lump_t is {fileofs, filelen, version, fourCC} up to v20 (GMod maps).
     // Left 4 Dead 2's v21 puts the version first; other v21 maps (TF2, CS:GO
-    // era) keep the standard order. As NikNaks: a first field of at most 8
-    // in lump 0 (planes) is a version, not a file offset.
+    // era, Portal 2's) keep the standard order. As NikNaks: a first field of
+    // at most 8 in lump 0 (planes) is a version, not a file offset.
     int32_t first;
     std::memcpy(&first, data.data() + 8, 4);
     versionFirst = version == 21 && first >= 0 && first <= 8;
@@ -188,6 +199,7 @@ public:
     return true;
   }
   bool versionFirst = false;
+  const char *error = "not read"; // why parse failed
   std::vector<std::vector<uint8_t>> unpacked; // decoded compressed lumps, by index
   std::vector<int> compressed;                // their indices
   // A lump's place in the file (as stored: compressed or not).
@@ -225,6 +237,7 @@ public:
 // --- Materials (VMT) and texture hashes (VTF) --------------------------------
 struct KeyValues {
   std::string shader;
+  std::string shaderAsWritten; // lowercase, before stockShaderName ("sdk_lightmappedgeneric")
   std::map<std::string, std::string> values;                 // top level, lowercase keys
   std::map<std::string, std::map<std::string, std::string>> blocks; // top-level sub-blocks (patch insert/replace)
 };
@@ -276,6 +289,7 @@ bool parseKeyValues(const std::string &text, KeyValues &out) {
     return false;
   // Mapbase's game shaders ("SDK_LightmappedGeneric") as the stock ones.
   out.shader = lower(game::stockShaderName(plain(tokens[0]).c_str()));
+  out.shaderAsWritten = lower(plain(tokens[0]));
   size_t i = 2;
   // Skips a block whose '{' was consumed.
   auto skip = [&]() {
@@ -342,6 +356,19 @@ bool loadMaterial(const std::string &name, KeyValues &out, int depth = 0) {
     if (condition.size() > 3 && condition[0] == '>' && condition.find("dx") != std::string::npos)
       for (auto &[k, v] : block)
         kv.values[k] = v;
+#if defined(PROXY_GAME_EZ2)
+  // The shader's DX9 fallback block, as the material system merges it
+  // ("SDK_LightmappedGeneric_HDR_DX9", else "..._DX9"; HDR is on): Half-Life
+  // 2's materials keep their normal map and reflection mask there (metal/
+  // citadel_metalwall077a), without which a strong reflection over a dark
+  // base read as polished metal across Entropy : Zero 2's Combine walls.
+  for (const char *suffix : {"_hdr_dx9", "_dx9"})
+    if (const auto block = kv.blocks.find(kv.shaderAsWritten + suffix); block != kv.blocks.end()) {
+      for (auto &[k, v] : block->second)
+        kv.values[k] = v;
+      break;
+    }
+#endif
   if (kv.shader != "patch") {
     out = std::move(kv);
     return true;
@@ -877,6 +904,7 @@ struct World {
   std::string pbrNames; // statistics: each world material's PBR conversion
   CullStatistics cull;
   std::unordered_map<std::string, int> overlayMaterialIndex;
+  uint32_t mirrorMaterials = 0, mirrorDraws = 0; // BSP faces', engine draws' (mirrorMaterial)
   uint32_t overlays = 0, overlayTriangles = 0, waterMaterials = 0, surfaceNormalCount = 0, surfaceNormalAnimated = 0,
            waterDownFaces = 0;
   uint32_t smoothNormals = 0; // corners with authored VRAD normals
@@ -938,6 +966,8 @@ struct World {
   uint32_t lodEntities = 0, lodFaces = 0, lodLeft = 0;
 } g_world;
 bool g_active = false;
+// Why the BSP world is inactive, for the statistics (a literal).
+std::atomic<const char *> g_inactiveReason{"no map loaded yet"};
 
 // The static props' placements for providesProp(), which other threads call
 // (l4d2-rtx's model hook on the game thread while the render thread may be
@@ -1406,6 +1436,16 @@ bool waterNormalsEnabled() {
   return on;
 }
 
+// OPENREMIX_PROXY_MIRRORS=0: reflective glass as the engine draws it (from its
+// reflection render target) instead of a path-traced mirror.
+bool mirrorsEnabled() {
+  static const bool on = [] {
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_MIRRORS", v, sizeof(v)) && v[0] == '0');
+  }();
+  return on;
+}
+
 // Every frame of a VTF's largest mip as RGBA8 (R in the lowest byte), at
 // most 64 MB of them. Else why not: a missing file, a format not read here.
 const char *vtfFrames(const std::string &name, uint32_t &width, uint32_t &height,
@@ -1542,6 +1582,45 @@ void animateSurfaceNormals() {
                normal->width * 4) == REMIXAPI_ERROR_CODE_SUCCESS)
       normal->shown = frame;
   }
+}
+
+// Reflective glass (LightmappedReflective: func_reflective_glass,
+// gm_construct's mirror room). Source draws it from render targets, the view
+// mirrored through it ($reflecttexture) over the one behind it
+// ($refracttexture), by a reflectivity from $minreflectivity to
+// $maxreflectivity ($fresnelpower 0: the maximum everywhere); it has no base
+// texture. Here a smooth metal of its $reflecttint at that reflectivity, the
+// rest see-through: the path tracer reflects the scene itself. Null: the
+// runtime refused it.
+remixapi_MaterialHandle createMirror(KeyValues &kv, const std::string &key) {
+  auto number = [&](const char *k, float fallback) {
+    return kv.values.count(k) ? float(std::atof(kv.values[k].c_str())) : fallback;
+  };
+  float tint[3] = {1, 1, 1};
+  if (kv.values.count("$reflecttint"))
+    parseColor(kv.values["$reflecttint"], tint);
+  const float minimum = std::clamp(number("$minreflectivity", 0), 0.0f, 1.0f);
+  const float maximum = std::clamp(number("$maxreflectivity", 1), minimum, 1.0f);
+  // Head-on (Source's Fresnel term is 0 facing the surface unless its power is 0).
+  const float reflectivity = number("$fresnelpower", 5) <= 0 ? maximum : std::max(minimum, 0.04f);
+  remixapi_MaterialInfoOpaqueEXT opaque = {};
+  opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+  opaque.albedoConstant = {std::clamp(tint[0], 0.0f, 1.0f), std::clamp(tint[1], 0.0f, 1.0f),
+                           std::clamp(tint[2], 0.0f, 1.0f)};
+  opaque.metallicConstant = 1;
+  opaque.roughnessConstant = 0;
+  opaque.opacityConstant = reflectivity < 0.99f ? reflectivity : 1.0f;
+  opaque.alphaTestType = 7; // always passes (a compare op)
+  remixapi_MaterialInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+  info.pNext = &opaque;
+  info.hash = XXH3_64bits(key.data(), key.size()) | 1;
+  info.filterMode = 1;
+  info.wrapModeU = info.wrapModeV = 1;
+  remixapi_MaterialHandle handle = nullptr;
+  if (!g_world.api || g_world.api->CreateMaterial(&info, &handle) != REMIXAPI_ERROR_CODE_SUCCESS)
+    return nullptr;
+  return handle;
 }
 
 // Index into g_world.materials, or -1 for materials left to the engine
@@ -1810,6 +1889,16 @@ int materialByName(const std::string &name, bool brush) {
     g_world.materials.push_back(std::move(m));
     return slot;
   }
+  if (kv.shader == "lightmappedreflective" && mirrorsEnabled()) {
+    m.ref.handle = createMirror(kv, key);
+    if (m.ref.handle) {
+      m.resolved = m.owned = true;
+      ++g_world.mirrorMaterials;
+    }
+    slot = int(g_world.materials.size());
+    g_world.materials.push_back(std::move(m));
+    return slot;
+  }
   if (!kv.shader.empty()) {
     auto flag = [&](const char *k) { return std::atoi(kv.values[k].c_str()) != 0; };
     m.alphaTest = flag("$alphatest");
@@ -1827,6 +1916,14 @@ int materialByName(const std::string &name, bool brush) {
       ++g_world.skippedTranslucent;
       return slot;
     }
+#if defined(PROXY_GAME_EZ2)
+    // A window imposter (dev/dev_windowportal): a cubemap of the room behind,
+    // which the path tracer has itself (see remix_output's onDraw).
+    if (kv.shader.rfind("windowimposter", 0) == 0) {
+      ++g_world.skippedIgnored;
+      return slot;
+    }
+#endif
     m.noCull = flag("$nocull");
     m.pointSample = flag("$pointsample") || flag("$point");
     if (kv.values.count("$alphatestreference")) {
@@ -3594,6 +3691,7 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap, LoadOp
   invalidateBakeScene();
   g_detailMaterial = kDefaultDetailMaterial;
   if (mapName.empty()) {
+    g_inactiveReason = "no map";
     sendPartition(nullptr);
     return false;
   }
@@ -3603,7 +3701,9 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap, LoadOp
   const std::string file = "maps/" + lower(mapName) + ".bsp";
   const std::wstring path = fs::locate(file);
   std::vector<uint8_t> bytes;
-  if (path.empty() ? !(fs::read(file, bytes) && bsp.open(std::move(bytes))) : !bsp.open(path)) {
+  const bool found = !path.empty() || fs::read(file, bytes);
+  if (!found || !(path.empty() ? bsp.open(std::move(bytes)) : bsp.open(path))) {
+    g_inactiveReason = found ? bsp.error : "map file not found in the search paths";
     sendPartition(nullptr);
     return false;
   }
@@ -3620,13 +3720,16 @@ bool load(const remixapi_Interface &api, const std::string &requestedMap, LoadOp
   }
   sendPartition(&bsp);
   parseDetailMaterial(bsp); // with the BSP world or without it
-  if (!enabled)
+  if (!enabled) {
+    g_inactiveReason = "off (OPENREMIX_PROXY_BSP_WORLD=0)";
     return false;
+  }
   const auto [pak, pakBytes] = bsp.lump<uint8_t>(kPakfile);
   fs::setPakfile(pak ? std::vector<uint8_t>(pak, pak + pakBytes) : std::vector<uint8_t>());
   g_world.map = lower(mapName);
   invalidateBakeScene();
   g_active = build(bsp);
+  g_inactiveReason = g_active ? "" : "the map's lumps are missing or of other versions";
   char reflectionHints[8] = {};
   const bool useReflectionHints = !(GetEnvironmentVariableA("OPENREMIX_PROXY_REFLECTION_HINTS", reflectionHints,
                                                             sizeof(reflectionHints)) && reflectionHints[0] == '0');
@@ -4460,12 +4563,33 @@ std::string materialName(uint64_t textureHash) {
   return {};
 }
 
+remixapi_MaterialHandle mirrorMaterial(const char *materialName) {
+  if (!materialName || !mirrorsEnabled())
+    return nullptr;
+  // By name for the process (the materials outlive maps; a handful at most).
+  static std::unordered_map<std::string, remixapi_MaterialHandle> mirrors;
+  const std::string key = lower(materialName);
+  const auto it = mirrors.find(key);
+  if (it != mirrors.end())
+    return it->second;
+  KeyValues kv;
+  remixapi_MaterialHandle handle = nullptr;
+  if (g_world.api && loadMaterial(key, kv) && kv.shader == "lightmappedreflective") {
+    handle = createMirror(kv, "mirror:" + key);
+    g_world.mirrorDraws += handle != nullptr;
+  }
+  // Without the API (no map read yet) the next draw asks again.
+  if (g_world.api)
+    mirrors.emplace(key, handle);
+  return handle;
+}
+
 void dumpStatistics(FILE *out) {
   if (g_partition.result >= 0 || g_partition.clusters)
     fprintf(out, "   visibility partition: %u nodes, %u leaves, %u clusters -> %d\n", g_partition.nodes,
             g_partition.leaves, g_partition.clusters, g_partition.result);
   if (!g_active) {
-    fprintf(out, "   BSP world: inactive\n");
+    fprintf(out, "   BSP world: inactive (%s)\n", g_inactiveReason.load());
     return;
   }
   uint32_t resolved = 0, meshes = 0;
@@ -4478,7 +4602,7 @@ void dumpStatistics(FILE *out) {
           "(meshes %u) | left to the engine: translucent %u, ignored %u | rtx.conf-ignored brush materials kept %u | sky camera %d | corners with smoothed normals %u\n"
           "   BSP static props: %zu placements (%u in the 3D skybox), %zu models (%u failed), %u parts | overlays %u "
           "(%u triangles, %zu groups) | func_lod brushes %u (%u faces; left to the engine %u) | water materials %u | surface normal textures %u (animated %u; "
-          "water optional via OPENREMIX_PROXY_WATER_NORMALS), water downward faces left out %u%s%s\n",
+          "water optional via OPENREMIX_PROXY_WATER_NORMALS), water downward faces left out %u%s%s | mirrors (reflective glass) %u, of brush entities %u%s\n",
 
           g_world.map.c_str(), g_world.faces, g_world.displacements, g_world.skyFaces, g_world.triangles, resolved,
           g_world.materials.size(), g_world.groups.size(), meshes, g_world.skippedTranslucent, g_world.skippedIgnored, g_world.keptIgnored,
@@ -4487,7 +4611,8 @@ void dumpStatistics(FILE *out) {
           g_world.overlayGroups.size(), g_world.lodEntities, g_world.lodFaces, g_world.lodLeft, g_world.waterMaterials, g_world.surfaceNormalCount, g_world.surfaceNormalAnimated,
 
           g_world.waterDownFaces,
-          g_world.surfaceNormalFailure.empty() ? "" : " | not loaded: ", g_world.surfaceNormalFailure.c_str());
+          g_world.surfaceNormalFailure.empty() ? "" : " | not loaded: ", g_world.surfaceNormalFailure.c_str(),
+          g_world.mirrorMaterials, g_world.mirrorDraws, mirrorsEnabled() ? "" : " (off: OPENREMIX_PROXY_MIRRORS=0)");
   {
     const auto &l = g_world.layers;
     uint32_t meshes = 0, waiting = 0;

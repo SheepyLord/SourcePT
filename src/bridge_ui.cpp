@@ -1,4 +1,4 @@
-// The x86 games (Left 4 Dead 2, Half-Life 2 RTX): the runtime's own UI
+// The x86 games (Left 4 Dead 2, Half-Life 2 RTX, Portal 2): the runtime's own UI
 // (remix_ui.h). OpenRemix runs in the bridge's 64-bit host process, its
 // window and SDL input there: F12 on the game window toggles the UI
 // (SetUIState ADVANCED / NONE), and while it is open the game window's input
@@ -6,14 +6,15 @@
 // instead of the game, as l4d2-rtx's imgui.cpp did. Key-ups still reach the
 // game (no stuck keys); raw mouse input (WM_INPUT) does not (it would turn the
 // camera). The engine shows the OS cursor meanwhile
-// (ISurface::SetCursorAlwaysVisible, game.h).
+// (ISurface::SetCursorAlwaysVisible, game.h; Portal 2: an input context of
+// the proxy's on top of the input stack, which also stops the mouse look).
 // The library loader (remixapi_lib_*) is remix_output's.
 #define REMIX_WINAPI_NO_LIBRARY_LOADER
 #include "remix_ui.h"
 
 #include "game.h"
-#ifdef PROXY_GAME_L4D2
-#include "l4d2.h"
+#ifdef PROXY_X86_ENGINE
+#include "x86_engine.h"
 #endif
 #include "pe_module.h"
 
@@ -56,14 +57,92 @@ void inject(Input type, uint32_t code, bool down, int32_t x = 0, int32_t y = 0, 
   }
 }
 
+#ifdef PROXY_GAME_PORTAL2
+// Portal 2 (game.h): the proxy's input context, enabled while the UI is open.
+// Pushed at the first open, when the engine's, the surface's and the client's
+// are all there; one pushed since (above it) gets a new context on top (the
+// old one stays, disabled). Closing puts the cursor at the window's centre
+// first: the client's mouse look reads the cursor's distance from there.
+// Main thread (the window's messages).
+void *g_inputStack = nullptr;
+void *g_context = nullptr;
+const char *g_cursorState = "not looked up";
+unsigned g_contexts = 0;
+
+bool inputStack() {
+  static const bool found = [] {
+    using proxy::pe::Module;
+    Module input;
+    void *stack = proxy::pe::createInterface("inputsystem.dll", proxy::game::kInputStackInterface);
+    if (!input.open("inputsystem.dll") || !stack) {
+      g_cursorState = "no input stack";
+      return false;
+    }
+    void **vtable = *static_cast<void ***>(stack);
+    // The slots' first bytes (CInputStackSystem, inputsystem.dll 0x1230,
+    // 0x1190, 0x1070 in the build this was written for).
+    const struct {
+      unsigned slot;
+      const char *bytes;
+    } expected[] = {
+        {proxy::game::kSlotPushInputContext, "53 56 57 6A 08 8B D9 E8"},       // push 8: new InputContext_t
+        {proxy::game::kSlotEnableInputContext, "55 8B EC 56 57 8B 7D 08 8B F1 85 FF"},
+        {proxy::game::kSlotIsTopmostEnabledContext, "55 8B EC 56 8B 75 08 85 F6 74"},
+    };
+    for (const auto &e : expected)
+      if (!input.inCode(vtable[e.slot]) ||
+          !proxy::pe::bytesAt(input, reinterpret_cast<uintptr_t>(vtable[e.slot]) - input.base, e.bytes)) {
+        g_cursorState = "input stack differs";
+        return false;
+      }
+    g_inputStack = stack;
+    g_cursorState = "ok";
+    return true;
+  }();
+  return found;
+}
+
+void setCursorVisible(bool visible) {
+  if (!inputStack())
+    return;
+  void **vtable = *static_cast<void ***>(g_inputStack);
+  using PushFn = void *(PROXY_THISCALL *)(void *);
+  using EnableFn = void(PROXY_THISCALL *)(void *, void *, bool);
+  using TopmostFn = bool(PROXY_THISCALL *)(void *, void *);
+  const auto enable = reinterpret_cast<EnableFn>(vtable[proxy::game::kSlotEnableInputContext]);
+  if (visible) {
+    if (g_context) {
+      enable(g_inputStack, g_context, true);
+      if (reinterpret_cast<TopmostFn>(vtable[proxy::game::kSlotIsTopmostEnabledContext])(g_inputStack, g_context))
+        return;
+      enable(g_inputStack, g_context, false); // another context above it
+    }
+    g_context = reinterpret_cast<PushFn>(vtable[proxy::game::kSlotPushInputContext])(g_inputStack);
+    g_contexts += g_context != nullptr;
+    return;
+  }
+  if (!g_context)
+    return;
+  RECT client;
+  if (g_window && GetClientRect(g_window, &client)) {
+    POINT centre{(client.right - client.left) / 2, (client.bottom - client.top) / 2};
+    if (ClientToScreen(g_window, &centre))
+      SetCursorPos(centre.x, centre.y);
+  }
+  enable(g_inputStack, g_context, false);
+}
+#else
 // ISurface::SetCursorAlwaysVisible(bool) (game.h: L4D2's VGUI_Surface031
 // slot 49, Half-Life 2 RTX's VGUI_Surface030 slot 52).
 void setCursorVisible(bool visible) {
   static void *surface = proxy::pe::createInterface("vguimatsurface.dll", proxy::game::kSurfaceInterface);
-  if (surface)
-    reinterpret_cast<void(PROXY_THISCALL *)(void *, bool)>(
-        (*static_cast<void ***>(surface))[proxy::game::kSlotSetCursorAlwaysVisible])(surface, visible);
+  if (!surface)
+    return;
+  void **vtable = *static_cast<void ***>(surface);
+  reinterpret_cast<void(PROXY_THISCALL *)(void *, bool)>(vtable[proxy::game::kSlotSetCursorAlwaysVisible])(surface,
+                                                                                                           visible);
 }
+#endif
 
 void setActive(bool active) {
   g_active = active;
@@ -114,8 +193,8 @@ bool forward(UINT message, WPARAM w, LPARAM l) {
 } // namespace
 
 void install(HWND window, remixapi_Interface *api, WNDPROC) {
-#ifdef PROXY_GAME_L4D2
-  proxy::l4d2::setGameWindow(window);
+#ifdef PROXY_X86_ENGINE
+  proxy::x86::setGameWindow(window);
 #endif
   if (g_previous || !window || !api || !api->SetUIState)
     return;
@@ -150,6 +229,9 @@ void dumpStatistics(FILE *out) {
   std::fprintf(out, "   Remix UI (F12, bridge host): %s; open %d, toggles %u, events forwarded %llu, input %s\n",
                g_status, int(g_active.load()), g_toggles.load(),
                static_cast<unsigned long long>(g_forwarded.load()), g_injectState);
+#ifdef PROXY_GAME_PORTAL2
+  std::fprintf(out, "   cursor: input stack %s, contexts pushed %u\n", g_cursorState, g_contexts);
+#endif
 }
 
 } // namespace proxy::remix_ui

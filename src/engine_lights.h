@@ -14,14 +14,20 @@
 // Known limit: entity-driven lights (gmod_light, lamps) stop when their
 // entity goes dormant outside the server's PVS for the player; the client
 // then stops making them, and holding the last state would be stale.
+//
+// GMod (x64) and Portal 2 (x86, the projected textures only: its
+// env_projectedtextures; engine_lights.cpp has each build's slots). Left 4
+// Dead 2 and Half-Life 2 RTX: off (gmod_only_stubs.cpp).
 namespace proxy::engine_lights {
 
 // Resolves the engine interfaces and installs the shadow manager hooks
-// (main thread, engine.dll loaded). False when unavailable.
+// (engine.dll loaded; GMod: the main thread, Portal 2: x86_engine's install
+// from Present). False when unavailable.
 bool install();
 
-// Once per main view on the main thread (the DrawWorldLists hook): samples
-// the engine's light state for the renderer.
+// Once per view on the main thread (the DrawWorldLists hook; GMod's
+// engine_hooks.cpp, Portal 2's x86_engine.cpp): samples the engine's light
+// state for the renderer.
 void sample();
 
 // A light in the engine's LightDesc_t terms, as bsp::Light (type 1 point,

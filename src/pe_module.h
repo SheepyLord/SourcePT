@@ -54,6 +54,13 @@ bool writeCode(void *at, const void *bytes, size_t n);
 // A relative jump (E9) at `at` to `target`, `n` >= 5 bytes (the rest nops).
 bool writeJump(void *at, const void *target, size_t n);
 
+// A networked variable's offset in its class (client.dll's receive tables,
+// the same layout in L4D2 and Portal 2): RecvTable {props, count, decoder,
+// name}; RecvProp (0x3C bytes) {name, .., data table +0x28, offset +0x2C,
+// ..}. Depth first, base classes (and other nested tables) included; -1 when
+// not found.
+int findNetProp(const void *recvTable, const char *name);
+
 // Environment: OPENREMIX_PROXY_<name>; `fallback` when unset.
 bool envFlag(const char *name, bool fallback);
 float envFloat(const char *name, float fallback);
