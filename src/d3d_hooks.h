@@ -23,6 +23,8 @@ bool install(HMODULE module);
 // Whether render target 0 is the back buffer (render thread): the views the
 // proxy takes draws from.
 bool backBufferBound();
+// The device's back buffer size. False before a device exists.
+bool backBufferSize(uint32_t &width, uint32_t &height);
 // The render-target texture render target 0 is (nullptr: the back buffer or
 // another surface). Render thread.
 const void *boundTargetTexture();

@@ -307,6 +307,63 @@ void PROXY_THISCALL shaderApiSetPIXMarker(proxy::Wrapper *self, unsigned long co
   proxy::original<Fn>(self, proxy::game::kSlotSetPIXMarker)(self->real, color, name);
 }
 
+#ifdef PROXY_GAME_GMOD
+// IShaderAPI slot 158: ReadPixels of a rect of render target 0. Engine
+// screenshots (the camera tool's "jpeg", "screenshot") and Lua captures read
+// the back buffer through it, which OpenRemix never draws (and from which the
+// shader API reads nothing under the proxy: the files came out black). Reads
+// of the back buffer get the runtime's last presented frame instead.
+struct ReadRect {
+  int x, y, width, height;
+};
+void PROXY_THISCALL shaderApiReadPixels(proxy::Wrapper *self, ReadRect *src, ReadRect *dst, unsigned char *data,
+                                        int format, int stride) {
+  using Fn = void(PROXY_THISCALL *)(void *, ReadRect *, ReadRect *, unsigned char *, int, int);
+  proxy::original<Fn>(self, proxy::game::kSlotReadPixels)(self->real, src, dst, data, format, stride);
+  uint32_t width = 0, height = 0;
+  if (!data || !proxy::d3d::backBufferBound() || !proxy::d3d::backBufferSize(width, height))
+    return;
+  // Each format's bytes as indices into B, G, R, A (4: opaque padding).
+  struct Layout {
+    int format, bytes;
+    int order[4];
+  };
+  static constexpr Layout kLayouts[] = {
+      {0, 4, {2, 1, 0, 3}},  // RGBA8888
+      {1, 4, {3, 0, 1, 2}},  // ABGR8888
+      {2, 3, {2, 1, 0, 0}},  // RGB888
+      {3, 3, {0, 1, 2, 0}},  // BGR888
+      {11, 4, {3, 2, 1, 0}}, // ARGB8888
+      {12, 4, {0, 1, 2, 3}}, // BGRA8888
+      {16, 4, {0, 1, 2, 4}}, // BGRX8888
+  };
+  const Layout *layout = nullptr;
+  for (const auto &l : kLayouts)
+    if (l.format == format)
+      layout = &l;
+  if (!layout)
+    return;
+  const ReadRect from = src ? *src : ReadRect{0, 0, int(width), int(height)};
+  const ReadRect to = dst ? *dst : ReadRect{0, 0, from.width, from.height};
+  if (from.width <= 0 || from.height <= 0 || to.width <= 0 || to.height <= 0 || to.x < 0 || to.y < 0)
+    return;
+  const auto *image = proxy::remix::presentedImage(width, height);
+  if (!image)
+    return;
+  const size_t pitch = stride > 0 ? size_t(stride) : size_t(to.width) * layout->bytes;
+  for (int y = 0; y < to.height; ++y) {
+    const int sy = std::clamp(from.y + int(int64_t(y) * from.height / to.height), 0, int(height) - 1);
+    unsigned char *row = data + size_t(to.y + y) * pitch + size_t(to.x) * layout->bytes;
+    for (int x = 0; x < to.width; ++x) {
+      const int sx = std::clamp(from.x + int(int64_t(x) * from.width / to.width), 0, int(width) - 1);
+      const uint8_t *bgra = image->data() + (size_t(sy) * width + sx) * 4;
+      for (int c = 0; c < layout->bytes; ++c)
+        row[x * layout->bytes + c] = layout->order[c] == 4 ? 255 : bgra[layout->order[c]];
+    }
+  }
+}
+#endif
+
 struct KnownInterface {
   const char *name;
   void (*setup)(proxy::Kind *);
@@ -333,6 +390,9 @@ const KnownInterface kKnown[] = {
 #endif
        proxy::setHook(k, proxy::game::kSlotSetLight, reinterpret_cast<void *>(&shaderApiSetLight));
        proxy::setHook(k, proxy::game::kSlotSetPIXMarker, reinterpret_cast<void *>(&shaderApiSetPIXMarker));
+#ifdef PROXY_GAME_GMOD
+       proxy::setHook(k, proxy::game::kSlotReadPixels, reinterpret_cast<void *>(&shaderApiReadPixels));
+#endif
        if (proxy::engine_materials::install(k->realVtbl))
          proxy::setHook(k, proxy::game::kSlotBind, reinterpret_cast<void *>(&shaderApiBind));
      }},

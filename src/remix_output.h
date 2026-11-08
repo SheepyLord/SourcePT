@@ -126,6 +126,12 @@ bool enabled();
 bool texturePixels(const void *texture, uint32_t &width, uint32_t &height, uint32_t &version, bool &bgra,
                    std::vector<uint8_t> *pixels);
 
+// The runtime's last presented frame as 8-bit BGRA (alpha 255), scaled to
+// width x height: what the back buffer would hold, for the engine's
+// screenshots. Read back once per presented frame and size. Null: the
+// runtime cannot provide it.
+const std::vector<uint8_t> *presentedImage(uint32_t width, uint32_t height);
+
 // Called from IDirect3D9::CreateDevice. May redirect presentation to a hidden
 // window; `gameWindow` receives Remix's output.
 void onCreateDevice(HWND gameWindow, D3DPRESENT_PARAMETERS *pp);

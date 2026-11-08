@@ -10085,6 +10085,43 @@ extern "C" __declspec(dllexport) int __cdecl openremix_set_legacy_variable(const
 }
 
 namespace proxy::remix {
+const std::vector<uint8_t> *presentedImage(uint32_t width, uint32_t height) {
+  static const auto read = reinterpret_cast<PFN_remixapi_ReadPresentedImageEXT>(
+      GetProcAddress(game::runtimeModule(), "remixapi_ReadPresentedImageEXT"));
+  static const auto count = reinterpret_cast<PFN_remixapi_GetPresentationCount>(
+      GetProcAddress(game::runtimeModule(), "remixapi_GetPresentationCount"));
+  static struct {
+    std::mutex lock;
+    std::vector<uint8_t> pixels;
+    uint32_t width = 0, height = 0;
+    uint64_t presented = ~0ull;
+  } cache;
+  if (!read || !width || !height)
+    return nullptr;
+  std::lock_guard<std::mutex> guard(cache.lock);
+  uint64_t presented = ~0ull;
+  if (!count || count(&presented) != REMIXAPI_ERROR_CODE_SUCCESS)
+    presented = ~0ull; // unknown: read every time
+  if (presented != ~0ull && presented == cache.presented && width == cache.width && height == cache.height)
+    return &cache.pixels;
+  cache.pixels.resize(size_t(width) * height * 4);
+  remixapi_PresentedImageEXT image = {};
+  image.width = width;
+  image.height = height;
+  image.rowPitch = width * 4;
+  image.pixels = cache.pixels.data();
+  const auto result = read(&image);
+  if (result != REMIXAPI_ERROR_CODE_SUCCESS) {
+    diag::stage("OpenRemix: presented image readback failed (%d)", int(result));
+    cache.presented = ~0ull;
+    return nullptr;
+  }
+  cache.width = width;
+  cache.height = height;
+  cache.presented = presented;
+  return &cache.pixels;
+}
+
 bool texturePixels(const void *texture, uint32_t &width, uint32_t &height, uint32_t &version, bool &bgra,
                    std::vector<uint8_t> *pixels) {
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);

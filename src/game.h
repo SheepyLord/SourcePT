@@ -78,6 +78,10 @@ constexpr bool kSetLightsArray = false;
 constexpr unsigned kSlotBind = 114;
 // void SetPIXMarker(unsigned long color, const char *name).
 constexpr unsigned kSlotSetPIXMarker = 216;
+// void ReadPixels(Rect_t *src, Rect_t *dst, unsigned char *data, ImageFormat
+// format, int stride) (slots 223 and 224, the two ReadPixels SDK 2013 lists,
+// are empty stubs in this build).
+constexpr unsigned kSlotReadPixels = 158;
 // void GetMatrix(MaterialMatrixMode_t, float *dst).
 constexpr unsigned kSlotGetMatrix = 12;
 // int GetCurrentNumBones() const.

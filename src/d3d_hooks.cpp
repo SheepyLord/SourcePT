@@ -2489,6 +2489,14 @@ bool install(HMODULE module) {
 }
 
 bool backBufferBound() { return g_renderTarget0 == g_backBuffer; }
+bool backBufferSize(uint32_t &width, uint32_t &height) {
+  D3DSURFACE_DESC desc = {};
+  if (!g_backBuffer || FAILED(g_backBuffer->GetDesc(&desc)))
+    return false;
+  width = desc.Width;
+  height = desc.Height;
+  return true;
+}
 const void *boundTargetTexture() {
   return g_renderTargetTexture && g_targetTextures.count(g_renderTargetTexture) ? g_renderTargetTexture : nullptr;
 }
