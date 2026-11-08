@@ -97,6 +97,7 @@ struct Stats {
       emissiveMaskNotUploaded{0}, emissiveCreated{0}, emissiveFailed{0}, emissiveEvicted{0};
   // PBR conversions (pbr_rules): draws with one, and why some stayed diffuse.
   std::atomic<uint32_t> underwaterFrames{0}, refractOverlaysDropped{0}, windowImpostersDropped{0};
+  std::atomic<uint32_t> glowDraws{0}, glowSources{0};
   std::atomic<uint32_t> pbrDraws{0}, pbrNormalDraws{0}, pbrMapDraws{0}, pbrMetalDraws{0}, pbrNotBase{0}, pbrMapsMissing{0}, pbrCreated{0};
   // Flexed draws (facial animation, see flexScale): rebuilt this frame, flex
   // streams whose scale was 0, and flex streams whose vertex shader's
@@ -1887,6 +1888,10 @@ struct UiLayer {
   uint32_t value;
 };
 std::vector<UiLayer> g_uiLayers;
+// An entity glow's coloured draw being taken (see onDraw): its colour and
+// opacity. Its groups' value is outside the stencil's range.
+const float *g_glowHalo = nullptr;
+constexpr uint32_t kGlowGroup = 0x100;
 #endif
 
 // Halo groups need their fill (the colour); the other groups that are both
@@ -5675,6 +5680,29 @@ void onDraw(const Draw &d) {
   }
   if (d.stencil || d.texture0Target || d.target)
     census(d);
+#if defined(PROXY_GAME_EZ2)
+  // Entity glows (CGlowObjectManager: Entropy : Zero 2's squad outlines). The
+  // glowing models are drawn with dev/glow_color invisibly into the stencil
+  // (alpha 0), then in the glow colour (c1: colour, opacity) into
+  // _rt_FullFrameFB, which dev/halo_add_to_screen lays outside the marked
+  // silhouettes. As the runtime's halos: the coloured draws are the sources
+  // (g_glowHalo), the rest is dropped.
+  if (const char *name = engine_materials::currentName();
+      !g_glowHalo && name &&
+      (std::strcmp(name, "dev/glow_color") == 0 || std::strcmp(name, "dev/halo_add_to_screen") == 0)) {
+    if (name[4] == 'g' && !d.mainTarget && !d.stencil && d.psConstants && d.psConstants[1 * 4 + 3] > 0.01f) {
+      g_glowHalo = d.psConstants + 1 * 4;
+      Draw source = d;
+      source.mainTarget = true;
+      source.target = nullptr;
+      source.blend = false;
+      onDraw(source);
+      g_glowHalo = nullptr;
+    }
+    ++g_stats.glowDraws;
+    return;
+  }
+#endif
   // Flat draws into render-target textures or sampling them are the engine's
   // screen-space passes (effects): replayed by the runtime, not drawn here.
   // So are the draws of screenspace_general materials (addons' own shaders)
@@ -6812,6 +6840,29 @@ void onDraw(const Draw &d) {
   }
   if (!stencilRole(d, inst))
     return;
+#if defined(PROXY_GAME_EZ2)
+  if (g_glowHalo) {
+    // A glow's source (see onDraw): one halo group per colour, seen through
+    // walls as the glow image is drawn without a depth test.
+    float color[3];
+    for (int c = 0; c < 3; ++c)
+      color[c] = std::clamp(g_glowHalo[c] * g_glowHalo[3], 0.0f, 1.0f);
+    auto group = std::find_if(g_stencilGroups.begin(), g_stencilGroups.end(), [&](const StencilGroup &g) {
+      return g.value == kGlowGroup && std::equal(color, color + 3, g.color);
+    });
+    if (group == g_stencilGroups.end()) {
+      group = g_stencilGroups.emplace(g_stencilGroups.end());
+      group->value = kGlowGroup;
+      group->halo = group->fill = group->ignoreZ = true;
+      group->passes = 1;
+      std::copy_n(color, 3, group->color);
+    }
+    ++group->sources;
+    ++g_stats.glowSources;
+    inst.stencilGroup = int(group - g_stencilGroups.begin());
+    inst.stencilRole = kStencilSource;
+  }
+#endif
   // D3DFILL_WIREFRAME (the Wireframe shader; any material with $wireframe):
   // the edges of its triangles, unlit, in its colour (texture x modulation x
   // vertex colour, as the draw's), with the draw's depth state. Not traced: a
@@ -9286,9 +9337,11 @@ void dumpStatistics(FILE *out) {
             g_stats.emissiveMaskNoHash.exchange(0) / f, g_stats.emissiveMaskNotUploaded.exchange(0) / f);
     fprintf(out,
             "   under water (bsp water leaves at the eye; OPENREMIX_PROXY_UNDERWATER): %.0f%% of frames | flat Refract "
-            "screen effects dropped per frame %.1f | window imposters and faded-out brushes dropped %.1f\n",
+            "screen effects dropped per frame %.1f | window imposters and faded-out brushes dropped %.1f | entity glow "
+            "draws %.1f, taken as halo sources %.1f\n",
             100.0 * g_stats.underwaterFrames.exchange(0) / std::max(1.0, f), g_stats.refractOverlaysDropped.exchange(0) / f,
-            g_stats.windowImpostersDropped.exchange(0) / f);
+            g_stats.windowImpostersDropped.exchange(0) / f, g_stats.glowDraws.exchange(0) / f,
+            g_stats.glowSources.exchange(0) / f);
     fprintf(out,
             "   PBR conversions (pbr_rules; OPENREMIX_PROXY_PBR=%d) per frame: %.1f draws, with a normal map %.1f, a "
             "roughness map %.1f, a metal map %.1f | stayed diffuse: not the material's base texture %.1f | a map not uploaded %.1f | "
