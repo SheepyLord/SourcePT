@@ -3774,6 +3774,8 @@ std::string materialName(uint64_t textureHash) {
   return {};
 }
 
+bool mirrorsOn() { return mirrorsEnabled(); }
+
 remixapi_MaterialHandle mirrorMaterial(const char *materialName) {
   if (!materialName || !mirrorsEnabled())
     return nullptr;

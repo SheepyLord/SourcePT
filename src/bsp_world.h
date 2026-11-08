@@ -118,6 +118,8 @@ std::string materialName(uint64_t textureHash);
 // material system's name; null for other materials, before a map is read or
 // with OPENREMIX_PROXY_MIRRORS=0. Render thread.
 remixapi_MaterialHandle mirrorMaterial(const char *materialName);
+// Whether reflective glass is path traced (OPENREMIX_PROXY_MIRRORS, default on).
+bool mirrorsOn();
 
 // Whether `materialName` (as the material system names it, lower case) is the
 // map's detail sprite material: worldspawn's "detailmaterial", else the

@@ -8,6 +8,7 @@
 #include "game.h"
 #include "engine_lights.h"
 #include "engine_materials.h"
+#include "engine_mirrors.h"
 #include "engine_nocull.h"
 #include "engine_patches.h"
 #include "engine_shadows.h"
@@ -1011,6 +1012,7 @@ DWORD WINAPI statisticsThread(void *) {
       proxy::engine_nocull::dumpStatistics(f);
       proxy::engine_lights::dumpStatistics(f);
       proxy::engine_shadows::dumpStatistics(f);
+      proxy::engine_mirrors::dumpStatistics(f);
 #ifdef PROXY_X86_ENGINE
       proxy::x86::dumpEngineStatistics(f);
 #endif

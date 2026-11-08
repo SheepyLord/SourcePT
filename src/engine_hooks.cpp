@@ -1,5 +1,6 @@
 #include "engine_hooks.h"
 #include "engine_lights.h"
+#include "engine_mirrors.h"
 #include "engine_nocull.h"
 #include "engine_patches.h"
 #include "engine_shadows.h"
@@ -179,6 +180,7 @@ bool install() {
     g_mainThread = GetCurrentThreadId();
   if (done) {
     applyTextureDetail();
+    engine_mirrors::install();
     return true;
   }
   // OPENREMIX_PROXY_ENGINE_HOOKS=0 leaves the engine untouched.
@@ -199,6 +201,7 @@ bool install() {
   engine_nocull::install(g_materials, renderView);
   engine_lights::install();
   engine_shadows::install();
+  engine_mirrors::install();
   done = true;
   return true;
 }
