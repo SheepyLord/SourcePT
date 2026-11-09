@@ -1,6 +1,8 @@
 """Install a verified runtime bundle into a separate, persistent GMod test host.
 
-Settings are local JSON: source, target, proxy, package, native_repo; optional mods, bake_cache.
+Settings are local JSON with source, target, proxy, package, native_revision
+and wrapper_revision. The revisions identify the selected binaries. Optional
+settings are mods and bake_cache.
 The initial target may be absent or contain only RTXLauncher bootstrap files.
 Updates preserve game content, user configuration, mods and bake caches.
 """
@@ -10,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -50,16 +53,17 @@ def idle(target):
             raise RuntimeError(f'Close the test installation before updating: {executable}')
 
 
-def revision(repo):
-    return subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
-
-
 def deploy(settings_path, verify=False):
     settings = json.loads(settings_path.read_text(encoding='utf-8-sig'))
     paths = {name: Path(settings[name]).resolve() for name in
-             ('source', 'target', 'proxy', 'package', 'native_repo')}
+             ('source', 'target', 'proxy', 'package')}
     source, target = paths['source'], paths['target']
-    proxy, package, native = paths['proxy'], paths['package'], paths['native_repo']
+    proxy, package = paths['proxy'], paths['package']
+    native_revision = settings.get('native_revision')
+    wrapper_revision = settings.get('wrapper_revision')
+    for name, revision in (('native_revision', native_revision), ('wrapper_revision', wrapper_revision)):
+        if not isinstance(revision, str) or not re.fullmatch(r'[0-9a-f]{40}', revision):
+            raise ValueError(f'{name} must be the full commit ID of the selected build')
     wrapper = Path(__file__).resolve().parents[1]
     if target == source or source in target.parents or target in source.parents:
         raise ValueError('Test host must be separate from the source installation')
@@ -78,13 +82,17 @@ def deploy(settings_path, verify=False):
         child(target, relative)
     if verify:
         installed = json.loads((target / 'openremix-install.json').read_text())
+        if (installed['nativeSourceHead'], installed['wrapperSourceHead']) != (native_revision, wrapper_revision):
+            raise ValueError('Installed revisions differ from the selected build')
+        for asset, relative in copies:
+            if installed['files'].get(relative.as_posix()) != digest(asset):
+                raise ValueError(f'Installed receipt differs from selected build: {relative}')
         for relative, expected in installed['files'].items():
             if digest(child(target, relative)) != expected:
                 raise ValueError(f'Installed hash mismatch: {relative}')
         print(f'Verified {len(installed["files"])} installed files: {target}')
         return
     idle(target)
-    native_revision, wrapper_revision = revision(native), revision(wrapper)
     if not (target / 'stage-manifest.json').exists():
         prepare(source, target, proxy, package / 'remix.dll', package / 'SDL3_shared.dll',
                 launcher_only=True)
