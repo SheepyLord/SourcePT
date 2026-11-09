@@ -1703,9 +1703,22 @@ int materialByName(const std::string &name, bool brush) {
     }();
     // The fog colour is what passes at the measurement distance: a distance
     // at which 5% of light (by luminance) is left at $fogend.
+    // What lies behind the surface fades to the fog colour over $fogend, as
+    // Source's water fog has it (remixapi_MaterialTranslucentFogEXT), instead
+    // of being absorbed by the fog colour (its hue strips the rest from even
+    // shallow water: gm_construct's {7 58 66} turned the sand under it cyan).
+    // OPENREMIX_PROXY_WATER_FOG=0: absorbed, as before.
+    static const bool fogWater = [] {
+      char v[8] = {};
+      return !(GetEnvironmentVariableA("OPENREMIX_PROXY_WATER_FOG", v, sizeof(v)) && v[0] == '0');
+    }();
+    remixapi_MaterialTranslucentFogEXT fade = {};
+    fade.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_TRANSLUCENT_FOG_EXT;
+    fade.pNext = opaque.pNext;
+    fade.fogEnd = std::max(fogEnd, 1.0f);
     remixapi_MaterialInfoTranslucentEXT translucent = {};
     translucent.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_TRANSLUCENT_EXT;
-    translucent.pNext = opaque.pNext;
+    translucent.pNext = fogWater ? static_cast<void *>(&fade) : opaque.pNext;
     translucent.refractiveIndex = 1.333f;
     translucent.transmittanceColor = opaque.albedoConstant;
     {
