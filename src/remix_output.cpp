@@ -15,8 +15,6 @@
 #include "device_window.h"
 #include "dxvk_hash.h"
 #include "engine_lights.h"
-#include "engine_nocull.h"
-#include "engine_visibility.h"
 #include "engine_materials.h"
 #include "fixed_function.h"
 #include "game.h"
@@ -7640,20 +7638,6 @@ void flushPendingTextures();
 }
 
 void onPresent() {
-  {
-    static auto backend = reinterpret_cast<PFN_remixapi_GetBackendCapabilitiesEXT>(
-        GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetBackendCapabilitiesEXT"));
-    static auto baking = reinterpret_cast<PFN_remixapi_GetBakeStatisticsEXT>(
-        GetProcAddress(GetModuleHandleW(L"remix.dll"), "remixapi_GetBakeStatisticsEXT"));
-    remixapi_BackendCapabilitiesEXT capabilities{};
-    capabilities.structSize = sizeof(capabilities);
-    remixapi_BakeStatisticsEXT bake{};
-    bake.structSize = sizeof(bake);
-    const bool known = backend && baking && backend(&capabilities) == REMIXAPI_ERROR_CODE_SUCCESS &&
-                       baking(&bake) == REMIXAPI_ERROR_CODE_SUCCESS;
-    engine_nocull::retainOffscreen(!known ||
-        proxy::retainOffscreenGeometry(capabilities.activeBackend, capabilities.requestedBackend, bake));
-  }
   sampleGpuPasses();
   if (!g_ready)
     return;

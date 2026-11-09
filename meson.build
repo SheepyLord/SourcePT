@@ -222,11 +222,6 @@ device_window_test = executable('device-window-test', 'tests/device_window.cpp',
   link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
 test('Game window ownership across redirected device creation', device_window_test)
 
-engine_visibility_test = executable('engine-visibility-test', 'tests/engine_visibility.cpp',
-  include_directories: include_directories('src', remix_inc),
-  link_args: ['-static', '-static-libgcc', '-static-libstdc++'])
-test('Engine culling follows bake publication and backend transitions', engine_visibility_test)
-
 remix_ui_test = executable('remix-ui-test', 'tests/remix_ui.cpp', 'src/remix_ui.cpp',
   include_directories: include_directories('src', remix_inc, sdl_inc),
   dependencies: meson.get_compiler('cpp').find_library('user32'),

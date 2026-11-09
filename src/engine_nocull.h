@@ -21,10 +21,6 @@ namespace proxy::engine_nocull {
 // IVRenderView. False when disabled.
 bool install(void *materials, void *renderView);
 
-// Atomically change the per-view policy; executable bytes still change only
-// on the engine thread around BuildWorldLists, never on the presenting thread.
-void retainOffscreen(bool retain);
-
 void dumpStatistics(FILE *out);
 
 } // namespace proxy::engine_nocull

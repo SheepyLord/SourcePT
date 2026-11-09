@@ -77,7 +77,6 @@ struct Module {
   template <typename T> T *at(uintptr_t rva) const { return reinterpret_cast<T *>(base + rva); }
 };
 Module g_engine, g_client, g_materialSystem;
-std::atomic<bool> g_retainOffscreen{true};
 
 // "48 8B C3": hex bytes, space separated.
 bool bytesAt(const Module &module, uintptr_t rva, const char *bytes) {
@@ -372,7 +371,7 @@ uint32_t g_cap = 4096;
 
 bool building() {
   const DWORD thread = g_buildThread.load(std::memory_order_relaxed);
-  return g_retainOffscreen.load(std::memory_order_relaxed) && thread && thread == GetCurrentThreadId();
+  return thread && thread == GetCurrentThreadId();
 }
 
 // Whether one more renderable the engine would cull may stay.
@@ -424,7 +423,7 @@ constexpr int kGroups = 14;
 
 void buildRenderablesList(void *self, const uint8_t *info) {
   const bool shadowDepth = !(info[kInfoFlags] & kTranslucentObjects);
-  if (!g_retainOffscreen.load(std::memory_order_relaxed) || shadowDepth || !backBufferView()) {
+  if (shadowDepth || !backBufferView()) {
     ++(shadowDepth ? g_stats.buildsShadow : g_stats.buildsOffTarget);
     g_buildThread.store(0, std::memory_order_relaxed);
     g_buildRenderablesList(self, info);
@@ -532,7 +531,7 @@ void openremix_buildWorldListsBegin(int shadowDepth) {
   }
   // Left set only when the engine left BuildRenderablesList without returning.
   g_buildThread.store(0, std::memory_order_relaxed);
-  const bool keep = g_retainOffscreen.load(std::memory_order_relaxed) && !(shadowDepth & 0xff) && backBufferView();
+  const bool keep = !(shadowDepth & 0xff) && backBufferView();
   ++((shadowDepth & 0xff) ? g_stats.worldShadow : keep ? g_stats.worldKept : g_stats.worldOffTarget);
   flip(g_worldFrustum, keep);
   flipAreaFlow(keep);
@@ -675,8 +674,6 @@ bool install(void *materials, void *renderView) {
 }
 
 void dumpStatistics(FILE *out) {
-  fprintf(out, "   geometry collection: %s\n", g_retainOffscreen.load(std::memory_order_relaxed)
-      ? "retain off-screen shadow casters" : "normal engine culling");
   fprintf(out, "== Engine no-cull: %s", g_status.load());
   if (!g_ready.load(std::memory_order_acquire)) {
     fprintf(out, "\n");
@@ -713,7 +710,5 @@ void dumpStatistics(FILE *out) {
           double(g_stats.opaque.exchange(0)) / views, double(g_stats.translucent.exchange(0)) / views,
           double(g_stats.other.exchange(0)) / views, double(g_stats.cappedViews.exchange(0)) / seconds);
 }
-
-void retainOffscreen(bool retain) { g_retainOffscreen.store(retain, std::memory_order_relaxed); }
 
 } // namespace proxy::engine_nocull

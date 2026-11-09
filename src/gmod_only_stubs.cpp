@@ -31,7 +31,6 @@ void dumpStatistics(FILE *) {}
 
 namespace proxy::engine_nocull {
 bool install(void *, void *) { return false; }
-void retainOffscreen(bool) {}
 void dumpStatistics(FILE *) {}
 } // namespace proxy::engine_nocull
 
