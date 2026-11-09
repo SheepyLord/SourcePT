@@ -27,8 +27,17 @@ struct MaterialRef {
 // (null handle: not uploaded yet). emission (may be null): its unlit or self-
 // illuminated variant, masked by the first uploaded texture among
 // maskCandidates (null handle while none of them is).
+// blend (may be null): a displacement's second texture as a sheet whose
+// coverage the first uploaded of `candidates` modulates per texel
+// (remixapi_MaterialBlendModulationEXT, with `transform` from the mesh's
+// coordinates; null handle while none of them is uploaded).
+struct BlendMask {
+  const std::vector<uint64_t> *candidates = nullptr;
+  float transform[2][3] = {{1, 0, 0}, {0, 1, 0}};
+};
 using MaterialLookup = MaterialRef (*)(uint64_t textureHash, const engine_materials::Shading *emission,
-                                       const std::vector<uint64_t> *maskCandidates, bool nearest);
+                                       const std::vector<uint64_t> *maskCandidates, bool nearest,
+                                       const BlendMask *blend);
 
 // dxvk hashes a texture ("models/x/y", as materials name it) can be uploaded
 // under: its largest mips, from the VTF file. Empty: no file, or a format the
@@ -37,7 +46,9 @@ using MaterialLookup = MaterialRef (*)(uint64_t textureHash, const engine_materi
 std::vector<uint64_t> textureCandidates(const std::string &name, uint32_t frame = 0);
 // The water the eye is in (the map's leaves), as the runtime's camera medium:
 // its colour (linear) and measurement distance. False: in air, or unknown.
-bool waterAt(const float eye[3], float color[3], float &distance);
+// fogEnd (may be null): the water's fog end when it fades as Source's water
+// fog does (remixapi_CameraMediumFogEXT), 0 when it absorbs.
+bool waterAt(const float eye[3], float color[3], float &distance, float *fogEnd = nullptr);
 // A texture's mean luminance as stored (0..1, gamma; its smallest mip), or
 // -1 when its file is missing or in a format not read. Cached by name.
 float textureLuminance(const std::string &name);
@@ -162,6 +173,8 @@ std::string materialName(uint64_t textureHash);
 // material system's name; null for other materials, before a map is read or
 // with OPENREMIX_PROXY_MIRRORS=0. Render thread.
 remixapi_MaterialHandle mirrorMaterial(const char *materialName);
+// Whether reflective glass is path traced (OPENREMIX_PROXY_MIRRORS, default on).
+bool mirrorsOn();
 
 // Whether `materialName` (as the material system names it, lower case) is the
 // map's detail sprite material: worldspawn's "detailmaterial", else the

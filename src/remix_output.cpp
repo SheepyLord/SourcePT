@@ -5,6 +5,7 @@
 #include "diag.h"
 #include "frame_profile.h"
 #include <map>
+#include <tuple>
 #include "remix_output.h"
 #include "d3d_hooks.h"
 #include "remix_ui.h"
@@ -1690,8 +1691,47 @@ void evictEmissiveMaterials() {
 // The material of an uploaded texture by its dxvk hash, for the BSP world;
 // `emission`: its unlit / self-illuminated variant, with the first uploaded
 // of `maskCandidates` as mask (no handle until that is uploaded).
+// A displacement's second texture as a sheet whose coverage a blend mask
+// shapes per texel (remixapi_MaterialBlendModulationEXT): the texture's lit
+// material with the mask, by texture, mask and transform. Kept for the
+// process (one per such layer and map). Texture lock held.
+std::map<std::tuple<uint64_t, uint64_t, std::array<float, 6>, bool>, remixapi_MaterialHandle> g_blendMaterials;
+remixapi_MaterialHandle blendMaterial(const RemixTexture &t, uint64_t maskHash, const float transform[2][3],
+                                      bool nearest) {
+  std::array<float, 6> rows;
+  std::copy_n(&transform[0][0], 6, rows.begin());
+  remixapi_MaterialHandle &slot = g_blendMaterials[{t.hash, maskHash, rows, nearest}];
+  if (slot)
+    return slot;
+  wchar_t path[32], maskPath[32];
+  swprintf(path, 32, L"0x%llX", static_cast<unsigned long long>(t.hash));
+  swprintf(maskPath, 32, L"0x%llX", static_cast<unsigned long long>(maskHash));
+  remixapi_MaterialBlendModulationEXT modulation = {};
+  modulation.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_BLEND_MODULATION_EXT;
+  modulation.maskTexture = maskPath;
+  std::copy_n(&transform[0][0], 6, &modulation.transform[0][0]);
+  remixapi_MaterialInfoOpaqueEXT opaque = {};
+  opaque.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+  opaque.pNext = &modulation;
+  opaque.albedoConstant = {1, 1, 1};
+  opaque.opacityConstant = 1;
+  opaque.alphaTestType = 7;
+  opaque.useDrawCallAlphaState = 1;
+  remixapi_MaterialInfo info = {};
+  info.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+  info.pNext = &opaque;
+  info.hash = XXH3_64bits_withSeed(rows.data(), sizeof(rows), t.hash ^ maskHash ^ (nearest ? 0x6e656172ull : 0)) | 1;
+  info.albedoTexture = path;
+  info.filterMode = nearest ? 0 : 1;
+  info.wrapModeU = info.wrapModeV = 1;
+  if (g_api.CreateMaterial(&info, &slot) != REMIXAPI_ERROR_CODE_SUCCESS)
+    slot = nullptr;
+  return slot;
+}
+
 bsp::MaterialRef materialForHash(uint64_t hash, const engine_materials::Shading *emission,
-                                 const std::vector<uint64_t> *maskCandidates, bool nearest = false) {
+                                 const std::vector<uint64_t> *maskCandidates, bool nearest = false,
+                                 const bsp::BlendMask *blend = nullptr) {
   using engine_materials::Shading;
   std::lock_guard<std::recursive_mutex> lock(g_textureLock);
   auto it = g_texturesByHash.find(hash);
@@ -1701,6 +1741,17 @@ bsp::MaterialRef materialForHash(uint64_t hash, const engine_materials::Shading 
   if (!texture)
     return {};
   bsp::MaterialRef ref;
+  if (blend && blend->candidates && (!emission || emission->mode == Shading::Lit)) {
+    uint64_t maskHash = 0;
+    for (uint64_t candidate : *blend->candidates)
+      if ((maskHash = uploadedTextureHash(candidate)))
+        break;
+    if (!maskHash)
+      return {}; // until the mask is uploaded
+    ref.handle = blendMaterial(*texture, maskHash, blend->transform, nearest);
+    ref.keep = std::move(texture);
+    return ref;
+  }
   // Its PBR conversion waits for the maps it names.
   bool complete = true;
   const PbrMaps maps = emission ? pbrMapsFor(*texture, *emission, true, &complete) : PbrMaps{};
@@ -7833,16 +7884,25 @@ void onPresent() {
     static const bool underwater = envScale("OPENREMIX_PROXY_UNDERWATER", 1) > 0;
     remixapi_CameraMediumEXT medium = {};
     medium.sType = REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_EXT;
+    // Water that fades as Source's water fog (bsp waterFogEnd) does so here too.
+    remixapi_CameraMediumFogEXT mediumFog = {};
+    mediumFog.sType = REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_FOG_EXT;
+    const void **mediumNext = &medium.pNext;
     {
-      float eye[3], color[3], distance = 0;
+      float eye[3], color[3], distance = 0, fogEnd = 0;
       for (int i = 0; i < 3; ++i)
         eye[i] = -(main->view[12] * main->view[i * 4] + main->view[13] * main->view[i * 4 + 1] +
                    main->view[14] * main->view[i * 4 + 2]);
-      g_cameraInWater = underwater && bsp::waterAt(eye, color, distance);
+      g_cameraInWater = underwater && bsp::waterAt(eye, color, distance, &fogEnd);
       if (g_cameraInWater) {
         medium.inside = 1;
         medium.transmittanceColor = {color[0], color[1], color[2]};
         medium.transmittanceMeasurementDistance = distance;
+        if (fogEnd > 0) {
+          mediumFog.fogEnd = fogEnd;
+          medium.pNext = &mediumFog;
+          mediumNext = &mediumFog.pNext;
+        }
         ++g_stats.underwaterFrames;
       }
     }
@@ -7854,7 +7914,7 @@ void onPresent() {
     screenList.count = uint32_t(screens.size());
     screenList.cameras = screens.data();
     if (!screens.empty())
-      medium.pNext = &screenList;
+      *mediumNext = &screenList;
     remixapi_CameraInfo camera = {};
     camera.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
     auto setup = [&](remixapi_CameraType type, const View &v) {

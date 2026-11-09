@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -753,10 +754,17 @@ struct Material {
   // distance (remixapi_CameraMediumEXT when the camera is in it).
   bool waterBody = false;
   float waterColor[3] = {}, waterDistance = 0;
+  float waterFogEnd = 0; // fades as Source's water fog over this (0: absorbs)
   uint8_t alphaRef = 179;
   MaterialRef ref;
   bool resolved = false;
   bool pointSample = false;
+  // A second layer whose coverage its $blendmodulatetexture shapes per texel
+  // (SecondLayer::perTexel): the mask's hashes (none: not modulated) and its
+  // transform (blendMask.candidates is set when looked up).
+  std::vector<uint64_t> blendMaskCandidates;
+  BlendMask blendMask;
+  bool blendDropped = false; // the mask was never uploaded: blended by vertex alpha alone
 };
 
 struct Geometry {
@@ -791,6 +799,7 @@ struct PropPart {
   std::vector<remixapi_HardcodedVertex> loadVertices; // temporary, released after sky placement clipping
   std::vector<float> positions; // model space, for occluders()
   std::vector<uint32_t> indices;
+  std::vector<remixapi_HardcodedVertex> vertices; // model space, for clipSkyProp
 };
 struct PropModel {
   std::vector<PropPart> parts;
@@ -832,9 +841,80 @@ struct SecondLayer {
   // (half width). $maskedblending: the texture's g alone.
   bool modulate = false, masked = false;
   float centre = 0.5f, halfWidth = 0.5f;
+  // The modulation per texel, as Source has it (the runtime's
+  // remixapi_MaterialBlendModulationEXT on the layer's material): the blend
+  // stays the vertex alpha. OPENREMIX_PROXY_BLEND_MODULATION=0: per vertex, by
+  // the mask's mean (as before).
+  bool perTexel = false;
+  // $basetexturetransform2: the second texture's coordinates from the first's.
+  float uv[2][3] = {{1, 0, 0}, {0, 1, 0}};
+  bool uvTransformed = false;
 };
+
+// A VMT texture transform ("center .5 .5 scale 1 1 rotate 0 translate 0 0")
+// as Source builds it (CMaterialVar matrices: translate by -center, scale,
+// rotate about Z by degrees, translate by center + translate), the rows that
+// take (u, v, 1) to the coordinates sampled. False: not parsed.
+bool parseTextureTransform(const std::string &text, float out[2][3]) {
+  float center[2] = {.5f, .5f}, scale[2] = {1, 1}, translate[2] = {0, 0}, rotate = 0;
+  std::istringstream in(lower(text));
+  std::string word;
+  bool any = false;
+  while (in >> word) {
+    if (word == "center")
+      in >> center[0] >> center[1];
+    else if (word == "scale")
+      in >> scale[0] >> scale[1];
+    else if (word == "rotate")
+      in >> rotate;
+    else if (word == "translate")
+      in >> translate[0] >> translate[1];
+    else
+      return false;
+    if (in.fail())
+      return false;
+    any = true;
+  }
+  if (!any)
+    return false;
+  const float r = rotate * 3.14159265f / 180, c = std::cos(r), s = std::sin(r);
+  // R S about the centre, then the translation.
+  const float m[2][2] = {{c * scale[0], -s * scale[1]}, {s * scale[0], c * scale[1]}};
+  for (int row = 0; row < 2; ++row) {
+    out[row][0] = m[row][0];
+    out[row][1] = m[row][1];
+    out[row][2] = center[row] + translate[row] - m[row][0] * center[0] - m[row][1] * center[1];
+  }
+  return true;
+}
+
+// a after b: the rows of (u, v, 1) -> a(b(u, v)).
+void composeTransforms(const float a[2][3], const float b[2][3], float out[2][3]) {
+  float r[2][3];
+  for (int row = 0; row < 2; ++row) {
+    r[row][0] = a[row][0] * b[0][0] + a[row][1] * b[1][0];
+    r[row][1] = a[row][0] * b[0][1] + a[row][1] * b[1][1];
+    r[row][2] = a[row][0] * b[0][2] + a[row][1] * b[1][2] + a[row][2];
+  }
+  std::memcpy(out, r, sizeof(r));
+}
+
+// The inverse of an affine transform's rows (false: singular).
+bool invertTransform(const float in[2][3], float out[2][3]) {
+  const float det = in[0][0] * in[1][1] - in[0][1] * in[1][0];
+  if (std::fabs(det) < 1e-12f)
+    return false;
+  const float a = in[1][1] / det, b = -in[0][1] / det, c = -in[1][0] / det, d = in[0][0] / det;
+  out[0][0] = a;
+  out[0][1] = b;
+  out[1][0] = c;
+  out[1][1] = d;
+  out[0][2] = -(a * in[0][2] + b * in[1][2]);
+  out[1][2] = -(c * in[0][2] + d * in[1][2]);
+  return true;
+}
 struct LayerStatistics {
-  uint32_t materials = 0, noHash = 0, fourWay = 0, modulated = 0, modulateUnread = 0;
+  uint32_t materials = 0, noHash = 0, fourWay = 0, modulated = 0, modulateUnread = 0, perTexel = 0;
   uint32_t displacements = 0, layered = 0, flat = 0, withoutTexture = 0;
   uint32_t baseTriangles = 0, secondTriangles = 0, blendedTriangles = 0;
   uint32_t brushFaces = 0; // two-layer materials on faces without a displacement (no alpha: the first texture)
@@ -925,6 +1005,7 @@ struct World {
   bool skyTraced = false;
   float playableMins[3] = {}, playableMaxs[3] = {};
   float skyReach = 0; // farthest traced sky point from the playable bounds' centre
+  uint32_t skyPiecesBehind = 0;
   uint32_t skyTracedTriangles = 0, skyStandInTriangles = 0, skyClippedTriangles = 0, skyTracedProps = 0,
            skyStandInProps = 0, skyCoplanarPieces = 0;
   uint64_t frames = 0;
@@ -1848,9 +1929,29 @@ int materialByName(const std::string &name, bool brush) {
     }();
     // The fog colour is what passes at the measurement distance: a distance
     // at which 5% of light (by luminance) is left at $fogend.
+    // What lies behind the surface fades to the fog colour over $fogend, as
+    // Source's water fog has it (remixapi_MaterialTranslucentFogEXT), instead
+    // of being absorbed by the fog colour (its hue strips the rest from even
+    // shallow water: gm_construct's {7 58 66} turned the sand under it cyan).
+    // OPENREMIX_PROXY_WATER_FOG=0: absorbed, as before.
+    static const bool fogWater = [] {
+      char v[8] = {};
+      return !(GetEnvironmentVariableA("OPENREMIX_PROXY_WATER_FOG", v, sizeof(v)) && v[0] == '0');
+    }();
+    remixapi_MaterialTranslucentFogEXT fade = {};
+    fade.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_TRANSLUCENT_FOG_EXT;
+    fade.pNext = opaque.pNext;
+    fade.fogEnd = std::max(fogEnd, 1.0f);
+    // $refracttint multiplies the refraction image, gamma-encoded as Source
+    // samples it: linear, its 2.2 power ({}: 0-255, []: 0-1).
+    float refractTint[3] = {1, 1, 1};
+    if (kv.values.count("$refracttint") && parseColor(kv.values["$refracttint"], refractTint))
+      for (float &c : refractTint)
+        c = std::pow(std::clamp(c, 0.0f, 1.0f), 2.2f);
+    fade.refractTint = {refractTint[0], refractTint[1], refractTint[2]};
     remixapi_MaterialInfoTranslucentEXT translucent = {};
     translucent.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_TRANSLUCENT_EXT;
-    translucent.pNext = opaque.pNext;
+    translucent.pNext = fogWater ? static_cast<void *>(&fade) : opaque.pNext;
     translucent.refractiveIndex = 1.333f;
     translucent.transmittanceColor = opaque.albedoConstant;
     {
@@ -1885,6 +1986,7 @@ int materialByName(const std::string &name, bool brush) {
     m.noCull = true;
     std::memcpy(m.waterColor, &translucent.transmittanceColor, sizeof(m.waterColor));
     m.waterDistance = translucent.transmittanceMeasurementDistance;
+    m.waterFogEnd = translucentWater && fogWater ? fade.fogEnd : 0;
     slot = int(g_world.materials.size());
     g_world.materials.push_back(std::move(m));
     return slot;
@@ -2059,6 +2161,34 @@ SecondLayer secondLayer(int base, bool use) {
       ++stats.modulated;
     } else {
       ++stats.modulateUnread;
+    }
+  }
+  // $basetexturetransform2: the second texture's own coordinates (the first
+  // texture's through it), on the layer's triangles (build).
+  if (kv.values.count("$basetexturetransform2") && parseTextureTransform(kv.values["$basetexturetransform2"], out.uv))
+    out.uvTransformed = true;
+  // Per texel: the layer's material carries the mask, at the first texture's
+  // coordinates through $blendmasktransform (Source samples it there), which
+  // are the layer's own through the inverse of $basetexturetransform2.
+  // (The x86 bridge does not carry the material extension: per vertex there.)
+  static const bool perTexel = [] {
+#ifdef _WIN64
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_BLEND_MODULATION", v, sizeof(v)) && v[0] == '0');
+#else
+    return false;
+#endif
+  }();
+  if (perTexel && out.modulate && !out.masked && out.material >= 0) {
+    Material &layer = g_world.materials[size_t(out.material)];
+    layer.blendMaskCandidates = textureHashes(kv.values["$blendmodulatetexture"]);
+    float maskTransform[2][3] = {{1, 0, 0}, {0, 1, 0}}, toFirst[2][3];
+    if (kv.values.count("$blendmasktransform"))
+      parseTextureTransform(kv.values["$blendmasktransform"], maskTransform);
+    if (!layer.blendMaskCandidates.empty() && invertTransform(out.uv, toFirst)) {
+      composeTransforms(maskTransform, toFirst, layer.blendMask.transform);
+      out.perTexel = true;
+      ++stats.perTexel;
     }
   }
   if (stats.names.size() < 700) {
@@ -3025,6 +3155,49 @@ bool build(const Bsp &bsp) {
     }
     return false;
   };
+  // A kept skybox piece lying on a world face it overlaps, or less than
+  // kBehind behind it, goes kBehind behind that face's plane (into the solid
+  // the face bounds). onWorldFace drops the pieces whose centre lies over a
+  // face; a piece mostly elsewhere (gm_construct's skybox ground continuing the
+  // north wall down into the ground) still overlaps the face with its rest and
+  // z-fought with it. Behind it the face hides it, and beyond the face (behind
+  // the sky brushes) it is where it was within a few units.
+  constexpr float kBehind = 2;
+  auto behindWorldFace = [&](std::vector<remixapi_HardcodedVertex> &piece) {
+    const float *a = piece[0].position, *b = piece[1].position, *c = piece[2].position;
+    const float e1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]}, e2[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+    float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+    const float length = std::sqrt(dot(n, n));
+    if (length < 1e-6f)
+      return false;
+    for (float &x : n)
+      x /= length;
+    float mins[3], maxs[3], centroid[3] = {};
+    for (int k = 0; k < 3; ++k) {
+      mins[k] = maxs[k] = piece[0].position[k];
+      for (const auto &v : piece) {
+        mins[k] = std::min(mins[k], v.position[k]);
+        maxs[k] = std::max(maxs[k], v.position[k]);
+        centroid[k] += v.position[k] / float(piece.size());
+      }
+    }
+    for (const auto &w : worldPlanes) {
+      const float d = dot(w.normal, centroid) - w.dist;
+      if (std::fabs(dot(w.normal, n)) < 0.996f || d >= 0.5f || d <= -kBehind)
+        continue;
+      bool overlap = true;
+      for (int k = 0; k < 3 && overlap; ++k)
+        overlap = mins[k] <= w.maxs[k] + 1 && maxs[k] >= w.mins[k] - 1;
+      if (!overlap)
+        continue;
+      const float shift = d + kBehind;
+      for (auto &v : piece)
+        for (int k = 0; k < 3; ++k)
+          v.position[k] -= w.normal[k] * shift;
+      return true;
+    }
+    return false;
+  };
 
   // The world's faces, then those of the func_lod brushes.
   std::vector<int32_t> faceList;
@@ -3155,6 +3328,11 @@ bool build(const Bsp &bsp) {
                                       return coplanar;
                                     }),
                      pieces.end());
+        for (auto &piece : pieces) {
+          const bool moved = behindWorldFace(piece);
+          g_world.skyPiecesBehind += moved && count;
+          clipped.split |= moved;
+        }
         if (!clipped.split) {
           g.indices.insert(g.indices.end(), triangles.begin() + i, triangles.begin() + i + 3);
           g_world.skyTracedTriangles += count;
@@ -3265,12 +3443,21 @@ bool build(const Bsp &bsp) {
       // the surface whose vertex alpha is `blend`.
       constexpr float kLayerOffset = 0.05f; // below the overlays and the engine's decals (0.1)
       std::vector<float> blend;
-      auto emit = [&](Geometry &g, const std::vector<uint32_t> &indices, bool sheet) {
+      // uv (may be null): the second texture's coordinates from the first's.
+      auto emit = [&](Geometry &g, const std::vector<uint32_t> &indices, bool sheet,
+                      const float (*uv)[3] = nullptr) {
         if (indices.empty())
           return;
         const uint32_t base = uint32_t(g.vertices.size());
         const size_t firstIndex = g.indices.size();
         g.vertices.insert(g.vertices.end(), grid.begin(), grid.end());
+        if (uv)
+          for (size_t v = base; v < g.vertices.size(); ++v) {
+            float *t = g.vertices[v].texcoord;
+            const float u0 = t[0], v0 = t[1];
+            t[0] = uv[0][0] * u0 + uv[0][1] * v0 + uv[0][2];
+            t[1] = uv[1][0] * u0 + uv[1][1] * v0 + uv[1][2];
+          }
         if (sheet)
           for (size_t v = 0; v < grid.size(); ++v) {
             auto &vtx = g.vertices[base + v];
@@ -3319,7 +3506,7 @@ bool build(const Bsp &bsp) {
           const float a = alpha[v] / 255;
           if (layer.masked) {
             blend[v] = layer.centre;
-          } else if (layer.modulate) {
+          } else if (layer.modulate && !layer.perTexel) {
             const float x = high > low ? std::clamp((a - low) / (high - low), 0.0f, 1.0f) : (a >= high ? 1.0f : 0.0f);
             blend[v] = x * x * (3 - 2 * x);
           } else {
@@ -3340,8 +3527,9 @@ bool build(const Bsp &bsp) {
         // mesh of the group, and with it the first layer under the sheets.)
         if (!first.empty())
           emit(groupFor(centroid, sky, m, skyboxFace), first, false);
+        const float (*layerUv)[3] = layer.uvTransformed ? layer.uv : nullptr;
         if (!second.empty())
-          emit(groupFor(centroid, sky, layer.material, skyboxFace), second, false);
+          emit(groupFor(centroid, sky, layer.material, skyboxFace), second, false, layerUv);
         if (!mixed.empty()) {
           const bool noCull = g_world.materials[m].noCull;
           std::array<int32_t, 5> key = {int32_t(std::floor(centroid[0] / kCell)), int32_t(std::floor(centroid[1] / kCell)),
@@ -3352,7 +3540,7 @@ bool build(const Bsp &bsp) {
           group.skybox = skyboxFace;
           group.noCull = noCull;
           group.id = XXH3_64bits_withSeed(key.data(), sizeof(key), 0x6c61796572ull) | 1;
-          emit(group.surfaces[uint32_t(layer.material)], mixed, true);
+          emit(group.surfaces[uint32_t(layer.material)], mixed, true, layerUv);
         }
         ++g_world.layers.layered;
         g_world.layers.baseTriangles += uint32_t((first.size() - mixed.size()) / 3);
@@ -3995,15 +4183,32 @@ void submit(MaterialLookup lookup) {
       }
       const bool emissive = shading.mode != engine_materials::Shading::Lit || shading.pbr.active;
       const bool variant = emissive || shading.reflectionReceiverKey;
+      // A blend mask the engine never uploads: blended by vertex alpha alone
+      // after ten seconds.
+      BlendMask blend = m.blendMask;
+      blend.candidates = &m.blendMaskCandidates;
+      const BlendMask *modulated = m.blendMaskCandidates.empty() || m.blendDropped ? nullptr : &blend;
       for (uint64_t h : m.candidates) {
-        auto ref = lookup(h, variant ? &shading : nullptr, &m.maskCandidates, m.pointSample);
+        auto ref = lookup(h, variant ? &shading : nullptr, &m.maskCandidates, m.pointSample, modulated);
         if (!ref.handle && emissive && frame >= 600) {
           auto fallback = shading;
           fallback.mode = engine_materials::Shading::Lit;
           fallback.pbr = {};
           fallback.mask.clear();
-          ref = lookup(h, fallback.reflectionReceiverKey ? &fallback : nullptr, nullptr, m.pointSample);
+          ref = lookup(h, fallback.reflectionReceiverKey ? &fallback : nullptr, nullptr, m.pointSample, modulated);
           if (ref.handle) m.maskDropped = true;
+        }
+        if (!ref.handle && modulated && frame >= 600) {
+          ref = lookup(h, variant ? &shading : nullptr, &m.maskCandidates, m.pointSample, nullptr);
+          if (!ref.handle && emissive) {
+            auto fallback = shading;
+            fallback.mode = engine_materials::Shading::Lit;
+            fallback.pbr = {};
+            fallback.mask.clear();
+            ref = lookup(h, fallback.reflectionReceiverKey ? &fallback : nullptr, nullptr, m.pointSample, nullptr);
+            if (ref.handle) m.maskDropped = true;
+          }
+          if (ref.handle) m.blendDropped = true;
         }
         if (ref.handle) {
           if (ref.handle != m.ref.handle) ++g_world.submitVersion;
@@ -4338,7 +4543,7 @@ void submit(MaterialLookup lookup) {
   }
 }
 
-bool waterAt(const float eye[3], float color[3], float &distance) {
+bool waterAt(const float eye[3], float color[3], float &distance, float *fogEnd) {
   if (!g_active || g_world.leafWater.empty())
     return false;
   int index = 0;
@@ -4354,6 +4559,8 @@ bool waterAt(const float eye[3], float color[3], float &distance) {
   const Material &m = g_world.materials[size_t(g_world.leafWater[size_t(leaf)])];
   std::memcpy(color, m.waterColor, sizeof(m.waterColor));
   distance = m.waterDistance;
+  if (fogEnd)
+    *fogEnd = m.waterFogEnd;
   return distance > 0;
 }
 
@@ -4563,6 +4770,8 @@ std::string materialName(uint64_t textureHash) {
   return {};
 }
 
+bool mirrorsOn() { return mirrorsEnabled(); }
+
 remixapi_MaterialHandle mirrorMaterial(const char *materialName) {
   if (!materialName || !mirrorsEnabled())
     return nullptr;
@@ -4618,17 +4827,21 @@ void dumpStatistics(FILE *out) {
     uint32_t meshes = 0, waiting = 0;
     for (auto &[key, group] : g_world.layerGroups)
       meshes += group.mesh != nullptr;
-    for (auto &[base, layer] : g_world.secondLayers)
+    uint32_t dropped = 0;
+    for (auto &[base, layer] : g_world.secondLayers) {
       waiting += layer.material >= 0 && !g_world.materials[layer.material].resolved;
+      dropped += layer.material >= 0 && g_world.materials[layer.material].blendDropped;
+    }
     fprintf(out,
             "   BSP second layers ($basetexture2): %u materials on %u displacements (alpha %.0f..%.0f) | layered %u: "
             "triangles first texture %u, second texture %u, blended (decal sheet, vertex alpha) %u in %zu groups (%u "
             "meshes) | not layered: alpha 0 everywhere %u, second texture without a hash %u (%u materials) | second "
-            "textures not uploaded yet %u | $blendmodulatetexture: %u by its mean per vertex, %u not read | 4-way "
+            "textures not uploaded yet %u | $blendmodulatetexture: %u read (%u per texel, OPENREMIX_PROXY_BLEND_MODULATION; "
+            "masks never uploaded %u), %u not read | 4-way "
             "blend materials (layers 3-4 not drawn) %u | on %u faces without a displacement (first texture only)\n%s",
             l.materials, l.displacements, l.displacements ? l.alphaMin : 0.0f, l.alphaMax, l.layered, l.baseTriangles,
             l.secondTriangles, l.blendedTriangles, g_world.layerGroups.size(), meshes, l.flat, l.withoutTexture,
-            l.noHash, waiting, l.modulated, l.modulateUnread, l.fourWay, l.brushFaces, l.names.c_str());
+            l.noHash, waiting, l.modulated, l.perTexel, dropped, l.modulateUnread, l.fourWay, l.brushFaces, l.names.c_str());
   }
   fprintf(out, "   BSP materials with a PBR conversion:\n%s", g_world.pbrNames.c_str());
   {
@@ -4661,10 +4874,10 @@ void dumpStatistics(FILE *out) {
   }
   if (g_world.skyTraced)
     fprintf(out, "   3D skybox path traced: %u triangles, %u clipped at the map, %u props (in playable space: %u "
-            "triangles, %u props; pieces on world faces %u), %zu clipped prop models, reach %.0f\n",
+            "triangles, %u props; pieces on world faces %u, moved behind world faces %u), %zu clipped prop models, reach %.0f\n",
             g_world.skyTracedTriangles, g_world.skyClippedTriangles, g_world.skyTracedProps,
             g_world.skyStandInTriangles, g_world.skyStandInProps, g_world.skyCoplanarPieces,
-            g_world.clippedSkyModels.size(), g_world.skyReach);
+            g_world.skyPiecesBehind, g_world.clippedSkyModels.size(), g_world.skyReach);
   {
     // Unresolved materials: no predictable texture hash (VTF missing or its
     // format not modelled) vs. a hash the engine never uploaded.
