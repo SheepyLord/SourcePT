@@ -49,7 +49,7 @@ and their Lua add-on folders, if any, into `garrysmod/addons`.
 - Every file is checked against the package's manifest (size and SHA-256) before it is put in place.
 - After an item updates, its files are brought up to date at the next start; after you unsubscribe, they are
   removed. A file you changed, and a folder the proxy did not create, are left as they are.
-- The first start after a new or updated item waits while it unpacks (a few seconds per GB on an SSD). What was
+- The first start after a new or updated item waits while it unpacks (about a second per GB on an NVMe SSD). What was
   placed is recorded in `bin/win64/shaderapi_proxy_workshop.txt`, and each step is logged in
   `shaderapi_proxy_diag.log`. `OPENREMIX_PROXY_WORKSHOP=0` turns it off.
 - A Workshop map itself still has to be mounted by the game: turn on RTXLauncher's *Load Workshop Addons*.
