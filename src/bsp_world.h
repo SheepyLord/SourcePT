@@ -44,7 +44,9 @@ using MaterialLookup = MaterialRef (*)(uint64_t textureHash, const engine_materi
 std::vector<uint64_t> textureCandidates(const std::string &name, uint32_t frame = 0);
 // The water the eye is in (the map's leaves), as the runtime's camera medium:
 // its colour (linear) and measurement distance. False: in air, or unknown.
-bool waterAt(const float eye[3], float color[3], float &distance);
+// fogEnd (may be null): the water's fog end when it fades as Source's water
+// fog does (remixapi_CameraMediumFogEXT), 0 when it absorbs.
+bool waterAt(const float eye[3], float color[3], float &distance, float *fogEnd = nullptr);
 // A texture's mean luminance as stored (0..1, gamma; its smallest mip), or
 // -1 when its file is missing or in a format not read. Cached by name.
 float textureLuminance(const std::string &name);

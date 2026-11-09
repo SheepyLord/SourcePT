@@ -7864,16 +7864,25 @@ void onPresent() {
     static const bool underwater = envScale("OPENREMIX_PROXY_UNDERWATER", 1) > 0;
     remixapi_CameraMediumEXT medium = {};
     medium.sType = REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_EXT;
+    // Water that fades as Source's water fog (bsp waterFogEnd) does so here too.
+    remixapi_CameraMediumFogEXT mediumFog = {};
+    mediumFog.sType = REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_FOG_EXT;
+    const void **mediumNext = &medium.pNext;
     {
-      float eye[3], color[3], distance = 0;
+      float eye[3], color[3], distance = 0, fogEnd = 0;
       for (int i = 0; i < 3; ++i)
         eye[i] = -(main->view[12] * main->view[i * 4] + main->view[13] * main->view[i * 4 + 1] +
                    main->view[14] * main->view[i * 4 + 2]);
-      g_cameraInWater = underwater && bsp::waterAt(eye, color, distance);
+      g_cameraInWater = underwater && bsp::waterAt(eye, color, distance, &fogEnd);
       if (g_cameraInWater) {
         medium.inside = 1;
         medium.transmittanceColor = {color[0], color[1], color[2]};
         medium.transmittanceMeasurementDistance = distance;
+        if (fogEnd > 0) {
+          mediumFog.fogEnd = fogEnd;
+          medium.pNext = &mediumFog;
+          mediumNext = &mediumFog.pNext;
+        }
         ++g_stats.underwaterFrames;
       }
     }
@@ -7885,7 +7894,7 @@ void onPresent() {
     screenList.count = uint32_t(screens.size());
     screenList.cameras = screens.data();
     if (!screens.empty())
-      medium.pNext = &screenList;
+      *mediumNext = &screenList;
     remixapi_CameraInfo camera = {};
     camera.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
     auto setup = [&](remixapi_CameraType type, const View &v) {

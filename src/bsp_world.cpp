@@ -702,6 +702,7 @@ struct Material {
   // distance (remixapi_CameraMediumEXT when the camera is in it).
   bool waterBody = false;
   float waterColor[3] = {}, waterDistance = 0;
+  float waterFogEnd = 0; // fades as Source's water fog over this (0: absorbs)
   uint8_t alphaRef = 179;
   MaterialRef ref;
   bool resolved = false;
@@ -1716,6 +1717,13 @@ int materialByName(const std::string &name, bool brush) {
     fade.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_TRANSLUCENT_FOG_EXT;
     fade.pNext = opaque.pNext;
     fade.fogEnd = std::max(fogEnd, 1.0f);
+    // $refracttint multiplies the refraction image, gamma-encoded as Source
+    // samples it: linear, its 2.2 power ({}: 0-255, []: 0-1).
+    float refractTint[3] = {1, 1, 1};
+    if (kv.values.count("$refracttint") && parseColor(kv.values["$refracttint"], refractTint))
+      for (float &c : refractTint)
+        c = std::pow(std::clamp(c, 0.0f, 1.0f), 2.2f);
+    fade.refractTint = {refractTint[0], refractTint[1], refractTint[2]};
     remixapi_MaterialInfoTranslucentEXT translucent = {};
     translucent.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_TRANSLUCENT_EXT;
     translucent.pNext = fogWater ? static_cast<void *>(&fade) : opaque.pNext;
@@ -1747,6 +1755,7 @@ int materialByName(const std::string &name, bool brush) {
     m.noCull = true;
     std::memcpy(m.waterColor, &translucent.transmittanceColor, sizeof(m.waterColor));
     m.waterDistance = translucent.transmittanceMeasurementDistance;
+    m.waterFogEnd = translucentWater && fogWater ? fade.fogEnd : 0;
     slot = int(g_world.materials.size());
     g_world.materials.push_back(std::move(m));
     return slot;
@@ -3819,7 +3828,7 @@ void submit(MaterialLookup lookup) {
   }
 }
 
-bool waterAt(const float eye[3], float color[3], float &distance) {
+bool waterAt(const float eye[3], float color[3], float &distance, float *fogEnd) {
   if (!g_active || g_world.leafWater.empty())
     return false;
   int index = 0;
@@ -3835,6 +3844,8 @@ bool waterAt(const float eye[3], float color[3], float &distance) {
   const Material &m = g_world.materials[size_t(g_world.leafWater[size_t(leaf)])];
   std::memcpy(color, m.waterColor, sizeof(m.waterColor));
   distance = m.waterDistance;
+  if (fogEnd)
+    *fogEnd = m.waterFogEnd;
   return distance > 0;
 }
 
