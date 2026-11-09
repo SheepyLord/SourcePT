@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -705,6 +706,12 @@ struct Material {
   MaterialRef ref;
   bool resolved = false;
   bool pointSample = false;
+  // A second layer whose coverage its $blendmodulatetexture shapes per texel
+  // (SecondLayer::perTexel): the mask's hashes (none: not modulated) and its
+  // transform (blendMask.candidates is set when looked up).
+  std::vector<uint64_t> blendMaskCandidates;
+  BlendMask blendMask;
+  bool blendDropped = false; // the mask was never uploaded: blended by vertex alpha alone
 };
 
 struct Geometry {
@@ -779,9 +786,80 @@ struct SecondLayer {
   // (half width). $maskedblending: the texture's g alone.
   bool modulate = false, masked = false;
   float centre = 0.5f, halfWidth = 0.5f;
+  // The modulation per texel, as Source has it (the runtime's
+  // remixapi_MaterialBlendModulationEXT on the layer's material): the blend
+  // stays the vertex alpha. OPENREMIX_PROXY_BLEND_MODULATION=0: per vertex, by
+  // the mask's mean (as before).
+  bool perTexel = false;
+  // $basetexturetransform2: the second texture's coordinates from the first's.
+  float uv[2][3] = {{1, 0, 0}, {0, 1, 0}};
+  bool uvTransformed = false;
 };
+
+// A VMT texture transform ("center .5 .5 scale 1 1 rotate 0 translate 0 0")
+// as Source builds it (CMaterialVar matrices: translate by -center, scale,
+// rotate about Z by degrees, translate by center + translate), the rows that
+// take (u, v, 1) to the coordinates sampled. False: not parsed.
+bool parseTextureTransform(const std::string &text, float out[2][3]) {
+  float center[2] = {.5f, .5f}, scale[2] = {1, 1}, translate[2] = {0, 0}, rotate = 0;
+  std::istringstream in(lower(text));
+  std::string word;
+  bool any = false;
+  while (in >> word) {
+    if (word == "center")
+      in >> center[0] >> center[1];
+    else if (word == "scale")
+      in >> scale[0] >> scale[1];
+    else if (word == "rotate")
+      in >> rotate;
+    else if (word == "translate")
+      in >> translate[0] >> translate[1];
+    else
+      return false;
+    if (in.fail())
+      return false;
+    any = true;
+  }
+  if (!any)
+    return false;
+  const float r = rotate * 3.14159265f / 180, c = std::cos(r), s = std::sin(r);
+  // R S about the centre, then the translation.
+  const float m[2][2] = {{c * scale[0], -s * scale[1]}, {s * scale[0], c * scale[1]}};
+  for (int row = 0; row < 2; ++row) {
+    out[row][0] = m[row][0];
+    out[row][1] = m[row][1];
+    out[row][2] = center[row] + translate[row] - m[row][0] * center[0] - m[row][1] * center[1];
+  }
+  return true;
+}
+
+// a after b: the rows of (u, v, 1) -> a(b(u, v)).
+void composeTransforms(const float a[2][3], const float b[2][3], float out[2][3]) {
+  float r[2][3];
+  for (int row = 0; row < 2; ++row) {
+    r[row][0] = a[row][0] * b[0][0] + a[row][1] * b[1][0];
+    r[row][1] = a[row][0] * b[0][1] + a[row][1] * b[1][1];
+    r[row][2] = a[row][0] * b[0][2] + a[row][1] * b[1][2] + a[row][2];
+  }
+  std::memcpy(out, r, sizeof(r));
+}
+
+// The inverse of an affine transform's rows (false: singular).
+bool invertTransform(const float in[2][3], float out[2][3]) {
+  const float det = in[0][0] * in[1][1] - in[0][1] * in[1][0];
+  if (std::fabs(det) < 1e-12f)
+    return false;
+  const float a = in[1][1] / det, b = -in[0][1] / det, c = -in[1][0] / det, d = in[0][0] / det;
+  out[0][0] = a;
+  out[0][1] = b;
+  out[1][0] = c;
+  out[1][1] = d;
+  out[0][2] = -(a * in[0][2] + b * in[1][2]);
+  out[1][2] = -(c * in[0][2] + d * in[1][2]);
+  return true;
+}
 struct LayerStatistics {
-  uint32_t materials = 0, noHash = 0, fourWay = 0, modulated = 0, modulateUnread = 0;
+  uint32_t materials = 0, noHash = 0, fourWay = 0, modulated = 0, modulateUnread = 0, perTexel = 0;
   uint32_t displacements = 0, layered = 0, flat = 0, withoutTexture = 0;
   uint32_t baseTriangles = 0, secondTriangles = 0, blendedTriangles = 0;
   uint32_t brushFaces = 0; // two-layer materials on faces without a displacement (no alpha: the first texture)
@@ -1789,6 +1867,34 @@ SecondLayer secondLayer(int base, bool use) {
       ++stats.modulated;
     } else {
       ++stats.modulateUnread;
+    }
+  }
+  // $basetexturetransform2: the second texture's own coordinates (the first
+  // texture's through it), on the layer's triangles (build).
+  if (kv.values.count("$basetexturetransform2") && parseTextureTransform(kv.values["$basetexturetransform2"], out.uv))
+    out.uvTransformed = true;
+  // Per texel: the layer's material carries the mask, at the first texture's
+  // coordinates through $blendmasktransform (Source samples it there), which
+  // are the layer's own through the inverse of $basetexturetransform2.
+  // (The x86 bridge does not carry the material extension: per vertex there.)
+  static const bool perTexel = [] {
+#ifdef _WIN64
+    char v[8] = {};
+    return !(GetEnvironmentVariableA("OPENREMIX_PROXY_BLEND_MODULATION", v, sizeof(v)) && v[0] == '0');
+#else
+    return false;
+#endif
+  }();
+  if (perTexel && out.modulate && !out.masked && out.material >= 0) {
+    Material &layer = g_world.materials[size_t(out.material)];
+    layer.blendMaskCandidates = textureHashes(kv.values["$blendmodulatetexture"]);
+    float maskTransform[2][3] = {{1, 0, 0}, {0, 1, 0}}, toFirst[2][3];
+    if (kv.values.count("$blendmasktransform"))
+      parseTextureTransform(kv.values["$blendmasktransform"], maskTransform);
+    if (!layer.blendMaskCandidates.empty() && invertTransform(out.uv, toFirst)) {
+      composeTransforms(maskTransform, toFirst, layer.blendMask.transform);
+      out.perTexel = true;
+      ++stats.perTexel;
     }
   }
   if (stats.names.size() < 700) {
@@ -3002,12 +3108,21 @@ bool build(const Bsp &bsp) {
       // the surface whose vertex alpha is `blend`.
       constexpr float kLayerOffset = 0.05f; // below the overlays and the engine's decals (0.1)
       std::vector<float> blend;
-      auto emit = [&](Geometry &g, const std::vector<uint32_t> &indices, bool sheet) {
+      // uv (may be null): the second texture's coordinates from the first's.
+      auto emit = [&](Geometry &g, const std::vector<uint32_t> &indices, bool sheet,
+                      const float (*uv)[3] = nullptr) {
         if (indices.empty())
           return;
         const uint32_t base = uint32_t(g.vertices.size());
         const size_t firstIndex = g.indices.size();
         g.vertices.insert(g.vertices.end(), grid.begin(), grid.end());
+        if (uv)
+          for (size_t v = base; v < g.vertices.size(); ++v) {
+            float *t = g.vertices[v].texcoord;
+            const float u0 = t[0], v0 = t[1];
+            t[0] = uv[0][0] * u0 + uv[0][1] * v0 + uv[0][2];
+            t[1] = uv[1][0] * u0 + uv[1][1] * v0 + uv[1][2];
+          }
         if (sheet)
           for (size_t v = 0; v < grid.size(); ++v) {
             auto &vtx = g.vertices[base + v];
@@ -3053,7 +3168,7 @@ bool build(const Bsp &bsp) {
           const float a = alpha[v] / 255;
           if (layer.masked) {
             blend[v] = layer.centre;
-          } else if (layer.modulate) {
+          } else if (layer.modulate && !layer.perTexel) {
             const float x = high > low ? std::clamp((a - low) / (high - low), 0.0f, 1.0f) : (a >= high ? 1.0f : 0.0f);
             blend[v] = x * x * (3 - 2 * x);
           } else {
@@ -3074,8 +3189,9 @@ bool build(const Bsp &bsp) {
         // mesh of the group, and with it the first layer under the sheets.)
         if (!first.empty())
           emit(groupFor(centroid, sky, m, skyboxFace), first, false);
+        const float (*layerUv)[3] = layer.uvTransformed ? layer.uv : nullptr;
         if (!second.empty())
-          emit(groupFor(centroid, sky, layer.material, skyboxFace), second, false);
+          emit(groupFor(centroid, sky, layer.material, skyboxFace), second, false, layerUv);
         if (!mixed.empty()) {
           const bool noCull = g_world.materials[m].noCull;
           std::array<int32_t, 5> key = {int32_t(std::floor(centroid[0] / kCell)), int32_t(std::floor(centroid[1] / kCell)),
@@ -3086,7 +3202,7 @@ bool build(const Bsp &bsp) {
           group.skybox = skyboxFace;
           group.noCull = noCull;
           group.id = XXH3_64bits_withSeed(key.data(), sizeof(key), 0x6c61796572ull) | 1;
-          emit(group.surfaces[uint32_t(layer.material)], mixed, true);
+          emit(group.surfaces[uint32_t(layer.material)], mixed, true, layerUv);
         }
         ++g_world.layers.layered;
         g_world.layers.baseTriangles += uint32_t((first.size() - mixed.size()) / 3);
@@ -3389,10 +3505,17 @@ void submit(MaterialLookup lookup) {
       // (A PBR conversion waits for its maps as well.)
       const bool emissive =
           (m.shading.mode != engine_materials::Shading::Lit || m.shading.pbr.active) && !m.maskDropped;
+      // A blend mask the engine never uploads: blended by vertex alpha alone
+      // after ten seconds.
+      BlendMask blend = m.blendMask;
+      blend.candidates = &m.blendMaskCandidates;
+      const BlendMask *modulated = m.blendMaskCandidates.empty() || m.blendDropped ? nullptr : &blend;
       for (uint64_t h : m.candidates) {
-        auto ref = lookup(h, emissive ? &m.shading : nullptr, &m.maskCandidates, m.pointSample);
-        if (!ref.handle && emissive && frame >= 600 && (ref = lookup(h, nullptr, nullptr, m.pointSample)).handle)
+        auto ref = lookup(h, emissive ? &m.shading : nullptr, &m.maskCandidates, m.pointSample, modulated);
+        if (!ref.handle && emissive && frame >= 600 && (ref = lookup(h, nullptr, nullptr, m.pointSample, modulated)).handle)
           m.maskDropped = true;
+        if (!ref.handle && modulated && frame >= 600 && (ref = lookup(h, nullptr, nullptr, m.pointSample, nullptr)).handle)
+          m.blendDropped = true;
         if (ref.handle) {
           m.ref = std::move(ref);
           m.resolved = true;
@@ -3964,17 +4087,21 @@ void dumpStatistics(FILE *out) {
     uint32_t meshes = 0, waiting = 0;
     for (auto &[key, group] : g_world.layerGroups)
       meshes += group.mesh != nullptr;
-    for (auto &[base, layer] : g_world.secondLayers)
+    uint32_t dropped = 0;
+    for (auto &[base, layer] : g_world.secondLayers) {
       waiting += layer.material >= 0 && !g_world.materials[layer.material].resolved;
+      dropped += layer.material >= 0 && g_world.materials[layer.material].blendDropped;
+    }
     fprintf(out,
             "   BSP second layers ($basetexture2): %u materials on %u displacements (alpha %.0f..%.0f) | layered %u: "
             "triangles first texture %u, second texture %u, blended (decal sheet, vertex alpha) %u in %zu groups (%u "
             "meshes) | not layered: alpha 0 everywhere %u, second texture without a hash %u (%u materials) | second "
-            "textures not uploaded yet %u | $blendmodulatetexture: %u by its mean per vertex, %u not read | 4-way "
+            "textures not uploaded yet %u | $blendmodulatetexture: %u read (%u per texel, OPENREMIX_PROXY_BLEND_MODULATION; "
+            "masks never uploaded %u), %u not read | 4-way "
             "blend materials (layers 3-4 not drawn) %u | on %u faces without a displacement (first texture only)\n%s",
             l.materials, l.displacements, l.displacements ? l.alphaMin : 0.0f, l.alphaMax, l.layered, l.baseTriangles,
             l.secondTriangles, l.blendedTriangles, g_world.layerGroups.size(), meshes, l.flat, l.withoutTexture,
-            l.noHash, waiting, l.modulated, l.modulateUnread, l.fourWay, l.brushFaces, l.names.c_str());
+            l.noHash, waiting, l.modulated, l.perTexel, dropped, l.modulateUnread, l.fourWay, l.brushFaces, l.names.c_str());
   }
   fprintf(out, "   BSP materials with a PBR conversion:\n%s", g_world.pbrNames.c_str());
   {

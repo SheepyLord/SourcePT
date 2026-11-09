@@ -25,8 +25,17 @@ struct MaterialRef {
 // (null handle: not uploaded yet). emission (may be null): its unlit or self-
 // illuminated variant, masked by the first uploaded texture among
 // maskCandidates (null handle while none of them is).
+// blend (may be null): a displacement's second texture as a sheet whose
+// coverage the first uploaded of `candidates` modulates per texel
+// (remixapi_MaterialBlendModulationEXT, with `transform` from the mesh's
+// coordinates; null handle while none of them is uploaded).
+struct BlendMask {
+  const std::vector<uint64_t> *candidates = nullptr;
+  float transform[2][3] = {{1, 0, 0}, {0, 1, 0}};
+};
 using MaterialLookup = MaterialRef (*)(uint64_t textureHash, const engine_materials::Shading *emission,
-                                       const std::vector<uint64_t> *maskCandidates, bool nearest);
+                                       const std::vector<uint64_t> *maskCandidates, bool nearest,
+                                       const BlendMask *blend);
 
 // dxvk hashes a texture ("models/x/y", as materials name it) can be uploaded
 // under: its largest mips, from the VTF file. Empty: no file, or a format the
