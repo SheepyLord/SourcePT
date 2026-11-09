@@ -5,6 +5,7 @@ normal write paths belong to the stage. Installed addons are not copied.
 This tool prepares files only. It does not start the game or install graphics hooks.
 """
 import argparse
+import filecmp
 import hashlib
 import json
 from pathlib import Path
@@ -38,13 +39,18 @@ def prepare(source, destination, proxy, runtime, sdl, *, launcher_only=False):
         raise ValueError("Stage must be a new directory; existing files are never replaced")
     engine = source / "bin/win64"
     client = source / "garrysmod/bin/win64"
+    original_shader = engine / "shaderapidx9_orig.dll"
+    if not original_shader.is_file():
+        original_shader = engine / "shaderapidx9.dll"
+    if original_shader.is_file() and filecmp.cmp(original_shader, proxy, shallow=False):
+        raise ValueError("The original game shader DLL must differ from the proxy")
     copies = [(source / "gmod_win64.exe", Path("gmod_win64.exe"))]
     copies += [(engine / (name + ".dll"), Path("bin/win64") / (name + ".dll"))
                for name in ENGINE_DLLS]
     copies += [(client / (name + ".dll"), Path("garrysmod/bin/win64") / (name + ".dll"))
                for name in CLIENT_DLLS]
     copies += [(engine / "gmod.exe", Path("bin/win64/gmod.exe")),
-               (engine / "shaderapidx9_orig.dll", Path("bin/win64/shaderapidx9_orig.dll")),
+               (original_shader, Path("bin/win64/shaderapidx9_orig.dll")),
                (proxy.resolve(strict=True), Path("bin/win64/shaderapidx9.dll")),
                (runtime.resolve(strict=True), Path("bin/win64/openremix/remix.dll")),
                (sdl.resolve(strict=True), Path("bin/win64/openremix/SDL3_shared.dll"))]
