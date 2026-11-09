@@ -1042,10 +1042,14 @@ extern "C" __declspec(dllexport) void *CreateInterface(const char *name, int *re
   if (!threadsStarted) {
     threadsStarted = true;
 #ifdef PROXY_GAME_GMOD
-    // Workshop content packages: their add-on folders now, ahead of GMod
-    // mounting garrysmod/addons; their Remix mods on a thread that startRemix
-    // waits for (workshop_content.h).
-    proxy::workshop::begin();
+    // Workshop content packages (workshop_content.h): with a runtime this
+    // session, their add-on folders now, ahead of GMod mounting
+    // garrysmod/addons, and their Remix mods on a thread that startRemix waits
+    // for; without one, nothing is placed and their add-ons that need it are
+    // hidden.
+    proxy::workshop::begin(proxy::remix::enabled() &&
+                               GetFileAttributesW((g_dir + proxy::game::kRuntimePath).c_str()) != INVALID_FILE_ATTRIBUTES,
+                           proxy::remix::modsDirectory());
 #endif
     hookFileOpens();
     CloseHandle(CreateThread(nullptr, 0, statisticsThread, nullptr, 0, nullptr));

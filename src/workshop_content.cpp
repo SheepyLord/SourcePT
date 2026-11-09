@@ -1,10 +1,13 @@
 #include "workshop_content.h"
 
+#include "d3d_hooks.h"
 #include "diag.h"
 
 #include <windows.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -14,6 +17,7 @@
 #include <exception>
 #include <list>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <utility>
@@ -30,6 +34,9 @@ constexpr char kAddonsPrefix[] = "garrysmod/addons/";
 constexpr uint64_t kManifestLimit = uint64_t(1) << 20;
 // Left free on the drive after unpacking.
 constexpr uint64_t kDiskMargin = uint64_t(512) << 20;
+
+// Bytes read or written while placing: finish() waits while this moves.
+std::atomic<uint64_t> g_progress{0};
 
 void say(const char *fmt, ...) {
   char text[900];
@@ -75,6 +82,17 @@ bool startsWith(const std::string &s, const std::string &prefix) { return s.comp
 bool endsWith(const std::string &s, const char *suffix) {
   const size_t n = std::strlen(suffix);
   return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
+}
+
+std::vector<std::string> split(const std::string &text, char separator) {
+  std::vector<std::string> fields;
+  for (size_t start = 0;;) {
+    const size_t end = text.find(separator, start);
+    fields.push_back(text.substr(start, end == std::string::npos ? std::string::npos : end - start));
+    if (end == std::string::npos)
+      return fields;
+    start = end + 1;
+  }
 }
 
 // `inner` is `outer` or lies below it ('/' paths, folded).
@@ -132,9 +150,12 @@ std::wstring longPath(const std::wstring &path) {
 }
 
 std::wstring fullPath(const std::wstring &path) {
-  wchar_t out[32768];
-  const DWORD n = GetFullPathNameW(path.c_str(), 32768, out, nullptr);
-  std::wstring full = n && n < 32768 ? std::wstring(out, n) : path;
+  std::wstring full(GetFullPathNameW(path.c_str(), 0, nullptr, nullptr), L'\0');
+  const DWORD n = full.empty() ? 0 : GetFullPathNameW(path.c_str(), DWORD(full.size()), full.data(), nullptr);
+  if (n && n < full.size())
+    full.resize(n);
+  else
+    full = path;
   while (full.size() > 3 && (full.back() == L'\\' || full.back() == L'/'))
     full.pop_back();
   return full;
@@ -191,8 +212,18 @@ bool makeDirectories(const std::wstring &dir) {
   return CreateDirectoryW(longPath(dir).c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS;
 }
 
+// The name a file is written under beside its place, before it goes there.
+std::wstring temporaryName(size_t index) { return L"~sourcept" + std::to_wstring(index) + L".part"; }
+
+bool temporary(const std::wstring &name) {
+  const std::string n = fold(narrow(name));
+  return n.size() > 14 && startsWith(n, "~sourcept") && endsWith(n, ".part") &&
+         std::all_of(n.begin() + 9, n.end() - 5, [](char c) { return c >= '0' && c <= '9'; });
+}
+
 // Removes the empty folders in `dir` and below, deepest first, then `dir` if
-// that leaves it empty (true). Files and links are never touched.
+// that leaves it empty (true). Files and links stay, but for the proxy's own
+// temporary files a start cut short left.
 bool removeEmptyFolders(const std::wstring &dir) {
   bool empty = true;
   WIN32_FIND_DATAW found;
@@ -204,12 +235,30 @@ bool removeEmptyFolders(const std::wstring &dir) {
         continue;
       if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
         empty = removeEmptyFolders(dir + L"\\" + name) && empty;
-      else
+      else if (!temporary(name) || !DeleteFileW(longPath(dir + L"\\" + name).c_str()))
         empty = false;
     } while (FindNextFileW(find, &found));
     FindClose(find);
   }
   return empty && RemoveDirectoryW(longPath(dir).c_str());
+}
+
+// Whether a file (or a link) is anywhere in `dir`; one that cannot be read
+// counts as holding one.
+bool holdsFiles(const std::wstring &dir) {
+  WIN32_FIND_DATAW found;
+  HANDLE find = FindFirstFileW(longPath(dir + L"\\*").c_str(), &found);
+  if (find == INVALID_HANDLE_VALUE)
+    return true;
+  bool any = false;
+  do {
+    const std::wstring name = found.cFileName;
+    if (name != L"." && name != L"..")
+      any = !(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+            (found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) || holdsFiles(dir + L"\\" + name);
+  } while (!any && FindNextFileW(find, &found));
+  FindClose(find);
+  return any;
 }
 
 // The directories directly in `dir` (`directories`) or its files ending in
@@ -318,6 +367,7 @@ std::string hashFile(const std::wstring &path) {
     ok = ReadFile(f, buffer.data(), DWORD(buffer.size()), &got, nullptr) != 0;
     if (!got)
       break;
+    g_progress += got;
   }
   CloseHandle(f);
   return ok ? sha.hex() : std::string();
@@ -844,27 +894,36 @@ public:
     }
   }
   uint64_t position() const { return consumed_ + at_; }
+  // A read failed (as opposed to the file ending): worth trying again later.
+  bool failed() const { return failed_; }
 
 private:
   bool fill() {
     consumed_ += size_;
     at_ = size_ = 0;
     DWORD got = 0;
-    if (!ReadFile(file_, buffer_.data(), DWORD(buffer_.size()), &got, nullptr) || !got)
+    if (!ReadFile(file_, buffer_.data(), DWORD(buffer_.size()), &got, nullptr)) {
+      failed_ = true;
       return false;
+    }
     size_ = got;
-    return true;
+    return got != 0;
   }
   HANDLE file_;
   std::vector<uint8_t> buffer_ = std::vector<uint8_t>(size_t(1) << 16);
   size_t at_ = 0, size_ = 0;
   uint64_t consumed_ = 0;
+  bool failed_ = false;
 };
 
-bool readArchive(HANDLE f, Archive &a, std::string &why) {
+// The index of a GMod addon archive (GMAD 1-3, as gmad writes it). `io`: the
+// failure was a read error, not the archive's contents.
+bool readArchive(HANDLE f, Archive &a, std::string &why, bool &io) {
+  io = false;
   LARGE_INTEGER total;
   if (!GetFileSizeEx(f, &total)) {
-    why = "its size could not be read";
+    why = "its size could not be read (error " + std::to_string(GetLastError()) + ")";
+    io = true;
     return false;
   }
   Reader r(f);
@@ -874,7 +933,8 @@ bool readArchive(HANDLE f, Archive &a, std::string &why) {
   int32_t addonVersion = 0;
   std::string text;
   if (!r.bytes(magic, 4) || std::memcmp(magic, "GMAD", 4) != 0 || !r.bytes(&version, 1) || version < 1 || version > 3) {
-    why = "it is not a GMAD archive";
+    io = r.failed();
+    why = io ? "it could not be read" : "it is not a GMAD archive";
     return false;
   }
   bool ok = r.bytes(&steamId, 8) && r.bytes(&stamp, 8);
@@ -893,7 +953,8 @@ bool readArchive(HANDLE f, Archive &a, std::string &why) {
     a.members.push_back(std::move(m));
   }
   if (!ok) {
-    why = "its index is damaged";
+    io = r.failed();
+    why = io ? "its index could not be read" : "its index is damaged";
     return false;
   }
   uint64_t offset = r.position();
@@ -930,10 +991,41 @@ struct Root {
 
 struct Package {
   std::string item, id, version, manifest; // manifest: the SHA-256 of manifest.json
+  bool requiresRemix = false;              // its add-ons only make sense with a runtime
   std::wstring archivePath;
   Archive archive;
   std::vector<Root> roots;
 };
+
+// The native loader version whose content-package rules this follows: a
+// package that requires a newer loader may rely on rules it does not know.
+constexpr uint64_t kLoaderRules[3] = {0, 16, 0};
+
+// MAJOR.MINOR.PATCH of a SemVer 2.0.0 version (true: `text` is one).
+bool semver(const std::string &text, uint64_t core[3]) {
+  const auto numeric = [](const std::string &s) {
+    return !s.empty() && s.size() <= 18 && std::all_of(s.begin(), s.end(), [](char c) { return c >= '0' && c <= '9'; }) &&
+           (s.size() == 1 || s[0] != '0');
+  };
+  const auto identifiers = [&](const std::string &s, bool pre) {
+    for (const std::string &part : split(s, '.'))
+      if (part.empty() ||
+          !std::all_of(part.begin(), part.end(),
+                       [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '-'; }) ||
+          (pre && std::all_of(part.begin(), part.end(), [](char c) { return c >= '0' && c <= '9'; }) && !numeric(part)))
+        return false;
+    return true;
+  };
+  const size_t plus = text.find('+'), dash = text.substr(0, plus).find('-');
+  const auto parts = split(text.substr(0, std::min(dash, plus)), '.');
+  if (parts.size() != 3 || !std::all_of(parts.begin(), parts.end(), numeric))
+    return false;
+  for (int i = 0; i < 3; ++i)
+    core[i] = std::strtoull(parts[size_t(i)].c_str(), nullptr, 10);
+  if (dash != std::string::npos && !identifiers(text.substr(dash + 1, plus == std::string::npos ? plus : plus - dash - 1), true))
+    return false;
+  return plus == std::string::npos || identifiers(text.substr(plus + 1), false);
+}
 
 // Why the manifest is not a content-only package this proxy can place (empty:
 // it is one), filling `p`. The rules are the native loader's for packages
@@ -958,18 +1050,26 @@ std::string validate(const Json &manifest, Package &p) {
       !std::all_of(id->text.begin(), id->text.end(),
                    [](char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-'; }))
     return "its id is not 1-64 of a-z 0-9 -";
-  if (!version || version->type != Json::String || version->text.empty() || version->text.size() > 256)
-    return "it has no version";
+  uint64_t core[3] = {};
+  if (!version || version->type != Json::String || version->text.size() > 256 || !semver(version->text, core))
+    return "its version is not a SemVer 2.0.0 version";
   p.id = id->text;
   p.version = version->text;
-  for (char &c : p.version)
-    if (static_cast<unsigned char>(c) < 0x20)
-      c = '?';
   const Json *name = manifest.get("name"), *loader = manifest.get("requires_loader"),
              *remix = manifest.get("requires_remix");
-  if ((name && name->type != Json::String) || (loader && loader->type != Json::String) ||
-      (remix && remix->type != Json::Bool))
-    return "its name, requires_loader or requires_remix has the wrong type";
+  if (name && (name->type != Json::String || name->text.empty() || name->text.size() > 128))
+    return "its name is not 1-128 bytes";
+  if (remix && remix->type != Json::Bool)
+    return "its requires_remix is not true or false";
+  p.requiresRemix = remix && remix->boolean;
+  if (loader) {
+    uint64_t needed[3] = {};
+    if (loader->type != Json::String || loader->text.compare(0, 2, ">=") != 0 ||
+        loader->text.find_first_of("-+") != std::string::npos || !semver(loader->text.substr(2), needed))
+      return "its requires_loader is not \">=MAJOR.MINOR.PATCH\"";
+    if (std::lexicographical_compare(kLoaderRules, kLoaderRules + 3, needed, needed + 3))
+      return "it requires loader " + loader->text.substr(2) + ", newer than the rules this follows";
+  }
 
   const Json *kinds = manifest.get("kinds");
   if (!kinds || kinds->type != Json::Array || kinds->items.empty())
@@ -1040,6 +1140,9 @@ std::string validate(const Json &manifest, Package &p) {
         hash->type != Json::String || !lowerHex64(hash->text))
       return "file " + key + " has no size and SHA-256";
     const std::string deployed = key.substr(std::strlen(kRootPrefix)), area = fold(deployed);
+    // Inside a named folder: rtx-remix/mods/<mod>/<file>, garrysmod/addons/<add-on>/<file>.
+    if (std::count(area.begin(), area.end(), '/') < 3)
+      return "file " + deployed + " is not inside a folder of rtx-remix/mods or garrysmod/addons";
     Root *owner = nullptr;
     for (Root &root : p.roots)
       if (within(area, fold(root.path))) {
@@ -1072,6 +1175,9 @@ std::string validate(const Json &manifest, Package &p) {
   for (const Root &root : p.roots)
     if (root.files.empty())
       return "root file " + root.path + " has no files";
+  for (const std::string &kind : kindSet)
+    if (std::none_of(p.roots.begin(), p.roots.end(), [&](const Root &r) { return r.addon == (kind == "lua-addon"); }))
+      return "it declares the kind " + kind + ", which no root file uses";
   // Nothing native rides along unlisted.
   for (const Member &m : p.archive.members) {
     const std::string folded = fold(m.name);
@@ -1082,7 +1188,7 @@ std::string validate(const Json &manifest, Package &p) {
 }
 
 // Unreadable: not an archive this reads (until it changes); Invalid: a
-// package that cannot be placed, or an archive that could not be opened now.
+// package that cannot be placed, or an archive that could not be read now.
 enum class Read { NotPackage, Unreadable, Invalid, Valid };
 
 Read readPackage(const std::string &item, const std::wstring &path, Package &p, std::string &why) {
@@ -1095,9 +1201,10 @@ Read readPackage(const std::string &item, const std::wstring &path, Package &p, 
   p.item = item;
   p.archivePath = path;
   std::string manifest;
-  if (!readArchive(f, p.archive, why)) {
+  bool io = false;
+  if (!readArchive(f, p.archive, why, io)) {
     CloseHandle(f);
-    return Read::Unreadable;
+    return io ? Read::Invalid : Read::Unreadable;
   }
   const auto found = p.archive.byName.find(kManifestPath);
   if (found == p.archive.byName.end()) {
@@ -1141,7 +1248,7 @@ Read readPackage(const std::string &item, const std::wstring &path, Package &p, 
 // ---------------------------------------------------------------- the record of what was placed
 
 struct FileRecord {
-  std::string path; // below the root ('/')
+  std::string path; // below the root ('/'); empty when the root is this file
   uint64_t size = 0, time = 0;
   std::string sha256;
 };
@@ -1150,6 +1257,7 @@ struct RootRecord {
   std::string path;    // as the package names it (rtx-remix/mods/<mod>...)
   std::wstring target; // where it was placed
   std::string item, package, version, manifest;
+  bool requiresRemix = false, createOnly = false;
   std::vector<FileRecord> files;
 };
 
@@ -1158,26 +1266,61 @@ struct ScanRecord {
   bool package = false;
 };
 
-std::vector<std::string> split(const std::string &line, char separator) {
-  std::vector<std::string> fields;
-  for (size_t start = 0;;) {
-    const size_t end = line.find(separator, start);
-    fields.push_back(line.substr(start, end == std::string::npos ? std::string::npos : end - start));
-    if (end == std::string::npos)
-      return fields;
-    start = end + 1;
-  }
+bool itemId(const std::string &name) {
+  return !name.empty() && name.size() <= 20 && name[0] != '0' &&
+         std::all_of(name.begin(), name.end(), [](char c) { return c >= '0' && c <= '9'; });
 }
 
-struct State {
-  std::list<RootRecord> roots;
-  std::map<std::string, ScanRecord> scans; // by item: archives known not to be packages
+// Item ids in numeric order (no leading zeros).
+bool itemBefore(const std::string &a, const std::string &b) { return a.size() != b.size() ? a.size() < b.size() : a < b; }
 
-  void load(const std::wstring &path) {
+bool number(const std::string &s) {
+  return !s.empty() && s.size() <= 20 && std::all_of(s.begin(), s.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+// The part of a root's path below its area: <mod>/... of
+// rtx-remix/mods/<mod>/..., <add-on>/... of garrysmod/addons/<add-on>/....
+std::string belowArea(const std::string &path) {
+  const std::string folded = fold(path);
+  for (const char *area : {kModsPrefix, kAddonsPrefix})
+    if (startsWith(folded, area))
+      return path.substr(std::strlen(area));
+  return path;
+}
+
+bool addonRoot(const std::string &path) { return startsWith(fold(path), kAddonsPrefix); }
+
+// shaderapi_proxy_workshop.txt: its header, then a record per line, fields
+// separated by tabs:
+//   scan <item> <size> <time> <0|1>    the item's archive when it was last read
+//   root <path> <target> <item> <package> <version> <manifest SHA-256> <flags>
+//   file <path below the root> <size> <time> <SHA-256>    of the root above
+// A target inside the game root is kept relative to it, so an install moved
+// or copied with its record still names its own folders. Flags:
+// requires-remix, create-only (none in an older record).
+struct State {
+  std::wstring base; // the game root
+  std::list<RootRecord> roots;
+  std::map<std::string, ScanRecord> scans; // by item
+  size_t dropped = 0;                      // lines load() left out
+
+  // Failed: the record exists but cannot be used; nothing may be decided from
+  // it, and it must not be written over.
+  enum Load { Loaded, Failed };
+  Load load(const std::wstring &path, std::string &why) {
+    roots.clear();
+    scans.clear();
+    dropped = 0;
+    if (!status(path).exists)
+      return Loaded; // the first start
     std::string text;
-    if (!readFile(path, text, uint64_t(256) << 20))
-      return;
-    bool header = false;
+    if (!readFile(path, text, uint64_t(256) << 20)) {
+      why = "it could not be read";
+      return Failed;
+    }
+    if (startsWith(text, "\xEF\xBB\xBF"))
+      text.erase(0, 3); // a byte order mark an editor added
+    bool header = text.empty();
     RootRecord *root = nullptr;
     for (size_t at = 0; at < text.size();) {
       size_t end = text.find('\n', at);
@@ -1188,38 +1331,59 @@ struct State {
       if (!line.empty() && line.back() == '\r')
         line.pop_back();
       if (!header) {
-        if (line != kStateHeader)
-          return;
+        if (line != kStateHeader) {
+          why = "it is not a record this proxy reads";
+          return Failed;
+        }
         header = true;
         continue;
       }
+      if (line.empty())
+        continue;
       const auto f = split(line, '\t');
-      if (f[0] == "scan" && f.size() == 5) {
+      if (f[0] == "scan" && f.size() == 5 && itemId(f[1]) && number(f[2]) && number(f[3]) &&
+          (f[4] == "0" || f[4] == "1")) {
         scans[f[1]] = {std::strtoull(f[2].c_str(), nullptr, 10), std::strtoull(f[3].c_str(), nullptr, 10), f[4] == "1"};
-      } else if (f[0] == "root" && f.size() == 7) {
-        roots.push_back({f[1], widen(f[2]), f[3], f[4], f[5], f[6], {}});
-        root = &roots.back();
-      } else if (f[0] == "file" && f.size() == 5 && root) {
+      } else if (f[0] == "root") {
+        RootRecord r;
+        root = nullptr;
+        if ((f.size() == 7 || f.size() == 8) && rootRecord(f, r) && !find(r.target)) {
+          roots.push_back(std::move(r));
+          root = &roots.back();
+        } else {
+          ++dropped;
+        }
+      } else if (f[0] == "file" && root && f.size() == 5 && (f[1].empty() || !pathProblem(f[1])) && number(f[2]) &&
+                 number(f[3]) && lowerHex64(f[4])) {
         root->files.push_back(
             {f[1], std::strtoull(f[2].c_str(), nullptr, 10), std::strtoull(f[3].c_str(), nullptr, 10), f[4]});
+      } else {
+        ++dropped;
       }
     }
+    if (dropped)
+      say("%s: %zu lines that are not valid records left out", narrow(path).c_str(), dropped);
+    return Loaded;
   }
 
   bool save(const std::wstring &path) const {
     std::string text = std::string(kStateHeader) + "\n";
-    char number[64];
+    char digits[64];
     for (const auto &[item, scan] : scans) {
-      snprintf(number, sizeof(number), "\t%llu\t%llu\t%d\n", (unsigned long long)scan.size,
+      snprintf(digits, sizeof(digits), "\t%llu\t%llu\t%d\n", (unsigned long long)scan.size,
                (unsigned long long)scan.time, scan.package ? 1 : 0);
-      text += "scan\t" + item + number;
+      text += "scan\t" + item + digits;
     }
     for (const RootRecord &root : roots) {
-      text += "root\t" + root.path + "\t" + narrow(root.target) + "\t" + root.item + "\t" + root.package + "\t" +
-              root.version + "\t" + root.manifest + "\n";
+      const std::wstring &t = root.target;
+      std::string flags = root.requiresRemix ? "requires-remix" : "";
+      if (root.createOnly)
+        flags += flags.empty() ? "create-only" : ",create-only";
+      text += "root\t" + root.path + "\t" + narrow(t.size() > base.size() + 1 && overlaps(t, base) ? t.substr(base.size() + 1) : t) +
+              "\t" + root.item + "\t" + root.package + "\t" + root.version + "\t" + root.manifest + "\t" + flags + "\n";
       for (const FileRecord &file : root.files) {
-        snprintf(number, sizeof(number), "\t%llu\t%llu\t", (unsigned long long)file.size, (unsigned long long)file.time);
-        text += "file\t" + file.path + number + file.sha256 + "\n";
+        snprintf(digits, sizeof(digits), "\t%llu\t%llu\t", (unsigned long long)file.size, (unsigned long long)file.time);
+        text += "file\t" + file.path + digits + file.sha256 + "\n";
       }
     }
     // A whole new record or the old one.
@@ -1241,6 +1405,45 @@ struct State {
       if (samePath(root.target, target))
         return &root;
     return nullptr;
+  }
+
+private:
+  // A root line, checked before anything is done with it: a path a package
+  // could name, an item id, and a target with no empty, . or .. component
+  // that is that path's place (<area>\<mod>..., or the game's
+  // garrysmod\addons\<add-on>...).
+  bool rootRecord(const std::vector<std::string> &f, RootRecord &r) const {
+    const std::string folded = fold(f[1]);
+    if (pathProblem(f[1]) || !(startsWith(folded, kModsPrefix) || addonRoot(f[1])) ||
+        std::count(folded.begin(), folded.end(), '/') < 2 || !itemId(f[3]))
+      return false;
+    std::string rest = f[2];
+    const bool drive = rest.size() > 3 && std::isalpha(static_cast<unsigned char>(rest[0])) && rest[1] == ':' &&
+                       rest[2] == '\\';
+    const bool unc = !drive && startsWith(rest, "\\\\");
+    rest.erase(0, drive ? 3 : unc ? 2 : 0);
+    for (const std::string &part : split(rest, '\\'))
+      if (part.empty() || part == "." || part == ".." || part.find('/') != std::string::npos)
+        return false;
+    r.target = drive || unc ? widen(f[2]) : base + L"\\" + widen(f[2]);
+    const std::wstring tail = below(L"", belowArea(f[1]));
+    const bool placed = addonRoot(f[1])
+                            ? samePath(r.target, below(base, f[1]))
+                            : r.target.size() > tail.size() && r.target[r.target.size() - tail.size() - 1] == L'\\' &&
+                                  samePath(r.target.substr(r.target.size() - tail.size()), tail);
+    if (!placed)
+      return false;
+    r.path = f[1];
+    r.item = f[3];
+    r.package = f[4];
+    r.version = f[5];
+    r.manifest = f[6];
+    if (f.size() == 8)
+      for (const std::string &flag : split(f[7], ',')) {
+        r.requiresRemix = r.requiresRemix || flag == "requires-remix";
+        r.createOnly = r.createOnly || flag == "create-only";
+      }
+    return true;
   }
 };
 
@@ -1279,14 +1482,6 @@ int subscribed(const std::map<std::string, const Vdf *> *details, const std::str
   return account ? 1 : 0;
 }
 
-bool itemId(const std::string &name) {
-  return !name.empty() && name.size() <= 20 && name[0] != '0' &&
-         std::all_of(name.begin(), name.end(), [](char c) { return c >= '0' && c <= '9'; });
-}
-
-// Item ids in numeric order (no leading zeros).
-bool itemBefore(const std::string &a, const std::string &b) { return a.size() != b.size() ? a.size() < b.size() : a < b; }
-
 std::wstring steamFromRegistry() {
   const HMODULE advapi = LoadLibraryExW(L"advapi32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
   using GetValue = LSTATUS(WINAPI *)(HKEY, LPCWSTR, LPCWSTR, DWORD, LPDWORD, PVOID, LPDWORD);
@@ -1302,8 +1497,9 @@ std::wstring steamFromRegistry() {
 }
 
 // The steamapps folder of the library holding GMod's Workshop items: the
-// game's own when it is installed in one (<library>\steamapps\common\<game>),
-// else (an install of its own, as RTXLauncher makes) the library Steam's
+// game's own when it is installed in one (<library>\steamapps\common\<game>)
+// that has GMod's Workshop record, else (an install of its own, as
+// RTXLauncher makes, or a copy in another library) the library Steam's
 // libraryfolders.vdf lists app 4000 in, else any with GMod's Workshop folder.
 std::wstring findLibrary(const Options &o, std::string &how) {
   if (!o.steamapps.empty()) {
@@ -1312,7 +1508,8 @@ std::wstring findLibrary(const Options &o, std::string &how) {
   }
   const std::wstring parent = parentOf(o.gameRoot), grandparent = parentOf(parent);
   if (samePath(parent.substr(parent.find_last_of(L'\\') + 1), L"common") &&
-      samePath(grandparent.substr(grandparent.find_last_of(L'\\') + 1), L"steamapps")) {
+      samePath(grandparent.substr(grandparent.find_last_of(L'\\') + 1), L"steamapps") &&
+      status(grandparent + L"\\workshop\\appworkshop_4000.acf").exists) {
     how = "the game's library";
     return grandparent;
   }
@@ -1348,18 +1545,20 @@ struct Planned {
   std::wstring target;
 };
 
-// Copies an archive member through a temporary file beside `path`, checking
-// its size and SHA-256: the file appears whole, as the manifest has it, or not
-// at all.
-bool extract(HANDLE archive, const Member &m, const std::wstring &path, const std::string &sha256,
+// Writes an archive member to `temp`, beside where it goes, checking its size
+// and SHA-256: only a whole file that is what the manifest says is ever put
+// in place. Written through to the disk (about 15% slower than cached, a
+// flush per file doubles the time), so a power cut cannot leave one whose
+// size and time match the record but not its contents. On failure `temp` is
+// gone.
+bool extract(HANDLE archive, const Member &m, const std::wstring &temp, const std::string &sha256,
              std::vector<uint8_t> &buffer, std::string &why) {
-  if (!makeDirectories(parentOf(path))) {
-    why = "its folder could not be made";
+  if (!makeDirectories(parentOf(temp))) {
+    why = "its folder could not be made (error " + std::to_string(GetLastError()) + ")";
     return false;
   }
-  const std::wstring temp = path + L".sourcept-part";
   HANDLE out = CreateFileW(longPath(temp).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                           FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_WRITE_THROUGH, nullptr);
   if (out == INVALID_HANDLE_VALUE) {
     why = "error " + std::to_string(GetLastError()) + " making it";
     return false;
@@ -1367,28 +1566,35 @@ bool extract(HANDLE archive, const Member &m, const std::wstring &path, const st
   LARGE_INTEGER at;
   at.QuadPart = LONGLONG(m.offset);
   Sha256 sha;
-  bool ok = sha.ok() && SetFilePointerEx(archive, at, nullptr, FILE_BEGIN);
-  for (uint64_t left = m.size; ok && left;) {
+  std::string failure;
+  if (!sha.ok())
+    failure = "SHA-256 is not available (bcrypt.dll)";
+  else if (!SetFilePointerEx(archive, at, nullptr, FILE_BEGIN))
+    failure = "error " + std::to_string(GetLastError()) + " reading the archive";
+  for (uint64_t left = m.size; failure.empty() && left;) {
     const DWORD chunk = DWORD(std::min<uint64_t>(left, buffer.size()));
     DWORD got = 0, wrote = 0;
-    ok = ReadFile(archive, buffer.data(), chunk, &got, nullptr) && got == chunk;
-    if (ok) {
-      sha.update(buffer.data(), got);
-      ok = WriteFile(out, buffer.data(), got, &wrote, nullptr) && wrote == got;
+    if (!ReadFile(archive, buffer.data(), chunk, &got, nullptr)) {
+      failure = "error " + std::to_string(GetLastError()) + " reading the archive";
+    } else if (got != chunk) {
+      failure = "the archive is shorter than its index (changed since it was read?)";
+    } else if (sha.update(buffer.data(), got), !WriteFile(out, buffer.data(), got, &wrote, nullptr)) {
+      failure = "error " + std::to_string(GetLastError()) + " writing it";
+    } else if (wrote != got) {
+      failure = "a short write";
+    } else {
       left -= got;
+      g_progress += got;
     }
   }
-  const DWORD error = ok ? 0 : GetLastError();
   CloseHandle(out);
-  const bool same = ok && sha.hex() == sha256;
-  if (!same || !MoveFileExW(longPath(temp).c_str(), longPath(path).c_str(), MOVEFILE_REPLACE_EXISTING)) {
-    why = !ok     ? "error " + std::to_string(error) + " copying it"
-          : !same ? std::string("its SHA-256 differs from the manifest's")
-                  : "error " + std::to_string(GetLastError()) + " putting it in place";
-    DeleteFileW(longPath(temp).c_str());
-    return false;
-  }
-  return true;
+  if (failure.empty() && sha.hex() != sha256)
+    failure = "its SHA-256 differs from the manifest's";
+  if (failure.empty())
+    return true;
+  why = failure;
+  DeleteFileW(longPath(temp).c_str());
+  return false;
 }
 
 // Whether the file at `path` is still what the record says was placed there.
@@ -1400,13 +1606,76 @@ bool unchanged(const std::wstring &path, const FileRecord &record, Status &s) {
   return s.time == record.time || hashFile(path) == record.sha256;
 }
 
+// A file the runtime finds a mod by (mod.usda, .usdc or .usd, at any depth):
+// put in place last, so a mod is never found half placed.
+bool entryFile(const Root &root, const File &file) {
+  const std::string path = fold(file.path.empty() ? root.path : file.path);
+  const std::string name = path.substr(path.find_last_of('/') + 1);
+  return name == "mod.usda" || name == "mod.usdc" || name == "mod.usd";
+}
+
 class Deployer {
 public:
-  explicit Deployer(Options options) : o_(std::move(options)) {}
+  explicit Deployer(Options options) : o_(std::move(options)) {
+    state_.base = o_.gameRoot;
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    wchar_t stamp[32];
+    swprintf(stamp, 32, L"%04u%02u%02u-%02u%02u%02u", unsigned(t.wYear), unsigned(t.wMonth), unsigned(t.wDay),
+             unsigned(t.wHour), unsigned(t.wMinute), unsigned(t.wSecond));
+    backup_ = parentOf(o_.statePath) + L"\\shaderapi_proxy_workshop_backup\\" + stamp;
+  }
+  ~Deployer() {
+    if (lock_ != INVALID_HANDLE_VALUE)
+      CloseHandle(lock_);
+  }
+  Deployer(const Deployer &) = delete;
+  Deployer &operator=(const Deployer &) = delete;
+
+  // The record alone. False when it cannot be used: then nothing is placed or
+  // removed, and it is not written over.
+  bool load() {
+    std::string why;
+    if (state_.load(o_.statePath, why) == State::Loaded)
+      return true;
+    say("%s: %s: nothing placed or removed (moved away, the proxy starts a new record, and leaves the folders it "
+        "placed alone)",
+        narrow(o_.statePath).c_str(), why.c_str());
+    return false;
+  }
+
+  // The add-on folders (names below garrysmod/addons, upper case) the record
+  // has for packages that require Remix.
+  std::vector<std::wstring> rtxOnlyAddons() const {
+    std::vector<std::wstring> names;
+    for (const RootRecord &root : state_.roots)
+      if (root.requiresRemix && addonRoot(root.path)) {
+        const std::string rest = belowArea(root.path);
+        const std::wstring name = upper(widen(rest.substr(0, rest.find('/'))));
+        if (std::find(names.begin(), names.end(), name) == names.end())
+          names.push_back(name);
+      }
+    return names;
+  }
 
   // Steam's records, the packages and where each of their roots goes.
   void prepare() {
-    state_.load(o_.statePath);
+    // One game at a time places packages, until it is done with them (two
+    // -multirun clients would each write the record from their own copy):
+    // the other places nothing.
+    lock_ = CreateFileW(longPath(o_.statePath + L".lock").c_str(), GENERIC_WRITE | DELETE, 0, nullptr, OPEN_ALWAYS,
+                        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (lock_ == INVALID_HANDLE_VALUE) {
+      const DWORD error = GetLastError();
+      if (error == ERROR_SHARING_VIOLATION)
+        say("another game is placing Workshop packages: nothing placed or removed");
+      else
+        say("%s.lock could not be made (error %lu): nothing placed or removed", narrow(o_.statePath).c_str(), error);
+      load();
+      return;
+    }
+    if (!load())
+      return;
     std::string how;
     const std::wstring steamapps = findLibrary(o_, how);
     if (steamapps.empty()) {
@@ -1446,6 +1715,7 @@ public:
       subscriptions += sub == 1;
       if (sub == 0 || disabled.count(item))
         continue; // what was placed from it goes
+      const auto cached = state_.scans.find(item);
       const bool placedFrom =
           std::any_of(state_.roots.begin(), state_.roots.end(), [&](const RootRecord &r) { return r.item == item; });
       const auto keep = [&](const char *why) {
@@ -1456,6 +1726,8 @@ public:
           }
       };
       if (sub < 0) {
+        if (cached != state_.scans.end())
+          scans[item] = cached->second; // as known: Steam's record says nothing new
         keep("Steam's record does not say whether it is subscribed");
         continue;
       }
@@ -1467,7 +1739,6 @@ public:
       }
       const std::wstring archive = folder + L"\\" + archives[0];
       const Status s = status(archive);
-      const auto cached = state_.scans.find(item);
       if (cached != state_.scans.end() && !cached->second.package && cached->second.size == s.size &&
           cached->second.time == s.time) {
         scans[item] = cached->second;
@@ -1504,28 +1775,34 @@ public:
 
     // Where each root goes. Of two packages with one id, or with roots that
     // overlap, the first item's is placed; a root the record keeps holds its
-    // place.
+    // place. A package that is not placed takes no id.
     std::set<std::string> ids;
     for (const Package &p : packages_) {
       std::vector<Planned> roots;
       std::string clash;
-      if (!ids.insert(p.id).second)
+      if (ids.count(p.id))
         clash = "an earlier item has the same package id";
       for (const Root &root : p.roots) {
-        const std::wstring target = root.addon ? below(o_.gameRoot, root.path)
-                                               : below(o_.modsDir, root.path.substr(std::strlen(kModsPrefix)));
+        if (!root.addon && o_.modsDir.empty())
+          continue; // the runtime reads no mods: the ones placed before stay as they are
+        const std::wstring target =
+            root.addon ? below(o_.gameRoot, root.path) : below(o_.modsDir, belowArea(root.path));
         for (const std::wstring &other : kept_)
           if (clash.empty() && overlaps(target, other))
             clash = "it overlaps " + narrow(other) + ", which stays as it is";
         for (const Planned &other : plan_)
           if (clash.empty() && overlaps(target, other.target))
             clash = "it overlaps " + other.root->path + " of item " + other.package->item;
+        for (const Planned &other : roots)
+          if (clash.empty() && overlaps(target, other.target))
+            clash = "its " + other.root->path + " and " + root.path + " would go to one folder";
         roots.push_back({&p, &root, target});
       }
       if (!clash.empty()) {
         say("item %s (%s %s): not placed: %s", p.item.c_str(), p.id.c_str(), p.version.c_str(), clash.c_str());
         continue;
       }
+      ids.insert(p.id);
       plan_.insert(plan_.end(), roots.begin(), roots.end());
       say("item %s: %s %s, %zu root file%s", p.item.c_str(), p.id.c_str(), p.version.c_str(), p.roots.size(),
           p.roots.size() == 1 ? "" : "s");
@@ -1533,14 +1810,18 @@ public:
     say("%s (%s): %zu subscribed items, %zu content packages", narrow(steamapps).c_str(), how.c_str(), subscriptions,
         packages_.size());
     ready_ = true;
-    if (rescanned)
+    if (rescanned || state_.dropped)
       save();
   }
 
   // Add-on folders, before GMod mounts garrysmod/addons.
   void addons() { apply(true); }
-  // Remix mods, before the runtime reads the mods directory.
-  void mods() { apply(false); }
+  // Remix mods, before the runtime reads the mods directory. Without one the
+  // mods placed before stay as they are.
+  void mods() {
+    if (!o_.modsDir.empty())
+      apply(false);
+  }
 
 private:
   Options o_;
@@ -1548,12 +1829,15 @@ private:
   std::list<Package> packages_;
   std::vector<Planned> plan_;
   std::vector<std::wstring> kept_;
-  std::vector<uint8_t> buffer_;
+  std::wstring backup_; // this start's backup folder
+  HANDLE lock_ = INVALID_HANDLE_VALUE;
   bool ready_ = false;
 
-  void save() {
-    if (!state_.save(o_.statePath))
-      say("could not write %s (error %lu)", narrow(o_.statePath).c_str(), GetLastError());
+  bool save() {
+    if (state_.save(o_.statePath))
+      return true;
+    say("could not write %s (error %lu)", narrow(o_.statePath).c_str(), GetLastError());
+    return false;
   }
 
   void apply(bool addons) {
@@ -1564,50 +1848,107 @@ private:
       const auto same = [&](const std::wstring &target) { return samePath(target, it->target); };
       const bool stays = std::any_of(plan_.begin(), plan_.end(), [&](const Planned &p) { return same(p.target); }) ||
                          std::any_of(kept_.begin(), kept_.end(), same);
-      if (stays || startsWith(fold(it->path), kAddonsPrefix) != addons) {
+      if (stays || addonRoot(it->path) != addons) {
         ++it;
         continue;
       }
-      const bool hadFiles = !it->files.empty();
+      const size_t before = it->files.size();
       remove(*it);
-      if (status(it->target).exists) {
-        // What stays (files changed since they were placed) keeps the folder
-        // the proxy's: subscribed again, the package is placed around them.
-        it->files.clear();
-        ++it;
-        if (!hadFiles)
-          continue; // as it was
-      } else {
-        it = state_.roots.erase(it);
-      }
-      save();
+      // Kept: files that could not be taken away (tried again at the next
+      // start), or a folder with someone else's files in it, which stays the
+      // proxy's (subscribed again, the package is placed around them).
+      const bool gone = it->files.empty() && !status(it->target).exists;
+      const bool changed = gone || it->files.size() != before;
+      it = gone ? state_.roots.erase(it) : std::next(it);
+      if (changed)
+        save();
     }
     for (const Planned &p : plan_)
       if (p.root->addon == addons)
         place(p);
   }
 
-  // Takes away what was placed for a root, but a file changed since, and the
-  // folders that leaves empty.
-  void remove(const RootRecord &root) {
-    size_t removed = 0, stayed = 0;
+  // Moves a file the proxy does not keep where it is (one it placed that
+  // changed since, or someone else's in a package file's place) into this
+  // start's backup folder: no change is lost.
+  bool backup(const std::string &rootPath, const std::string &filePath, const std::wstring &path) {
+    if (!status(path).exists)
+      return true;
+    const std::wstring to = below(below(backup_, rootPath), filePath);
+    if (makeDirectories(parentOf(to)) &&
+        MoveFileExW(longPath(path).c_str(), longPath(to).c_str(), MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH))
+      return true;
+    const DWORD error = GetLastError();
+    say("%s could not be moved to %s (error %lu): it stays", narrow(path).c_str(), narrow(to).c_str(), error);
+    return false;
+  }
+
+  // The folders above a root that placing it made (rtx-remix/mods/<pack> of
+  // rtx-remix/mods/<pack>/<mod>) once they are empty; never its area.
+  static void removeEmptyParents(const RootRecord &root) {
+    const std::string rest = belowArea(root.path);
+    std::wstring dir = root.target;
+    for (auto depth = std::count(rest.begin(), rest.end(), '/'); depth > 0; --depth) {
+      dir = parentOf(dir);
+      const DWORD attributes = GetFileAttributesW(longPath(dir).c_str());
+      if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+          !RemoveDirectoryW(longPath(dir).c_str()))
+        break;
+    }
+  }
+
+  // Takes away what was placed for a root: its files as placed, a
+  // replace-owned one changed since into the backup (a create-only one stays
+  // the player's), and the folders that leaves empty. What could not be taken
+  // away stays in `root.files`.
+  void remove(RootRecord &root) {
+    size_t removed = 0, backedUp = 0, theirs = 0;
+    std::vector<FileRecord> left;
     for (const FileRecord &file : root.files) {
       const std::wstring path = below(root.target, file.path);
       Status s;
-      if (unchanged(path, file, s) && DeleteFileW(longPath(path).c_str()))
-        ++removed;
-      else if (status(path).exists)
-        ++stayed;
+      if (unchanged(path, file, s)) {
+        if (DeleteFileW(longPath(path).c_str()))
+          ++removed;
+        else
+          left.push_back(file);
+      } else if (s.exists && !s.directory) {
+        if (root.createOnly)
+          ++theirs;
+        else if (backup(root.path, file.path, path))
+          ++backedUp;
+        else
+          left.push_back(file);
+      }
     }
+    const bool had = !root.files.empty();
+    root.files = std::move(left);
     const bool gone = removeEmptyFolders(root.target) || !status(root.target).exists;
-    if (root.files.empty())
-      return; // removed before; something changed stays
+    if (gone)
+      removeEmptyParents(root);
+    if (!had)
+      return; // taken away before; what stays is someone else's
     std::string line = root.path + " (item " + root.item + ", " + root.package + "): " + std::to_string(removed) +
                        " files removed";
-    if (!gone)
-      line += stayed ? ", " + std::to_string(stayed) + " changed since they were placed stay"
-                     : std::string(", files someone else put there stay");
+    if (backedUp)
+      line += ", " + std::to_string(backedUp) + " changed since they were placed moved to " + narrow(backup_);
+    if (theirs)
+      line += ", " + std::to_string(theirs) + " create-only files changed since they were placed stay";
+    if (!root.files.empty())
+      line += ", " + std::to_string(root.files.size()) + " could not be removed (tried again at the next start)";
+    else if (!gone)
+      line += ", files someone else put there stay";
     say("%s", line.c_str());
+  }
+
+  void commit(RootRecord *record, const std::map<std::string, FileRecord> &placed, bool &dirty) {
+    if (!record || !dirty)
+      return;
+    record->files.clear();
+    for (const auto &entry : placed)
+      record->files.push_back(entry.second);
+    save();
+    dirty = false;
   }
 
   void place(const Planned &p) {
@@ -1616,54 +1957,41 @@ private:
     const std::string label = root.path + " (item " + package.item + ", " + package.id + " " + package.version + ")";
     RootRecord *record = state_.find(p.target);
     if (!record) {
-      if (status(p.target).exists) {
+      // A folder is the proxy's once its record says so. One with files in
+      // it, or a file there, is someone else's.
+      const Status s = status(p.target);
+      if (s.exists && (!s.directory || holdsFiles(p.target))) {
         say("%s: left alone: %s was not placed by the proxy (with it gone, the proxy places the package)",
             label.c_str(), narrow(p.target).c_str());
         return;
       }
-      state_.roots.push_back({root.path, p.target, package.item, package.id, {}, {}, {}});
-      record = &state_.roots.back();
-      save(); // the folder is the proxy's from here on
     }
-    bool dirty = record->path != root.path || record->item != package.item || record->package != package.id;
-    record->path = root.path;
-    record->item = package.item;
-    record->package = package.id;
     std::map<std::string, FileRecord> placed; // by folded path
-    for (const FileRecord &file : record->files)
-      placed[fold(file.path)] = file;
-    // Written only when something changed: most starts change nothing.
-    const auto commit = [&] {
-      if (!dirty)
-        return;
-      record->files.clear();
-      for (const auto &entry : placed)
-        record->files.push_back(entry.second);
-      save();
-      dirty = false;
-    };
-
-    // Files the package no longer has go.
-    std::set<std::string> wanted;
-    for (const File &file : root.files)
-      wanted.insert(fold(file.path));
-    size_t dropped = 0;
-    for (auto it = placed.begin(); it != placed.end();) {
-      if (wanted.count(it->first)) {
-        ++it;
-        continue;
-      }
-      const std::wstring path = below(p.target, it->second.path);
-      Status s;
-      dropped += unchanged(path, it->second, s) && DeleteFileW(longPath(path).c_str());
-      it = placed.erase(it);
-      dirty = true;
+    bool dirty = false;
+    if (record) {
+      for (const FileRecord &file : record->files)
+        placed[fold(file.path)] = file;
+      dirty = record->path != root.path || record->item != package.item || record->package != package.id ||
+              record->requiresRemix != package.requiresRemix || record->createOnly != root.createOnly;
+      record->path = root.path;
+      record->item = package.item;
+      record->package = package.id;
+      record->requiresRemix = package.requiresRemix;
+      record->createOnly = root.createOnly;
     }
 
-    // What to write: missing files, and the proxy's own of an earlier version.
-    // A file changed since it was placed, or someone else's, stays, unless it
-    // already is the package's.
-    std::vector<const File *> jobs;
+    // What each file needs. One as the proxy placed it is replaced by a new
+    // version; one that already is the package's is taken as placed; a
+    // missing one is written. A changed one, or someone else's, stays while
+    // it is a create-only file or an edit of a file the package has not
+    // changed since; otherwise the package's goes in, and the changed one into
+    // the backup.
+    struct Job {
+      const File *file;
+      std::wstring path, temp;
+      bool backup;
+    };
+    std::vector<Job> jobs;
     size_t current = 0, stayed = 0;
     uint64_t bytes = 0;
     std::string firstStayed;
@@ -1671,47 +1999,57 @@ private:
       const std::wstring path = below(p.target, file.path);
       const std::string key = fold(file.path);
       const auto found = placed.find(key);
+      const bool recorded = found != placed.end();
       Status s;
-      bool write = true;
-      if (found != placed.end()) {
-        if (unchanged(path, found->second, s)) {
-          dirty = dirty || found->second.time != s.time;
-          found->second.time = s.time;
-          write = found->second.sha256 != file.sha256 && !root.createOnly;
-        } else if (s.exists) {
-          placed.erase(found); // someone else's now
+      if (recorded && unchanged(path, found->second, s)) {
+        if (found->second.time != s.time) {
+          found->second.time = s.time; // touched, not changed
           dirty = true;
-          write = false;
-          if (!stayed++)
-            firstStayed = file.path;
         }
-      } else if ((s = status(path)).exists) {
-        write = false;
-        if (!s.directory && s.size == file.size && hashFile(path) == file.sha256) {
+        if (found->second.sha256 == file.sha256 || root.createOnly) {
+          ++current;
+          continue;
+        }
+        jobs.push_back({&file, path, {}, false});
+      } else {
+        if (!recorded)
+          s = status(path);
+        if (!s.exists) {
+          jobs.push_back({&file, path, {}, false});
+        } else if (!s.directory && s.size == file.size && hashFile(path) == file.sha256) {
           placed[key] = {file.path, s.size, s.time, file.sha256}; // already the package's
           dirty = true;
-        } else if (!stayed++) {
-          firstStayed = file.path;
+          ++current;
+          continue;
+        } else if (s.directory || root.createOnly || (recorded && found->second.sha256 == file.sha256)) {
+          if (recorded && s.directory) {
+            placed.erase(found); // a folder now: not the proxy's file
+            dirty = true;
+          }
+          if (!stayed++)
+            firstStayed = file.path;
+          continue;
+        } else {
+          jobs.push_back({&file, path, {}, true});
         }
       }
-      if (write) {
-        jobs.push_back(&file);
-        bytes += file.size;
-      } else if (placed.count(key)) {
-        ++current;
-      }
+      bytes += file.size;
     }
-    // A mod is found by its mod.usda: written last, a mod is never read half
-    // placed.
-    std::stable_partition(jobs.begin(), jobs.end(), [](const File *file) {
-      const std::string name = fold(file->path);
-      return name != "mod.usda" && name != "mod.usdc" && name != "mod.usd";
-    });
+    if (!record && jobs.empty()) {
+      say("%s: nothing to place (folders where its files go)", label.c_str());
+      return;
+    }
+    std::stable_partition(jobs.begin(), jobs.end(), [&](const Job &job) { return !entryFile(root, *job.file); });
 
-    size_t written = 0, failed = 0;
+    size_t written = 0, failed = 0, dropped = 0, backedUp = 0, undeletable = 0;
     std::string firstFailure;
+    const auto fail = [&](const std::string &what) {
+      if (!failed++)
+        firstFailure = what;
+    };
     const ULONGLONG started = GetTickCount64();
     if (!jobs.empty()) {
+      // Room for the new files beside the old ones.
       std::wstring existing = p.target;
       while (!existing.empty() && !status(existing).exists)
         existing = parentOf(existing);
@@ -1720,7 +2058,7 @@ private:
           available.QuadPart < bytes + kDiskMargin) {
         say("%s: not placed: it needs %s, and the drive has %s free", label.c_str(), gib(bytes).c_str(),
             gib(available.QuadPart).c_str());
-        commit();
+        commit(record, placed, dirty);
         return;
       }
       HANDLE archive = CreateFileW(longPath(package.archivePath).c_str(), GENERIC_READ,
@@ -1728,39 +2066,90 @@ private:
                                    FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
       if (archive == INVALID_HANDLE_VALUE) {
         say("%s: not placed: its archive could not be opened (error %lu)", label.c_str(), GetLastError());
-        commit();
+        commit(record, placed, dirty);
         return;
       }
-      buffer_.resize(size_t(4) << 20);
-      uint64_t sinceCommit = 0;
-      for (const File *file : jobs) {
-        const std::wstring path = below(p.target, file->path);
-        std::string why;
-        if (!extract(archive, package.archive.members[file->member], path, file->sha256, buffer_, why)) {
-          if (!failed++)
-            firstFailure = file->path + ": " + why;
-          continue;
-        }
-        const Status s = status(path);
-        placed[fold(file->path)] = {file->path, s.size, s.time, file->sha256};
-        dirty = true;
-        ++written;
-        // The record keeps up: a start cut short need not check these again.
-        if ((sinceCommit += file->size) >= (uint64_t(1) << 30)) {
-          sinceCommit = 0;
-          commit();
+      if (!record) {
+        // The folder is the proxy's from here on, once the record says so.
+        state_.roots.push_back(
+            {root.path, p.target, package.item, package.id, {}, {}, package.requiresRemix, root.createOnly, {}});
+        record = &state_.roots.back();
+        if (!save()) {
+          state_.roots.pop_back();
+          CloseHandle(archive);
+          say("%s: not placed: the record could not be written", label.c_str());
+          return;
         }
       }
+      // Every new file is written and checked beside its place first (what a
+      // start cut short left there goes): a version goes in whole or not at
+      // all. Then each is put in place, the entry files last.
+      removeEmptyFolders(p.target);
+      std::vector<uint8_t> buffer(size_t(4) << 20);
+      for (size_t i = 0; i < jobs.size() && !failed; ++i) {
+        std::string why;
+        const std::wstring temp = parentOf(jobs[i].path) + L"\\" + temporaryName(i);
+        if (extract(archive, package.archive.members[jobs[i].file->member], temp, jobs[i].file->sha256, buffer, why))
+          jobs[i].temp = temp;
+        else
+          fail(jobs[i].file->path + ": " + why);
+      }
       CloseHandle(archive);
+      for (Job &job : jobs) {
+        if (job.temp.empty())
+          continue;
+        if (!failed) {
+          if (job.backup && !backup(root.path, job.file->path, job.path)) {
+            fail(job.file->path + ": what is in its place could not be moved to the backup");
+          } else if (!MoveFileExW(longPath(job.temp).c_str(), longPath(job.path).c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            fail(job.file->path + ": error " + std::to_string(GetLastError()) + " putting it in place");
+          } else {
+            const Status s = status(job.path);
+            placed[fold(job.file->path)] = {job.file->path, s.size, s.time, job.file->sha256};
+            dirty = true;
+            ++written;
+            backedUp += job.backup;
+            continue;
+          }
+        }
+        DeleteFileW(longPath(job.temp).c_str());
+      }
+    }
+
+    // The files this version no longer has go once it is in place (a changed
+    // replace-owned one into the backup). One that cannot stays recorded, to
+    // be tried again at the next start.
+    std::set<std::string> wanted;
+    for (const File &file : root.files)
+      wanted.insert(fold(file.path));
+    for (auto it = placed.begin(); !failed && it != placed.end();) {
+      if (wanted.count(it->first)) {
+        ++it;
+        continue;
+      }
+      const std::wstring path = below(p.target, it->second.path);
+      Status s;
+      const bool ours = unchanged(path, it->second, s);
+      const bool changed = !ours && s.exists && !s.directory && !root.createOnly;
+      if ((ours && !DeleteFileW(longPath(path).c_str())) || (changed && !backup(root.path, it->second.path, path))) {
+        ++undeletable;
+        ++it;
+        continue;
+      }
+      dropped += ours;
+      backedUp += changed;
+      it = placed.erase(it);
+      dirty = true;
     }
     if (!failed && (record->version != package.version || record->manifest != package.manifest)) {
       record->version = package.version;
       record->manifest = package.manifest;
       dirty = true;
     }
-    commit();
-    // Nothing of it could be placed: no empty folders left behind.
+    commit(record, placed, dirty);
+    // Nothing of it placed: no claim or empty folders left behind.
     if (placed.empty() && removeEmptyFolders(p.target)) {
+      removeEmptyParents(*record);
       state_.roots.remove_if([&](const RootRecord &r) { return &r == record; });
       save();
     }
@@ -1773,20 +2162,181 @@ private:
     line += std::to_string(current) + " up to date";
     if (dropped)
       line += ", " + std::to_string(dropped) + " it no longer has removed";
+    if (backedUp)
+      line += ", " + std::to_string(backedUp) + " changed ones moved to " + narrow(backup_);
     if (stayed)
       line += ", " + std::to_string(stayed) + " changed or not the proxy's stay (first: " + firstStayed + ")";
+    if (undeletable)
+      line += ", " + std::to_string(undeletable) + " it no longer has could not be removed (tried again)";
     if (failed)
-      line += ", " + std::to_string(failed) + " FAILED (first: " + firstFailure + ")";
+      line += ", FAILED (" + firstFailure + "): tried again at the next start";
     say("%s", line.c_str());
   }
 };
 
-Deployer *g_deployer = nullptr;
-HANDLE g_thread = nullptr;
+// ---------------------------------------------------------------- add-ons that require Remix, without a runtime
 
-DWORD WINAPI modsThread(void *) {
+// A session without a runtime leaves the add-on folders of packages that
+// require Remix out of the searches filesystem_stdio.dll makes of
+// garrysmod\addons, which is how GMod finds the folders it mounts: they stay
+// on disk and in the record, and switching RTX back on costs nothing (the
+// GMod native loader's ADR 0013 does the same).
+using FindFirstFileAFn = HANDLE(WINAPI *)(LPCSTR, LPWIN32_FIND_DATAA);
+using FindFirstFileExWFn = HANDLE(WINAPI *)(LPCWSTR, FINDEX_INFO_LEVELS, LPVOID, FINDEX_SEARCH_OPS, LPVOID, DWORD);
+using FindNextFileAFn = BOOL(WINAPI *)(HANDLE, LPWIN32_FIND_DATAA);
+using FindNextFileWFn = BOOL(WINAPI *)(HANDLE, LPWIN32_FIND_DATAW);
+using FindCloseFn = BOOL(WINAPI *)(HANDLE);
+FindFirstFileAFn g_findFirstFileA = FindFirstFileA;
+FindFirstFileExWFn g_findFirstFileExW = FindFirstFileExW;
+FindNextFileAFn g_findNextFileA = FindNextFileA;
+FindNextFileWFn g_findNextFileW = FindNextFileW;
+FindCloseFn g_findClose = FindClose;
+
+std::wstring g_addonsDir;            // <game root>\garrysmod\addons
+std::vector<std::wstring> g_rtxOnly; // folder names in it, upper case; set before any search is hooked
+std::atomic<bool> g_hiding{false}, g_leftOut{false};
+SRWLOCK g_searchLock = SRWLOCK_INIT;
+std::set<HANDLE> g_searches; // open searches of g_addonsDir (under g_searchLock)
+std::atomic<size_t> g_searchCount{0};
+
+std::wstring fromAnsi(const char *s) {
+  const int n = MultiByteToWideChar(CP_ACP, 0, s, -1, nullptr, 0);
+  if (n <= 1)
+    return {};
+  std::wstring out(size_t(n), L'\0');
+  MultiByteToWideChar(CP_ACP, 0, s, -1, out.data(), n);
+  out.resize(size_t(n - 1));
+  return out;
+}
+
+bool searchesAddons(std::wstring pattern) {
+  if (!g_hiding)
+    return false;
+  std::replace(pattern.begin(), pattern.end(), L'/', L'\\');
+  const size_t slash = pattern.find_last_of(L'\\');
+  return samePath(fullPath(slash == std::wstring::npos ? std::wstring(L".") : pattern.substr(0, slash + 1)),
+                  g_addonsDir);
+}
+
+bool leftOut(const wchar_t *name, DWORD attributes) {
+  if (!(attributes & FILE_ATTRIBUTE_DIRECTORY) ||
+      std::find(g_rtxOnly.begin(), g_rtxOnly.end(), upper(name)) == g_rtxOnly.end())
+    return false;
+  if (!g_leftOut.exchange(true))
+    say("a search of garrysmod\\addons left %s out (the first one)", narrow(name).c_str());
+  return true;
+}
+
+void track(HANDLE search, bool open) {
+  AcquireSRWLockExclusive(&g_searchLock);
+  if (open)
+    g_searches.insert(search);
+  else
+    g_searches.erase(search);
+  g_searchCount = g_searches.size();
+  ReleaseSRWLockExclusive(&g_searchLock);
+}
+
+bool tracked(HANDLE search) {
+  if (!g_searchCount)
+    return false;
+  AcquireSRWLockShared(&g_searchLock);
+  const bool found = g_searches.count(search) != 0;
+  ReleaseSRWLockShared(&g_searchLock);
+  return found;
+}
+
+// Every entry of a search was left out.
+HANDLE noneFound(HANDLE search) {
+  g_findClose(search);
+  SetLastError(ERROR_FILE_NOT_FOUND);
+  return INVALID_HANDLE_VALUE;
+}
+
+HANDLE WINAPI findFirstFileA(LPCSTR pattern, LPWIN32_FIND_DATAA data) {
+  const HANDLE search = g_findFirstFileA(pattern, data);
+  if (search == INVALID_HANDLE_VALUE || !pattern || !searchesAddons(fromAnsi(pattern)))
+    return search;
+  while (leftOut(fromAnsi(data->cFileName).c_str(), data->dwFileAttributes))
+    if (!g_findNextFileA(search, data))
+      return noneFound(search);
+  track(search, true);
+  return search;
+}
+
+HANDLE WINAPI findFirstFileExW(LPCWSTR pattern, FINDEX_INFO_LEVELS level, LPVOID data, FINDEX_SEARCH_OPS op,
+                               LPVOID filter, DWORD flags) {
+  const HANDLE search = g_findFirstFileExW(pattern, level, data, op, filter, flags);
+  if (search == INVALID_HANDLE_VALUE || !pattern || !searchesAddons(pattern))
+    return search;
+  auto *found = static_cast<LPWIN32_FIND_DATAW>(data);
+  while (leftOut(found->cFileName, found->dwFileAttributes))
+    if (!g_findNextFileW(search, found))
+      return noneFound(search);
+  track(search, true);
+  return search;
+}
+
+BOOL WINAPI findNextFileA(HANDLE search, LPWIN32_FIND_DATAA data) {
+  for (;;) {
+    if (!g_findNextFileA(search, data))
+      return FALSE;
+    if (!tracked(search) || !leftOut(fromAnsi(data->cFileName).c_str(), data->dwFileAttributes))
+      return TRUE;
+  }
+}
+
+BOOL WINAPI findNextFileW(HANDLE search, LPWIN32_FIND_DATAW data) {
+  for (;;) {
+    if (!g_findNextFileW(search, data))
+      return FALSE;
+    if (!tracked(search) || !leftOut(data->cFileName, data->dwFileAttributes))
+      return TRUE;
+  }
+}
+
+BOOL WINAPI findClose(HANDLE search) {
+  if (tracked(search))
+    track(search, false);
+  return g_findClose(search);
+}
+
+template <typename Fn> void hookImport(HMODULE module, const char *name, Fn &original, Fn hook) {
+  if (void *old = proxy::d3d::patchModuleImport(module, "KERNEL32.dll", name, reinterpret_cast<void *>(hook)))
+    original = reinterpret_cast<Fn>(old);
+}
+
+void hideRtxOnly() {
+  if (g_rtxOnly.empty() || g_hiding.exchange(true))
+    return;
+  std::string names;
+  for (const std::wstring &name : g_rtxOnly)
+    names += (names.empty() ? "" : ", ") + narrow(name);
+  const HMODULE fs = GetModuleHandleW(L"filesystem_stdio.dll");
+  if (!fs) {
+    say("filesystem_stdio.dll is not loaded: the add-ons of packages that require Remix stay visible (%s)",
+        names.c_str());
+    return;
+  }
+  hookImport(fs, "FindFirstFileA", g_findFirstFileA, &findFirstFileA);
+  hookImport(fs, "FindFirstFileExW", g_findFirstFileExW, &findFirstFileExW);
+  hookImport(fs, "FindNextFileA", g_findNextFileA, &findNextFileA);
+  hookImport(fs, "FindNextFileW", g_findNextFileW, &findNextFileW);
+  hookImport(fs, "FindClose", g_findClose, &findClose);
+  say("no runtime: GMod's searches of garrysmod\\addons leave out the add-ons of packages that require Remix (%s)",
+      names.c_str());
+}
+
+// ---------------------------------------------------------------- the session
+
+HANDLE g_thread = nullptr;
+// No progress for this long and the runtime starts without the mods.
+constexpr ULONGLONG kStall = 2 * 60 * 1000;
+
+DWORD WINAPI modsThread(void *deployer) {
+  std::unique_ptr<Deployer> d(static_cast<Deployer *>(deployer));
   try {
-    g_deployer->mods();
+    d->mods();
   } catch (const std::exception &e) {
     say("unpacking the mods failed: %s", e.what());
   } catch (...) {
@@ -1797,7 +2347,7 @@ DWORD WINAPI modsThread(void *) {
 
 } // namespace
 
-void begin() {
+void begin(bool runtime, const std::wstring &modsDir) {
   static bool begun = false;
   if (begun)
     return;
@@ -1811,35 +2361,44 @@ void begin() {
     Options o;
     wchar_t path[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, path, MAX_PATH);
-    const std::wstring exeDir = parentOf(path);
-    // The folder holding garrysmod/: the exe's (gmod_win64.exe), or two up
-    // from bin/win64/gmod.exe.
-    o.gameRoot = exeDir;
-    if (!status(exeDir + L"\\garrysmod").directory && status(parentOf(parentOf(exeDir)) + L"\\garrysmod").directory)
-      o.gameRoot = parentOf(parentOf(exeDir));
-    // The mods directory as startRemix configures it.
-    const DWORD n = GetEnvironmentVariableW(L"OPENREMIX_PROXY_MODS", value, MAX_PATH * 2);
-    if (n && n < MAX_PATH * 2) {
-      if (std::wcscmp(value, L"0") == 0) {
-        say("off: the runtime reads no mods (OPENREMIX_PROXY_MODS=0)");
-        return;
-      }
-      o.modsDir = fullPath(value);
-    } else {
-      o.modsDir = exeDir + L"\\rtx-remix\\mods";
+    // The game: garrysmod/ beside its executable (gmod_win64.exe). A tool in
+    // bin\win64 that loads the proxy (hlmv, hammer) is not.
+    o.gameRoot = parentOf(path);
+    if (!status(o.gameRoot + L"\\garrysmod").directory) {
+      say("%s is not the game (no garrysmod folder beside it): nothing placed", narrow(path).c_str());
+      return;
     }
+    o.modsDir = modsDir.empty() ? std::wstring() : fullPath(modsDir);
     // The record beside the proxy, as its other files.
     HMODULE self = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        reinterpret_cast<LPCWSTR>(&begin), &self);
     GetModuleFileNameW(self, path, MAX_PATH);
     o.statePath = parentOf(path) + L"\\shaderapi_proxy_workshop.txt";
-    g_deployer = new Deployer(o); // for the life of the process
-    g_deployer->prepare();
-    g_deployer->addons();
-    g_thread = CreateThread(nullptr, 0, modsThread, nullptr, 0, nullptr);
-    if (!g_thread)
-      modsThread(nullptr);
+    g_addonsDir = o.gameRoot + L"\\garrysmod\\addons";
+    auto d = std::make_unique<Deployer>(o);
+    if (!runtime) {
+      // The game as it is: nothing placed or removed, and what needs a
+      // runtime out of sight.
+      say("no runtime this session: nothing placed or removed");
+      if (d->load())
+        g_rtxOnly = d->rtxOnlyAddons();
+      hideRtxOnly();
+      return;
+    }
+    d->prepare();
+    d->addons();
+    g_rtxOnly = d->rtxOnlyAddons(); // should the runtime fail to start
+    if (o.modsDir.empty()) {
+      say("the runtime reads no mods (OPENREMIX_PROXY_MODS=0, or a directory the ANSI code page cannot name): the "
+          "mods placed before stay as they are");
+      return;
+    }
+    g_thread = CreateThread(nullptr, 0, modsThread, d.get(), 0, nullptr);
+    if (g_thread)
+      d.release(); // the thread's now
+    else
+      modsThread(d.release());
   } catch (const std::exception &e) {
     say("failed: %s", e.what());
   } catch (...) {
@@ -1852,10 +2411,27 @@ void finish() {
     return;
   const ULONGLONG started = GetTickCount64();
   if (WaitForSingleObject(g_thread, 500) == WAIT_TIMEOUT) {
+    // The game's window thread waits (a first unpack of a remaster takes a
+    // while): no "Not Responding" ghost offering to end the game meanwhile.
+    DisableProcessWindowsGhosting();
     say("waiting for the mods to be unpacked");
-    if (WaitForSingleObject(g_thread, 10 * 60 * 1000) == WAIT_TIMEOUT) {
-      say("still unpacking after 10 minutes: the runtime starts without waiting");
-      return;
+    uint64_t seen = g_progress;
+    ULONGLONG moved = GetTickCount64(), told = moved;
+    while (WaitForSingleObject(g_thread, 1000) == WAIT_TIMEOUT) {
+      const ULONGLONG now = GetTickCount64();
+      if (const uint64_t progress = g_progress; progress != seen) {
+        seen = progress;
+        moved = now;
+      } else if (now - moved >= kStall) {
+        say("no progress for %llu s: the runtime starts without waiting", (unsigned long long)(kStall / 1000));
+        CloseHandle(g_thread);
+        g_thread = nullptr;
+        return;
+      }
+      if (now - told >= 10000) {
+        told = now;
+        say("unpacking, %s read or written so far", gib(seen).c_str());
+      }
     }
     say("waited %.1f s", double(GetTickCount64() - started) / 1000.0);
   }
@@ -1863,14 +2439,33 @@ void finish() {
   g_thread = nullptr;
 }
 
+void runtimeFailed() {
+  try {
+    hideRtxOnly();
+  } catch (...) {
+  }
+}
+
 void deploy(const Options &options) {
   Options o = options;
   o.gameRoot = fullPath(o.gameRoot);
-  o.modsDir = fullPath(o.modsDir);
+  if (!o.modsDir.empty())
+    o.modsDir = fullPath(o.modsDir);
   Deployer d(o);
   d.prepare();
   d.addons();
   d.mods();
+}
+
+std::vector<std::string> rtxOnlyAddons(const Options &options) {
+  Options o = options;
+  o.gameRoot = fullPath(o.gameRoot);
+  Deployer d(o);
+  std::vector<std::string> names;
+  if (d.load())
+    for (const std::wstring &name : d.rtxOnlyAddons())
+      names.push_back(narrow(name));
+  return names;
 }
 
 } // namespace proxy::workshop
