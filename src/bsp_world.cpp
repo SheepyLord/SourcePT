@@ -2181,7 +2181,8 @@ SecondLayer secondLayer(int base, bool use) {
   }();
   if (perTexel && out.modulate && !out.masked && out.material >= 0) {
     Material &layer = g_world.materials[size_t(out.material)];
-    layer.blendMaskCandidates = textureHashes(kv.values["$blendmodulatetexture"]);
+    layer.blendMask.texture = kv.values["$blendmodulatetexture"];
+    layer.blendMaskCandidates = textureHashes(layer.blendMask.texture);
     float maskTransform[2][3] = {{1, 0, 0}, {0, 1, 0}}, toFirst[2][3];
     if (kv.values.count("$blendmasktransform"))
       parseTextureTransform(kv.values["$blendmasktransform"], maskTransform);

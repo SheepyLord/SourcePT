@@ -32,6 +32,7 @@ struct MaterialRef {
 // (remixapi_MaterialBlendModulationEXT, with `transform` from the mesh's
 // coordinates; null handle while none of them is uploaded).
 struct BlendMask {
+  std::string texture; // Source asset name for offline replay
   const std::vector<uint64_t> *candidates = nullptr;
   float transform[2][3] = {{1, 0, 0}, {0, 1, 0}};
 };

@@ -104,7 +104,8 @@ public:
         api.DestroyTexture(texture.handle);
   }
   bool complete() const { return failures.empty(); }
-  proxy::bsp::MaterialRef lookup(uint64_t sourceHash, const Shading *shading, bool nearest) {
+  proxy::bsp::MaterialRef lookup(uint64_t sourceHash, const Shading *shading, bool nearest,
+                                 const proxy::bsp::BlendMask *blend) {
     std::string base;
     if (!proxy::bsp::materialSource(sourceHash, base)) {
       fail("texture hash " + std::to_string(sourceHash), "no VMT base texture");
@@ -114,6 +115,12 @@ public:
     std::ostringstream key;
     key.precision(9);
     key << base << ':' << sourceHash << ':' << nearest;
+    if (blend) {
+      key << ":blend:" << blend->texture;
+      for (const auto &row : blend->transform)
+        for (float value : row)
+          key << ':' << value;
+    }
     if (shading) {
       const auto &s = *shading;
       if (s.reflectionReceiverKey) key << ":receiver:" << s.reflectionReceiverKey;
@@ -229,6 +236,18 @@ public:
                     shading->reflectionSceneId, shading->reflectionVolumeId};
       opaque.pNext = &reflection;
     }
+    std::wstring blendTexture;
+    remixapi_MaterialBlendModulationEXT modulation{};
+    if (blend) {
+      blendTexture = image(blend->texture);
+      if (blendTexture.empty())
+        return {};
+      modulation.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_BLEND_MODULATION_EXT;
+      modulation.pNext = opaque.pNext;
+      modulation.maskTexture = blendTexture.c_str();
+      std::memcpy(modulation.transform, blend->transform, sizeof(modulation.transform));
+      opaque.pNext = &modulation;
+    }
     remixapi_MaterialHandle handle = nullptr;
     check(api.CreateMaterial(&info, &handle), "CreateMaterial");
     materials[key.str()] = {handle, info.hash, sceneId, volumeId};
@@ -286,8 +305,9 @@ private:
   }
 };
 Materials *currentMaterials = nullptr;
-proxy::bsp::MaterialRef lookup(uint64_t hash, const Shading *shading, const std::vector<uint64_t> *, bool nearest) {
-  return currentMaterials->lookup(hash, shading, nearest);
+proxy::bsp::MaterialRef lookup(uint64_t hash, const Shading *shading, const std::vector<uint64_t> *, bool nearest,
+                               const proxy::bsp::BlendMask *blend) {
+  return currentMaterials->lookup(hash, shading, nearest, blend);
 }
 
 proxy::lighting::SourceLight sourceLight(const proxy::bsp::Light &source) {
