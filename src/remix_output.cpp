@@ -22,6 +22,9 @@
 #include "shader_tables.h"
 #include "texture_categories.h"
 #include "vb_origins.h"
+#ifdef PROXY_GAME_GMOD
+#include "workshop_content.h"
+#endif
 #include <unordered_set>
 
 #include "texture_formats.h"
@@ -3645,6 +3648,10 @@ bool startRemix() {
   // USD mod replacements from the game's rtx-remix/mods (OPENREMIX_PROXY_MODS:
   // another directory, or 0 to disable). Z up.
   {
+#ifdef PROXY_GAME_GMOD
+    // Subscribed Workshop content packages unpack their mods into it first.
+    proxy::workshop::finish();
+#endif
     char mods[MAX_PATH * 2] = {};
     if (!GetEnvironmentVariableA("OPENREMIX_PROXY_MODS", mods, sizeof(mods))) {
       GetModuleFileNameA(nullptr, mods, MAX_PATH);

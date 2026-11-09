@@ -28,6 +28,9 @@
 #endif
 #include "vb_origins.h"
 #include "vtable_proxy.h"
+#ifdef PROXY_GAME_GMOD
+#include "workshop_content.h"
+#endif
 
 #include <algorithm>
 #include <tlhelp32.h>
@@ -1038,6 +1041,12 @@ extern "C" __declspec(dllexport) void *CreateInterface(const char *name, int *re
   static bool threadsStarted = false;
   if (!threadsStarted) {
     threadsStarted = true;
+#ifdef PROXY_GAME_GMOD
+    // Workshop content packages: their add-on folders now, ahead of GMod
+    // mounting garrysmod/addons; their Remix mods on a thread that startRemix
+    // waits for (workshop_content.h).
+    proxy::workshop::begin();
+#endif
     hookFileOpens();
     CloseHandle(CreateThread(nullptr, 0, statisticsThread, nullptr, 0, nullptr));
     CloseHandle(CreateThread(nullptr, 0, profilerThread, nullptr, 0, nullptr));
